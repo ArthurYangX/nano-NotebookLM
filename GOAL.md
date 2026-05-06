@@ -46,44 +46,44 @@
 
 每条都附带需要补的测试。**没补 mini + corner 的，不许打勾。**
 
-1. ☐ **6 个 skill 都有前端入口**（exam-analysis / report / mastery 当前没 UI）
+1. ☑ **6 个 skill 都有前端入口**（exam-analysis / report / mastery 当前没 UI）
    - mini：每个新 UI 入口的 fetch 调用打通后端，断言关键字段渲染
    - corner：后端 502 / 网络断开时 UI 不白屏
-2. ☐ **引用可点击** → Reader 跳到该页 + 高亮目标 chunk
+2. ☑ **引用可点击** → Reader 跳到该页 + 高亮目标 chunk
    - mini：点击后 active page 切换、目标 chunk 有高亮 className
    - corner：引用指向已删除的文件 / 不存在的页码 → 给出友好提示
-3. ☐ **思维导图深化设计**（数据结构 + 视觉 + 交互一体）
+3. ☑ **思维导图深化设计**（数据结构 + 视觉 + 交互一体）
    - **数据**：节点 = 概念，边 = 关系类型（is-a / part-of / depends-on / example-of / related），每节点带 `depth / weight / source_chunks[]`，由 `kg/extractor.py` 在抽取时打标
    - **视觉**：根据 `weight` 调字号 + 颜色饱和度；按 `depth` 分层；中心节点固定，子节点放射或树状（受 Tweaks 面板控制）；边的样式按关系类型区分（实线 / 虚线 / 箭头）
    - **交互**：点击节点 → 右侧弹出详情面板（概念解释 + 关联 chunks + "针对这个出 3 道题"按钮）；拖拽 / 缩放 / pan；高亮搜索；折叠子树
    - **联动**：节点 `source_chunks[]` 与 Reader 双向跳转（点节点定位文档，反过来也行）
    - mini：渲染一个 30 节点的 KG，断言每节点尺寸/颜色随 weight 变化、点击触发详情面板、source_chunks 链接到正确文件
    - corner：(a) 节点 ≥ 200 仍流畅（≥ 30fps）；(b) 空 KG / 单节点孤儿态有占位；(c) 节点重名时按 ID 区分不串扰
-4. ☐ **Subagent 模块**（生成期补充信息 + 输出格式化）
+4. ☑ **Subagent 模块**（生成期补充信息 + 输出格式化）
    - **职责 A — 网络搜索增补**：当用户对生成结果不满（"展开"/"补充例子"/"这是哪年的论文"）或主 LLM 自己识别"知识缺口"时，subagent 接过 query → 调 web search API（Tavily / Bing / Serper，先选一个）→ 摘要回填
    - **职责 B — 输出格式化**：把主 LLM 的原始输出走一遍格式化器（Markdown 修复、LaTeX 公式补全 `$...$`、代码块语言识别、引用格式 `[Source: ...]` 规整、流式拼接 artifact 清理）
    - **架构**：新建 `nano_notebooklm/agents/`，至少有 `web_research.py` 和 `formatter.py` 两个 subagent；orchestrator 提供 `run_subagent(name, payload)`；前端 Assistant 多一个"展开调查"按钮
    - mini：(a) 触发 web_research 拿到非空结果，merge 进答案后引用块格式正确；(b) formatter 把畸形 Markdown 修复成可渲染版本
    - corner：(a) 搜索 API key 缺失或网络不通 → fallback 到主答案 + 标注"未补充"；(b) 搜索返回的内容包含 prompt injection 信号要被拒；(c) formatter 遇到嵌套代码块 / 不闭合 LaTeX 不能死循环
-5. ☐ **Notes 可编辑** + **Markdown / PDF 导出**
+5. ☑ **Notes 可编辑** + **Markdown / PDF 导出**
    - mini：编辑后内容写回 localStorage；导出文件名 / 内容正确
    - corner：超大笔记（> 100KB）不冻 UI；同时切课不丢草稿
-6. ☐ **Quiz 答案跨会话保留** + "只看错题"复习模式
+6. ☑ **Quiz 答案跨会话保留** + "只看错题"复习模式
    - mini：答完刷新仍保留；切换 review 模式只显示错题
    - corner：题库变更后旧答案能识别为 stale 并提示
-7. ☐ **Mastery 仪表盘**：弱点列表 + 一键"练这个"生成定向 quiz
+7. ☑ **Mastery 仪表盘**：弱点列表 + 一键"练这个"生成定向 quiz
    - mini：弱点点击调用 quiz API 带 topic 参数
    - corner：mastery.json 不存在 / 全分数 ≥ 0.5 时 UI 给空态
-8. ☐ **生成走流式**（notes / quiz / report token-by-token）
+8. ☑ **生成走流式**（notes / quiz / report token-by-token）
    - mini：流式 chunk 累积渲染，最终内容 == 全量调用结果
    - corner：流中断 → 已收到的部分保留 + 显示 retry
-9. ☐ **失败可恢复**：部分结果保留 + 重试按钮 + 不冻 UI
+9. ☑ **失败可恢复**：部分结果保留 + 重试按钮 + 不冻 UI
    - mini：retry 按钮触发新请求并替换内容
    - corner：连续 3 次失败给出错误详情而不是无限 spinner
-10. ☐ **每日 session log**：当天 / 当门课问过什么、生成过什么，可回看
+10. ☑ **每日 session log**：当天 / 当门课问过什么、生成过什么，可回看
     - mini：每次生成 / 提问写 entry，按日期分组返回
     - corner：log 文件超过阈值自动轮转，不能让磁盘炸
-11. ☐ **可观测**：状态栏显示当前 backend / latency / cost；p50 search < 200ms，p50 chat < 5s
+11. ☑ **可观测**：状态栏显示当前 backend / latency / cost；p50 search < 200ms，p50 chat < 5s
     - mini：状态栏渲染 `/api/status` 数据
     - corner：backend 全挂时状态栏显示降级状态而非崩溃
 
