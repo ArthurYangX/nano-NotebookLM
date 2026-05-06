@@ -75,9 +75,23 @@ nano_notebooklm/   Python backend modules
 - API: input validation via Pydantic, 422 errors return
   `{error: "validation_error", request_id, detail}`. All responses include
   `x-request-id` and `x-response-time-ms` headers.
-- Tests: run `pytest` — covers chunker, BM25/vector/hybrid search, and
-  FastAPI smoke (no LLM keys or downloaded models required; uses a
-  deterministic hash-based embed fn).
+- P0/P1 learning UX: frontend now exposes all six skills, clickable citations
+  route to Reader highlights, notes are editable with Markdown/PDF export,
+  quiz answers persist with stale detection and wrong-only review, mastery can
+  launch targeted quiz practice, and session history is logged daily.
+- Generation reliability: notes / quiz / report have NDJSON streaming endpoints,
+  partial output retention, retry state helpers, and formatter cleanup; web
+  research and formatter subagents are stateless and offline-testable.
+- Knowledge graph: KG payloads carry depth / weight / source_chunks plus typed
+  relations; frontend mind map uses weight/depth styling, detail panels, source
+  links, pan/zoom/drag, collapse, and empty-state handling.
+- Observability: `/api/status` includes backend, latency p50 samples, and cost
+  fields; the frontend status bar displays degraded state if the backend is
+  unavailable.
+- Tests: run `pytest` — covers chunker, BM25/vector/hybrid search, FastAPI
+  smoke, streaming endpoints, subagents, session log rotation, and frontend
+  state helpers (no LLM keys or downloaded models required; uses deterministic
+  hash-based fake embeddings and monkeypatched search/LLM paths).
 - Still missing for production: auth / multi-tenant, request rate limits,
   background-task ingestion, OpenAPI client codegen, structured metrics
   (Prometheus). Mastery / KG editing are read-only.

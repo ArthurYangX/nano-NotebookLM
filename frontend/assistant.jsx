@@ -62,7 +62,7 @@ function ThinkingSteps({ steps, activeIndex }) {
   );
 }
 
-function MessageBubble({ content }) {
+function MessageBubble({ content, onCitation }) {
   const { body, refs } = parseMessage(content);
   const html = renderMarkdown(body);
 
@@ -72,7 +72,7 @@ function MessageBubble({ content }) {
       {refs.length > 0 && (
         <div className="refs">
           {refs.slice(0, 5).map((r, i) => (
-            <span className="ref-chip mono" key={i} title={r}>
+            <span className="ref-chip mono" key={i} title={r} onClick={() => onCitation && onCitation(`[Source: ${r}]`)}>
               {r.length > 40 ? r.slice(0, 37) + "…" : r}
             </span>
           ))}
@@ -83,7 +83,7 @@ function MessageBubble({ content }) {
   );
 }
 
-function Assistant({ mode, persona = "Dr. Marginalia", activeSources, streaming, streamProgress, activeCourse, onGenerateNotes, onGenerateQuiz, onGenerateMindmap, checkedFiles }) {
+function Assistant({ mode, persona = "Dr. Marginalia", activeSources, streaming, streamProgress, activeCourse, onGenerateNotes, onGenerateQuiz, onGenerateMindmap, onSkillEntry, onCitation, checkedFiles }) {
   const [text, setText] = useStateA("");
   const [messages, setMessages] = useStateA([]);
   const [thinking, setThinking] = useStateA(false);
@@ -117,10 +117,14 @@ function Assistant({ mode, persona = "Dr. Marginalia", activeSources, streaming,
       { label: "Generate study notes", action: onGenerateNotes },
       { label: "Generate quiz", action: onGenerateQuiz },
       { label: "Build knowledge graph", action: onGenerateMindmap },
+      { label: "Exam analysis", action: () => onSkillEntry && onSkillEntry("exam-analysis") },
+      { label: "Course report", action: () => onSkillEntry && onSkillEntry("report") },
+      { label: "Mastery dashboard", action: () => onSkillEntry && onSkillEntry("mastery") },
     ],
     notes: [
       { label: "Rewrite shorter" },
       { label: "Add worked examples" },
+      { label: "展开调查", action: () => handleResearch(text || "supplement these notes") },
       { label: "Generate quiz from notes", action: onGenerateQuiz },
     ],
     mindmap: [
@@ -203,6 +207,23 @@ function Assistant({ mode, persona = "Dr. Marginalia", activeSources, streaming,
     }
   }
 
+  async function handleResearch(seed) {
+    const query = (seed || text || "supplement this answer").trim();
+    if (!query) return;
+    setThinking(true);
+    try {
+      const data = await API.runSubagent("web_research", { query });
+      setMessages(prev => [...prev, {
+        role: "ai",
+        content: `${data.summary || "未补充"}\n${data.citation_block || ""}`,
+        time: data.status || "research",
+      }]);
+    } catch (e) {
+      setMessages(prev => [...prev, { role: "ai", content: "未补充：" + e.message, time: "error" }]);
+    }
+    setThinking(false);
+  }
+
   function handleKeyDown(e) {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
@@ -252,7 +273,7 @@ function Assistant({ mode, persona = "Dr. Marginalia", activeSources, streaming,
             <div className="who">{m.role === "user" ? "You" : persona} · {m.time}</div>
             {m.role === "user"
               ? <div className="bubble">{m.content}</div>
-              : <MessageBubble content={m.content} />
+              : <MessageBubble content={m.content} onCitation={onCitation} />
             }
           </div>
         ))}

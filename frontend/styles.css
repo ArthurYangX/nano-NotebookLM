@@ -914,6 +914,16 @@ body::before {
 }
 .mindmap-wrap:active { cursor: grabbing; }
 
+.mindmap-empty {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  font-family: var(--serif);
+  color: var(--ink-3);
+  pointer-events: none;
+}
+
 .mindmap-toolbar {
   position: absolute;
   left: 16px;
@@ -945,6 +955,44 @@ body::before {
 }
 .mindmap-legend .row { display: flex; align-items: center; gap: 8px; }
 .mindmap-legend .sw { width: 10px; height: 10px; border: 1px solid; }
+
+.mindmap-detail {
+  position: absolute;
+  right: 16px;
+  top: 64px;
+  width: 260px;
+  max-height: calc(100% - 150px);
+  overflow: auto;
+  background: var(--paper);
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+  padding: 14px;
+  box-shadow: var(--shadow);
+  z-index: 6;
+}
+.mindmap-detail h3 {
+  margin: 0 0 8px;
+  font-family: var(--serif);
+  font-size: 17px;
+}
+.mindmap-detail p {
+  margin: 0 0 12px;
+  color: var(--ink-2);
+  font-size: 13px;
+}
+.source-list { display: flex; flex-direction: column; gap: 6px; margin-top: 12px; }
+.source-link,
+.weak-row {
+  border: 1px solid var(--rule);
+  background: var(--paper-2);
+  color: var(--ink-2);
+  border-radius: var(--radius);
+  padding: 7px 9px;
+  text-align: left;
+  cursor: pointer;
+}
+.source-link:hover,
+.weak-row:hover { border-color: var(--accent); color: var(--accent-ink); }
 
 .mm-node {
   position: absolute;
@@ -1274,6 +1322,106 @@ body::before {
 .btn.primary { background: var(--accent); border-color: var(--accent); color: var(--paper); }
 .btn.primary:hover { background: var(--accent-ink); }
 
+.notes-toolbar {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 16px;
+  position: sticky;
+  top: 0;
+  background: var(--paper);
+  padding: 8px 0;
+  z-index: 2;
+}
+.notes-editor {
+  width: 100%;
+  min-height: 62vh;
+  resize: vertical;
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+  padding: 14px;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--mono);
+  font-size: 13px;
+  line-height: 1.55;
+}
+.error-banner {
+  border: 1px solid var(--crimson);
+  background: var(--crimson-soft);
+  color: var(--crimson);
+  padding: 9px 12px;
+  border-radius: var(--radius);
+  margin-bottom: 12px;
+  font-size: 13px;
+}
+.reader-notice,
+.reader-target {
+  border: 1px solid var(--amber);
+  background: var(--amber-soft);
+  color: oklch(0.34 0.08 70);
+  padding: 8px 10px;
+  border-radius: var(--radius);
+  margin-bottom: 12px;
+  font-family: var(--mono);
+  font-size: 11px;
+}
+.reader-target.active {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent-ink);
+}
+.skill-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 14px;
+}
+.skill-panel {
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+  padding: 14px;
+  background: var(--paper);
+  min-width: 0;
+}
+.skill-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+.skill-head h3 {
+  margin: 0;
+  font-family: var(--serif);
+  font-size: 16px;
+}
+.skill-output {
+  white-space: pre-wrap;
+  margin: 0;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--ink-2);
+  max-height: 360px;
+  overflow: auto;
+}
+.empty-state { color: var(--ink-3); font-style: italic; }
+.weak-list { display: flex; flex-direction: column; gap: 7px; }
+.weak-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  width: 100%;
+}
+.history-day { margin-bottom: 22px; }
+.history-day h3 { font-family: var(--serif); }
+.history-entry {
+  display: grid;
+  grid-template-columns: 180px 120px 1fr;
+  gap: 12px;
+  padding: 8px 0;
+  border-bottom: 1px dashed var(--rule);
+  color: var(--ink-2);
+}
+
 /* ============ Right: Assistant ============ */
 .assistant {
   grid-area: assistant;
@@ -1506,6 +1654,7 @@ body::before {
 }
 .statusbar .item { display: flex; gap: 6px; align-items: center; }
 .statusbar .item b { color: var(--ink-2); font-weight: 500; }
+.statusbar .item.degraded b { color: var(--crimson); }
 .statusbar .spacer { flex: 1; }
 .statusbar .dot {
   width: 5px; height: 5px; border-radius: 50%; background: var(--accent);

@@ -12,7 +12,7 @@ from typing import Annotated, Any
 from fastapi import FastAPI, File, UploadFile, HTTPException, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 
@@ -20,8 +20,11 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from nano_notebooklm.ai.router import ModelRouter
+from nano_notebooklm.agents import run_subagent
+from nano_notebooklm.agents.formatter import format_response
 from nano_notebooklm.kb.store import KBStore
 from nano_notebooklm.orchestrator.engine import Orchestrator
+from nano_notebooklm.orchestrator.session_log import SessionLog
 from nano_notebooklm import config
 
 logging.basicConfig(
@@ -35,6 +38,8 @@ access_log = logging.getLogger("nano.access")
 kb = KBStore()
 router = ModelRouter()
 orchestrator = Orchestrator(kb, router)
+session_log = SessionLog(config.ARTIFACTS_DIR)
+LATENCY_SAMPLES: dict[str, list[float]] = {"search": [], "chat": []}
 
 app = FastAPI(
     title="nano-NOTEBOOKLM API",
@@ -65,6 +70,7 @@ async def request_logging_middleware(request: Request, call_next):
         )
         raise
     elapsed_ms = (time.perf_counter() - start) * 1000
+    _record_latency(request.url.path, elapsed_ms)
     response.headers["x-request-id"] = rid
     response.headers["x-response-time-ms"] = f"{elapsed_ms:.1f}"
     access_log.info(
@@ -164,6 +170,17 @@ class MemoryUpdate(BaseModel):
     value: Any
 
 
+class SubagentRequest(BaseModel):
+    name: str = Field(..., pattern=r"^(web_research|formatter)$")
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class SessionEntryRequest(BaseModel):
+    course_id: str | None = Field(None, max_length=128)
+    kind: str = Field(..., min_length=1, max_length=64)
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
 # ── Course endpoints ─────────────────────────────────────────────────
 @app.get("/api/courses", tags=["courses"], summary="List courses with chunk counts")
 async def list_courses():
@@ -217,12 +234,17 @@ async def chat(req: ChatRequest):
     })
     if not result.success:
         raise HTTPException(status_code=502, detail=result.error or "qa skill failed")
-    return result.data
+    data = dict(result.data)
+    if "answer" in data:
+        data["answer"] = format_response(str(data["answer"]))
+    session_log.append(req.course_id, "question", {"question": req.question, "answer": data.get("answer", "")})
+    return data
 
 
 @app.post("/api/search", tags=["skills"], summary="Hybrid search across knowledge base")
 async def search(req: SearchRequest):
     results = kb.search(req.query, top_k=req.top_k, course_id=req.course_id)
+    session_log.append(req.course_id, "search", {"query": req.query, "results": len(results)})
     return {
         "results": [
             {
@@ -247,7 +269,11 @@ async def generate_notes(req: NoteRequest):
     })
     if not result.success:
         raise HTTPException(status_code=502, detail=result.error or "note generation failed")
-    return result.data
+    data = dict(result.data)
+    if "content" in data:
+        data["content"] = format_response(str(data["content"]))
+    session_log.append(req.course_id, "generation", {"kind": "notes", "topic": req.topic})
+    return data
 
 
 @app.post("/api/quiz", tags=["skills"], summary="Generate a practice quiz")
@@ -260,6 +286,7 @@ async def generate_quiz(req: QuizRequest):
     })
     if not result.success:
         raise HTTPException(status_code=502, detail=result.error or "quiz generation failed")
+    session_log.append(req.course_id, "generation", {"kind": "quiz", "topic": req.topic, "num_questions": req.num_questions})
     return result.data
 
 
@@ -268,6 +295,7 @@ async def analyze_exam(req: ExamAnalysisRequest):
     result = await orchestrator.run_skill("exam_analyzer", {"course_id": req.course_id})
     if not result.success:
         raise HTTPException(status_code=502, detail=result.error or "exam analysis failed")
+    session_log.append(req.course_id, "generation", {"kind": "exam-analysis"})
     return result.data
 
 
@@ -281,7 +309,45 @@ async def generate_report(req: ReportRequest):
     })
     if not result.success:
         raise HTTPException(status_code=502, detail=result.error or "report generation failed")
-    return result.data
+    data = dict(result.data)
+    if "content" in data:
+        data["content"] = format_response(str(data["content"]))
+    session_log.append(req.course_id, "generation", {"kind": "report", "report_type": req.report_type})
+    return data
+
+
+@app.post("/api/notes/stream", tags=["skills"], summary="Stream structured study notes")
+async def stream_notes(req: NoteRequest):
+    return _stream_response("note_generator", {
+        "course_id": req.course_id,
+        "topic": req.topic,
+        "format": req.format,
+    }, req.course_id, "notes")
+
+
+@app.post("/api/quiz/stream", tags=["skills"], summary="Stream a practice quiz")
+async def stream_quiz(req: QuizRequest):
+    return _stream_response("quiz_generator", {
+        "course_id": req.course_id,
+        "topic": req.topic,
+        "num_questions": req.num_questions,
+        "difficulty": req.difficulty,
+    }, req.course_id, "quiz")
+
+
+@app.post("/api/report/stream", tags=["skills"], summary="Stream a course report")
+async def stream_report(req: ReportRequest):
+    return _stream_response("report_generator", {
+        "course_id": req.course_id,
+        "report_type": req.report_type,
+        "include_code": req.include_code,
+        "format": req.format,
+    }, req.course_id, "report")
+
+
+@app.post("/api/subagent", tags=["agents"], summary="Run a stateless subagent")
+async def run_subagent_endpoint(req: SubagentRequest):
+    return await run_subagent(req.name, req.payload)
 
 
 @app.post("/api/mindmap/{course_id}", tags=["skills"], summary="Get or generate knowledge graph as mindmap tree")
@@ -400,11 +466,17 @@ async def get_mastery(course_id: str):
 async def status_endpoint():
     courses = orchestrator.list_courses()
     total_chunks = sum(len(kb.get_chunks(c)) for c in courses)
+    usage = router.get_usage_summary()
+    total_cost = usage.get("total_cost_usd", usage.get("total_cost", 0.0))
     return {
         "backends": list(router.backends.keys()),
         "courses": len(courses),
         "total_chunks": total_chunks,
-        "usage": router.get_usage_summary(),
+        "usage": {**usage, "total_cost": total_cost},
+        "latency_ms": {
+            "search_p50": _p50(LATENCY_SAMPLES["search"]),
+            "chat_p50": _p50(LATENCY_SAMPLES["chat"]),
+        },
         "embedding_mode": config.EMBEDDING_MODE,
         "embedding_model": config.EMBEDDING_MODEL,
         "version": app.version,
@@ -437,32 +509,122 @@ async def replace_memory(data: dict):
     return {"ok": True}
 
 
+@app.get("/api/session-log", tags=["learning"], summary="List daily session log entries")
+async def list_session_log():
+    return {"days": session_log.list_grouped()}
+
+
+@app.post("/api/session-log", tags=["learning"], summary="Append a session log entry")
+async def append_session_log(req: SessionEntryRequest):
+    return session_log.append(req.course_id, req.kind, req.payload)
+
+
 # ── Helper ───────────────────────────────────────────────────────────
+def _stream_response(skill_name: str, params: dict, course_id: str, kind: str) -> StreamingResponse:
+    async def events():
+        partial = ""
+        try:
+            result = await orchestrator.run_skill(skill_name, params)
+            if not result.success:
+                raise RuntimeError(result.error or f"{kind} generation failed")
+            content = _skill_stream_content(result.data)
+            if kind in {"notes", "report"}:
+                content = format_response(content)
+            for chunk in _chunk_text(content):
+                partial += chunk
+                yield json.dumps({"type": "chunk", "chunk": chunk, "partial": partial}, ensure_ascii=False) + "\n"
+            session_log.append(course_id, "generation", {"kind": kind, "streamed": True})
+            yield json.dumps({"type": "done", "content": content}, ensure_ascii=False) + "\n"
+        except Exception as exc:
+            yield json.dumps({
+                "type": "error",
+                "error": str(exc),
+                "partial": partial,
+                "retryable": True,
+            }, ensure_ascii=False) + "\n"
+
+    return StreamingResponse(events(), media_type="application/x-ndjson")
+
+
+def _skill_stream_content(data: dict) -> str:
+    if "content" in data:
+        return str(data["content"])
+    if "report" in data:
+        return str(data["report"])
+    if "quiz" in data:
+        return json.dumps(data["quiz"], ensure_ascii=False)
+    return json.dumps(data, ensure_ascii=False)
+
+
+def _chunk_text(content: str, target_size: int = 24):
+    text = str(content or "")
+    if not text:
+        return
+    buf = ""
+    for token in re_split_keep_space(text):
+        buf += token
+        if len(buf) >= target_size:
+            yield buf
+            buf = ""
+    if buf:
+        yield buf
+
+
+def re_split_keep_space(text: str) -> list[str]:
+    import re
+    return [p for p in re.split(r"(\s+)", text) if p]
+
+
+def _record_latency(path: str, elapsed_ms: float):
+    key = None
+    if path == "/api/search":
+        key = "search"
+    elif path == "/api/chat":
+        key = "chat"
+    if key:
+        samples = LATENCY_SAMPLES[key]
+        samples.append(elapsed_ms)
+        del samples[:-200]
+
+
+def _p50(samples: list[float]) -> float:
+    if not samples:
+        return 0.0
+    ordered = sorted(samples)
+    return round(ordered[len(ordered) // 2], 1)
+
+
 def _kg_to_mindmap(kg_data: dict, course_id: str) -> dict:
-    """Convert KG JSON to mindmap tree structure for frontend."""
+    """Convert KG JSON to a frontend KG payload plus tree-compatible fields."""
     nodes = kg_data.get("nodes", [])
     edges = kg_data.get("edges", [])
 
     if not nodes:
-        return {"id": "root", "label": course_id, "children": []}
+        return {"id": "root", "label": course_id, "nodes": [], "edges": [], "children": []}
+
+    normalized_nodes = _normalize_kg_nodes(nodes)
+    normalized_edges = _normalize_kg_edges(edges)
+    node_map = {n["id"]: n for n in normalized_nodes}
 
     children_map: dict[str, list] = {}
-    for edge in edges:
+    for edge in normalized_edges:
         src = edge.get("source", "")
         children_map.setdefault(src, []).append(edge.get("target", ""))
 
-    targets = {e.get("target") for e in edges}
-    roots = [n for n in nodes if n.get("id") not in targets]
+    targets = {e.get("target") for e in normalized_edges}
+    roots = [n for n in normalized_nodes if n.get("id") not in targets]
     if not roots:
-        roots = nodes[:5]
-
-    node_map = {n["id"]: n for n in nodes}
+        roots = normalized_nodes[:5]
 
     def build_tree(node_id: str, depth: int = 0) -> dict:
         node = node_map.get(node_id, {})
         result = {
             "id": node_id,
             "label": node.get("name", node_id),
+            "depth": node.get("depth", depth),
+            "weight": node.get("weight", 1.0),
+            "definition": node.get("definition", ""),
+            "source_chunks": node.get("source_chunks", []),
         }
         if depth < 3:
             child_ids = children_map.get(node_id, [])
@@ -471,7 +633,54 @@ def _kg_to_mindmap(kg_data: dict, course_id: str) -> dict:
         return result
 
     root_children = [build_tree(r["id"]) for r in roots[:8]]
-    return {"id": "root", "label": course_id, "children": root_children}
+    return {
+        "id": "root",
+        "label": course_id,
+        "nodes": normalized_nodes,
+        "edges": normalized_edges,
+        "children": root_children,
+    }
+
+
+def _normalize_kg_nodes(nodes: list[dict]) -> list[dict]:
+    normalized = []
+    for idx, node in enumerate(nodes):
+        node_id = str(node.get("id", node.get("concept_id", f"node_{idx}")))
+        chunk_ids = node.get("chunk_ids", [])
+        source_chunks = node.get("source_chunks") or [
+            {"chunk_id": cid, "source_file": node.get("source_file", ""), "page": node.get("page")}
+            for cid in chunk_ids
+        ]
+        normalized.append({
+            "id": node_id,
+            "name": node.get("name", node_id),
+            "definition": node.get("definition", ""),
+            "concept_type": node.get("concept_type", "definition"),
+            "depth": int(node.get("depth", 1 if idx else 0)),
+            "weight": float(node.get("weight", max(1, len(chunk_ids) or 1))),
+            "source_chunks": source_chunks,
+            "chunk_ids": chunk_ids,
+        })
+    return normalized
+
+
+def _normalize_kg_edges(edges: list[dict]) -> list[dict]:
+    allowed = {"is-a", "part-of", "depends-on", "example-of", "related"}
+    normalized = []
+    for edge in edges:
+        rel = str(edge.get("relation", edge.get("relation_type", "related"))).replace("_", "-")
+        if rel == "related-to":
+            rel = "related"
+        if rel == "prerequisite":
+            rel = "depends-on"
+        if rel not in allowed:
+            rel = "related"
+        normalized.append({
+            "source": edge.get("source", edge.get("from")),
+            "target": edge.get("target", edge.get("to")),
+            "relation": rel,
+        })
+    return normalized
 
 
 # ── Serve frontend ──────────────────────────────────────────────────

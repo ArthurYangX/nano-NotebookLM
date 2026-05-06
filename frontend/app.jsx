@@ -1,4 +1,4 @@
-/* global React, Library, Reader, Notes, MindMap, Quiz, Assistant, Processing, API,
+/* global React, Library, Reader, Notes, MindMap, Quiz, Assistant, Processing, API, StudyState,
    SAMPLE_SOURCES, TweaksPanel, useTweaks, TweakSection, TweakSelect,
    TweakRadio, TweakSlider, TweakToggle, NOTES_DATA, QUIZ_DATA, MINDMAP */
 const { useState, useEffect, useRef } = React;
@@ -18,12 +18,15 @@ function App() {
   const [mode, setMode] = useState("reader");
   const [sources, setSources] = useState([]);
   const [activeId, setActiveId] = useState(null);
+  const [activePage, setActivePage] = useState(null);
   const [highlightedId, setHighlightedId] = useState(null);
   const [highlightedNode, setHighlightedNode] = useState(null);
+  const [citationNotice, setCitationNotice] = useState("");
   const [uploading, setUploading] = useState(null);
   const [processing, setProcessing] = useState(null);
   const [streaming, setStreaming] = useState(false);
   const [streamProgress, setStreamProgress] = useState(0);
+  const [generationState, setGenerationState] = useState(StudyState.createGenerationState());
 
   // ── Core state ──
   const [courses, setCourses] = useState([]);
@@ -32,6 +35,10 @@ function App() {
   const [realNotes, setRealNotes] = useState(null);
   const [realQuiz, setRealQuiz] = useState(null);
   const [realMindmap, setRealMindmap] = useState(null);
+  const [examAnalysis, setExamAnalysis] = useState(null);
+  const [reportData, setReportData] = useState(null);
+  const [masteryData, setMasteryData] = useState(null);
+  const [sessionDays, setSessionDays] = useState({});
 
   // ── localStorage helpers (per-course persistence) ──
   const STORAGE_PREFIX = "nano-nlm:v1";
@@ -66,6 +73,13 @@ function App() {
     API.getStatus().then(setBackendStatus).catch(() => {});
   }, []);
 
+  useEffect(() => {
+    const iv = setInterval(() => {
+      API.getStatus().then(setBackendStatus).catch(() => setBackendStatus(null));
+    }, 10000);
+    return () => clearInterval(iv);
+  }, []);
+
   // ── Load sources when course changes; restore generated content from cache ──
   useEffect(() => {
     // Restore previous generated content for this course (if any)
@@ -74,6 +88,10 @@ function App() {
     const cachedMm = loadCached(activeCourse, "mindmap");
     setRealMindmap(cachedMm);
     if (cachedMm) window.MINDMAP = cachedMm;
+    setExamAnalysis(loadCached(activeCourse, "exam-analysis"));
+    setReportData(loadCached(activeCourse, "report"));
+    setMasteryData(loadCached(activeCourse, "mastery"));
+    setGenerationState(StudyState.createGenerationState());
 
     if (!activeCourse) {
       // "All Courses" mode — show all sources from all courses
@@ -111,6 +129,7 @@ function App() {
       setSources(srcs);
       if (srcs.length > 0) setActiveId(srcs[0].id);
     }).catch(() => {});
+    API.getSessionLog().then(data => setSessionDays(data.days || {})).catch(() => {});
   }, [activeCourse]);
 
   // ── Theme ──
@@ -131,30 +150,50 @@ function App() {
     if (!activeCourse) { alert("Please select a specific course first (not 'All Courses')"); return; }
     setMode("notes");
     setStreaming(true);
+    setStreamProgress(0);
+    setGenerationState(StudyState.createGenerationState());
     try {
-      const data = await API.generateNotes(activeCourse);
-      const content = data.content || "Notes generation failed.";
+      let partial = "";
+      const final = await API.streamNotes(activeCourse, null, "markdown", event => {
+        if (event.type === "chunk") {
+          partial = event.partial;
+          setRealNotes(partial);
+          setGenerationState(s => StudyState.recordPartialGeneration(s, event.chunk));
+          setStreamProgress(p => p + 1);
+        } else if (event.type === "error") {
+          setGenerationState(s => StudyState.recordGenerationFailure({ ...s, partial: event.partial || partial }, new Error(event.error), (s.failures || 0) + 1));
+        }
+      });
+      if (final && final.type === "error") throw new Error(final.error);
+      const content = (final && final.content) || partial || "Notes generation failed.";
       setRealNotes(content);
       saveCached(activeCourse, "notes", content);
+      StudyState.saveNoteDraft(localStorage, activeCourse, content);
+      await API.appendSessionLog(activeCourse, "generation", { kind: "notes" }).catch(() => {});
     } catch (e) {
       const msg = "Error: " + e.message;
-      setRealNotes(msg);
+      setRealNotes(prev => prev || msg);
+      setGenerationState(s => StudyState.recordGenerationFailure(s, e, (s.failures || 0) + 1));
       // Don't cache errors
     }
     setStreaming(false);
   }
 
-  async function handleGenerateQuiz() {
+  async function handleGenerateQuiz(topic = null) {
+    if (topic && typeof topic !== "string") topic = null;
     if (!activeCourse) { alert("Please select a specific course first"); return; }
     setMode("quiz");
     setStreaming(true);
+    setStreamProgress(0);
     try {
-      const data = await API.generateQuiz(activeCourse);
+      const data = await API.generateQuiz(activeCourse, topic);
       const quiz = data.quiz || data || [];
       setRealQuiz(quiz);
       if (Array.isArray(quiz) && quiz.length > 0) saveCached(activeCourse, "quiz", quiz);
+      await API.appendSessionLog(activeCourse, "generation", { kind: "quiz", topic }).catch(() => {});
     } catch (e) {
       setRealQuiz([]);
+      setGenerationState(s => StudyState.recordGenerationFailure(s, e, (s.failures || 0) + 1));
     }
     setStreaming(false);
   }
@@ -168,10 +207,69 @@ function App() {
       window.MINDMAP = data;
       setRealMindmap(data);
       if (data) saveCached(activeCourse, "mindmap", data);
+      await API.appendSessionLog(activeCourse, "generation", { kind: "mindmap" }).catch(() => {});
     } catch (e) {
       setRealMindmap(null);
     }
     setStreaming(false);
+  }
+
+  async function handleSkillEntry(kind) {
+    if (!activeCourse) { alert("Please select a specific course first"); return; }
+    setStreaming(true);
+    try {
+      if (kind === "exam-analysis") {
+        const data = await API.analyzeExam(activeCourse);
+        setExamAnalysis(data);
+        saveCached(activeCourse, "exam-analysis", data);
+      } else if (kind === "report") {
+        let partial = "";
+        const final = await API.streamReport(activeCourse, "summary", false, event => {
+          if (event.type === "chunk") {
+            partial = event.partial;
+            setReportData({ content: partial });
+            setStreamProgress(p => p + 1);
+          }
+        });
+        const data = { content: (final && final.content) || partial };
+        setReportData(data);
+        saveCached(activeCourse, "report", data);
+      } else if (kind === "mastery") {
+        const data = await API.getMastery(activeCourse);
+        setMasteryData(data);
+        saveCached(activeCourse, "mastery", data);
+      }
+      setMode("notes");
+      await API.appendSessionLog(activeCourse, "generation", { kind }).catch(() => {});
+    } catch (e) {
+      if (kind === "exam-analysis") setExamAnalysis({ error: e.message });
+      if (kind === "report") setReportData({ error: e.message });
+      if (kind === "mastery") setMasteryData({ error: e.message, weak_areas: [] });
+    }
+    setStreaming(false);
+  }
+
+  function handleCitation(refText) {
+    const nav = StudyState.resolveCitationNavigation(refText, sources);
+    if (!nav.ok) {
+      setCitationNotice(nav.message);
+      return;
+    }
+    setCitationNotice("");
+    setActiveId(nav.activeId);
+    setActivePage(nav.page);
+    setHighlightedId(nav.highlightedId);
+    setMode("reader");
+  }
+
+  function handleMindmapSource(chunk) {
+    const ref = `[Source: ${chunk.source_file || ""}, PDF p.${chunk.page || 1}, chunk ${chunk.chunk_id || ""}]`;
+    handleCitation(ref);
+  }
+
+  async function handleRetryGeneration() {
+    setGenerationState(s => StudyState.retryGeneration(s));
+    await handleGenerateNotes();
   }
 
   function onStartUpload() {
@@ -240,7 +338,11 @@ function App() {
     { id: "notes", label: "Notes", num: realNotes ? "✓" : "—" },
     { id: "mindmap", label: "Mind map", num: realMindmap ? "✓" : "—" },
     { id: "quiz", label: "Quiz", num: realQuiz && realQuiz.length ? `Q·${realQuiz.length}` : "—" },
+    { id: "skills", label: "Skills", num: [examAnalysis, reportData, masteryData].filter(Boolean).length || "—" },
+    { id: "history", label: "History", num: Object.keys(sessionDays || {}).length || "—" },
   ];
+  const statusView = StudyState.formatStatusBar(backendStatus);
+  const masteryView = StudyState.formatMasteryState(masteryData || {});
 
   return (
     <div className="app">
@@ -267,6 +369,9 @@ function App() {
           <button className="icon-btn" title="Generate Notes" onClick={handleGenerateNotes} disabled={streaming}>📝</button>
           <button className="icon-btn" title="Generate Quiz" onClick={handleGenerateQuiz} disabled={streaming}>❓</button>
           <button className="icon-btn" title="Build Knowledge Graph" onClick={handleGenerateMindmap} disabled={streaming}>🧠</button>
+          <button className="icon-btn" title="Exam Analysis" onClick={() => handleSkillEntry("exam-analysis")} disabled={streaming}>⌁</button>
+          <button className="icon-btn" title="Course Report" onClick={() => handleSkillEntry("report")} disabled={streaming}>▤</button>
+          <button className="icon-btn" title="Mastery Dashboard" onClick={() => handleSkillEntry("mastery")} disabled={streaming}>◎</button>
           <button className="icon-btn" title="Settings">✦</button>
         </div>
       </header>
@@ -300,11 +405,29 @@ function App() {
         </div>
         <div className="workspace">
           {effectiveMode === "reader" && (
-            <Reader highlightedId={highlightedId} onHighlight={setHighlightedId} onCite={() => {}} />
+            <Reader
+              sources={sources}
+              activeId={activeId}
+              activePage={activePage}
+              highlightedId={highlightedId}
+              notice={citationNotice}
+              onHighlight={setHighlightedId}
+              onCite={handleCitation}
+            />
           )}
           {effectiveMode === "notes" && (
             realNotes
-              ? <RealNotesView content={realNotes} streaming={streaming} />
+              ? <RealNotesView
+                  content={realNotes}
+                  streaming={streaming}
+                  activeCourse={activeCourse}
+                  onContentChange={(content) => {
+                    setRealNotes(content);
+                    saveCached(activeCourse, "notes", content);
+                  }}
+                  onRetry={handleRetryGeneration}
+                  generationState={generationState}
+                />
               : <ActionPlaceholder
                   title="Study Notes"
                   desc={activeCourse ? `Generate structured study notes for ${activeCourse}` : "Select a course first"}
@@ -315,7 +438,14 @@ function App() {
           )}
           {effectiveMode === "mindmap" && (
             realMindmap
-              ? <MindMap layout={tweaks.mindmapLayout} highlightedId={highlightedNode} onNodeClick={setHighlightedNode} />
+              ? <MindMap
+                  data={realMindmap}
+                  layout={tweaks.mindmapLayout}
+                  highlightedId={highlightedNode}
+                  onNodeClick={setHighlightedNode}
+                  onSourceClick={handleMindmapSource}
+                  onPractice={(topic) => handleGenerateQuiz(topic)}
+                />
               : <ActionPlaceholder
                   title="Knowledge Graph"
                   desc={activeCourse ? `Extract concepts and relationships from ${activeCourse} materials` : "Select a course first"}
@@ -327,7 +457,7 @@ function App() {
           )}
           {effectiveMode === "quiz" && (
             realQuiz && realQuiz.length > 0
-              ? <RealQuizView questions={realQuiz} />
+              ? <RealQuizView questions={realQuiz} activeCourse={activeCourse} />
               : <ActionPlaceholder
                   title="Practice Quiz"
                   desc={activeCourse ? `Generate a practice quiz for ${activeCourse}` : "Select a course first"}
@@ -338,6 +468,21 @@ function App() {
           )}
           {effectiveMode === "processing" && (
             <Processing fileName={processing.file} activeStep={processing.step} />
+          )}
+          {effectiveMode === "skills" && (
+            <SkillsDashboard
+              activeCourse={activeCourse}
+              examAnalysis={examAnalysis}
+              reportData={reportData}
+              masteryData={masteryData}
+              masteryView={masteryView}
+              streaming={streaming}
+              onRun={handleSkillEntry}
+              onPractice={(topic) => handleGenerateQuiz(topic)}
+            />
+          )}
+          {effectiveMode === "history" && (
+            <SessionHistory days={sessionDays} />
           )}
         </div>
       </main>
@@ -353,6 +498,8 @@ function App() {
         onGenerateNotes={handleGenerateNotes}
         onGenerateQuiz={handleGenerateQuiz}
         onGenerateMindmap={handleGenerateMindmap}
+        onSkillEntry={handleSkillEntry}
+        onCitation={handleCitation}
         checkedFiles={getCheckedSourceFiles()}
       />
 
@@ -364,6 +511,9 @@ function App() {
         </div>
         <div className="item">
           <span>Backend</span><b>{backendStatus ? backendStatus.backends.join(", ") || "none" : "..."}</b>
+        </div>
+        <div className={"item" + (statusView.degraded ? " degraded" : "")}>
+          <span>Status</span><b>{statusView.text}</b>
         </div>
         <div className="item">
           <span>Active</span><b>{activeCourse || "—"}</b>
@@ -435,9 +585,9 @@ function ActionPlaceholder({ title, desc, btnLabel, onAction, disabled, hint }) 
   );
 }
 
-/* ── Real Notes View ── */
-function RealNotesView({ content, streaming }) {
-  const html = content
+/* ── Markdown helpers ── */
+function markdownToHtml(content) {
+  return String(content || "")
     .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
     .replace(/^### (.+)$/gm, "<h3>$1</h3>")
     .replace(/^## (.+)$/gm, "<h2 style='margin-top:20px'>$1</h2>")
@@ -451,34 +601,103 @@ function RealNotesView({ content, streaming }) {
     .replace(/\[Source:\s*([^\]]+)\]/g, '<span class="ref-chip mono">$1</span>')
     .replace(/\n\n/g, "</p><p>")
     .replace(/\n/g, "<br/>");
+}
+
+/* ── Real Notes View ── */
+function RealNotesView({ content, streaming, activeCourse, onContentChange, generationState, onRetry }) {
+  const [draft, setDraft] = React.useState(content || "");
+  const [editing, setEditing] = React.useState(false);
+
+  React.useEffect(() => {
+    const cached = activeCourse ? StudyState.loadNoteDraft(localStorage, activeCourse) : "";
+    setDraft(cached || content || "");
+  }, [activeCourse, content]);
+
+  function updateDraft(value) {
+    setDraft(value);
+    if (activeCourse) StudyState.saveNoteDraft(localStorage, activeCourse, value);
+    onContentChange && onContentChange(value);
+  }
+
+  function downloadMarkdown() {
+    const exp = StudyState.buildMarkdownExport(activeCourse, draft);
+    const blob = new Blob([exp.content], { type: exp.mime });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = exp.filename;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  function exportPdf() {
+    const html = StudyState.buildPdfPrintHtml(activeCourse, draft);
+    const win = window.open("", "_blank");
+    if (!win) return;
+    win.document.write(html);
+    win.document.close();
+    win.print();
+  }
+
+  const html = markdownToHtml(draft);
 
   return (
     <div className="reader-body" style={{ padding: "28px 40px" }}>
+      <div className="notes-toolbar">
+        <button className="btn ghost" onClick={() => setEditing(!editing)}>{editing ? "Preview" : "Edit"}</button>
+        <button className="btn ghost" onClick={downloadMarkdown}>Markdown</button>
+        <button className="btn ghost" onClick={exportPdf}>PDF</button>
+        {generationState?.retryable && <button className="btn primary" onClick={onRetry}>Retry</button>}
+      </div>
       {streaming && <div style={{ color: "var(--accent)", marginBottom: 16, fontFamily: "var(--mono)", fontSize: 12 }}>Generating notes<span className="stream-cursor"></span></div>}
-      <div dangerouslySetInnerHTML={{ __html: "<p>" + html + "</p>" }} />
+      {generationState?.status === "failed" && <div className="error-banner">{generationState.errorDetail}</div>}
+      {editing
+        ? <textarea className="notes-editor" value={draft} onChange={e => updateDraft(e.target.value)} />
+        : <div dangerouslySetInnerHTML={{ __html: "<p>" + html + "</p>" }} />
+      }
     </div>
   );
 }
 
 /* ── Real Quiz View ── */
-function RealQuizView({ questions }) {
-  const [answers, setAnswers] = React.useState({});
+function RealQuizView({ questions, activeCourse }) {
+  const loaded = StudyState.loadQuizAnswers(localStorage, activeCourse, questions);
+  const [answers, setAnswers] = React.useState(loaded.answers || {});
   const [submitted, setSubmitted] = React.useState(false);
+  const [reviewWrong, setReviewWrong] = React.useState(false);
+
+  React.useEffect(() => {
+    const restored = StudyState.loadQuizAnswers(localStorage, activeCourse, questions);
+    setAnswers(restored.answers || {});
+    setSubmitted(false);
+    setReviewWrong(false);
+  }, [activeCourse, questions]);
+
+  function updateAnswer(index, value) {
+    const next = { ...answers, [index]: value };
+    setAnswers(next);
+    StudyState.saveQuizAnswers(localStorage, activeCourse, questions, next);
+  }
+
+  const visibleQuestions = reviewWrong ? StudyState.filterWrongQuestions(questions, answers) : questions;
+  const stale = StudyState.loadQuizAnswers(localStorage, activeCourse, questions).stale;
 
   return (
     <div className="reader-body" style={{ padding: "28px 40px" }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
         <h2 style={{ fontFamily: "var(--serif)", margin: 0 }}>Practice Quiz — {questions.length} Questions</h2>
-        <button
-          onClick={() => setSubmitted(!submitted)}
-          style={{
-            padding: "8px 20px", background: submitted ? "var(--ink-3)" : "var(--accent)",
-            color: "white", border: "none", borderRadius: 6, cursor: "pointer", fontSize: 13,
-          }}
-        >{submitted ? "Hide Answers" : "Grade with AI"}</button>
+        <div style={{ display: "flex", gap: 8 }}>
+          <button className="btn ghost" onClick={() => setReviewWrong(!reviewWrong)} disabled={!submitted}>
+            {reviewWrong ? "All Questions" : "Wrong Only"}
+          </button>
+          <button className="btn primary" onClick={() => setSubmitted(!submitted)}>{submitted ? "Hide Answers" : "Grade"}</button>
+        </div>
       </div>
+      {stale && <div className="error-banner">Saved answers are stale because the question set changed.</div>}
 
-      {questions.map((q, i) => (
+      {visibleQuestions.map((q) => {
+        const i = questions.indexOf(q);
+        return (
         <div key={i} style={{ marginBottom: 20, paddingBottom: 16, borderBottom: "1px dashed var(--rule)" }}>
           <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 6 }}>
             <strong style={{ color: "var(--accent)" }}>Q{i + 1}.</strong>
@@ -489,13 +708,14 @@ function RealQuizView({ questions }) {
           {q.options && q.options.map((opt, j) => {
             const optText = typeof opt === "string" ? opt : `${opt.l}. ${opt.t}`;
             const isCorrect = q.correct && (typeof opt === "string" ? opt.charAt(0) === q.correct : opt.l === q.correct);
+            const optValue = typeof opt === "string" ? opt.charAt(0) : opt.l;
             return (
               <label key={j} style={{
                 display: "block", padding: "5px 8px", cursor: "pointer", borderRadius: 4, marginBottom: 2,
-                background: submitted && isCorrect ? "oklch(0.92 0.04 160)" : submitted && answers[i] === j && !isCorrect ? "oklch(0.92 0.06 25)" : "transparent",
+                background: submitted && isCorrect ? "oklch(0.92 0.04 160)" : submitted && answers[i] === optValue && !isCorrect ? "oklch(0.92 0.06 25)" : "transparent",
               }}>
-                <input type="radio" name={`q${i}`} checked={answers[i] === j}
-                  onChange={() => !submitted && setAnswers(prev => ({ ...prev, [i]: j }))}
+                <input type="radio" name={`q${i}`} checked={answers[i] === optValue}
+                  onChange={() => !submitted && updateAnswer(i, optValue)}
                   style={{ marginRight: 8 }} />
                 {optText}
                 {submitted && isCorrect && " ✓"}
@@ -506,7 +726,8 @@ function RealQuizView({ questions }) {
           {!q.options && (
             <textarea placeholder="Your answer..." rows={3}
               style={{ width: "100%", padding: 8, border: "1px solid var(--rule)", borderRadius: 4, fontFamily: "var(--serif)", fontSize: 14 }}
-              onChange={e => setAnswers(prev => ({ ...prev, [i]: e.target.value }))} />
+              value={answers[i] || ""}
+              onChange={e => updateAnswer(i, e.target.value)} />
           )}
 
           {submitted && (q.answer || q.explanation) && (
@@ -516,6 +737,64 @@ function RealQuizView({ questions }) {
             </div>
           )}
         </div>
+      );})}
+    </div>
+  );
+}
+
+function SkillsDashboard({ activeCourse, examAnalysis, reportData, masteryData, masteryView, streaming, onRun, onPractice }) {
+  const cards = [
+    { id: "exam-analysis", title: "Exam Analysis", data: examAnalysis },
+    { id: "report", title: "Course Report", data: reportData },
+    { id: "mastery", title: "Mastery", data: masteryData },
+  ];
+  return (
+    <div className="reader-body" style={{ padding: "28px 40px" }}>
+      <div className="skill-grid">
+        {cards.map(card => (
+          <section className="skill-panel" key={card.id}>
+            <div className="skill-head">
+              <h3>{card.title}</h3>
+              <button className="btn ghost" disabled={!activeCourse || streaming} onClick={() => onRun(card.id)}>Run</button>
+            </div>
+            {card.id === "mastery" && masteryData ? (
+              <div>
+                {masteryView.empty ? <p className="empty-state">{masteryView.text}</p> : (
+                  <div className="weak-list">
+                    {(masteryData.weak_areas || []).map(w => (
+                      <button key={w.concept} className="weak-row" onClick={() => onPractice(w.concept)}>
+                        <span>{w.concept}</span><b>{Math.round((w.score || 0) * 100)}%</b>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            ) : (
+              <pre className="skill-output">{card.data ? (card.data.error || card.data.content || JSON.stringify(card.data, null, 2)) : "Not generated yet."}</pre>
+            )}
+          </section>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function SessionHistory({ days }) {
+  const entries = Object.entries(days || {}).reverse();
+  return (
+    <div className="reader-body" style={{ padding: "28px 40px" }}>
+      {entries.length === 0 && <p className="empty-state">No session history yet.</p>}
+      {entries.map(([date, items]) => (
+        <section className="history-day" key={date}>
+          <h3>{date}</h3>
+          {(items || []).map(item => (
+            <div className="history-entry" key={item.id}>
+              <span className="mono">{item.timestamp}</span>
+              <b>{item.course_id || "All"}</b>
+              <span>{item.kind}</span>
+            </div>
+          ))}
+        </section>
       ))}
     </div>
   );

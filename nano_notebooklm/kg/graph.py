@@ -27,6 +27,9 @@ class KnowledgeGraph:
                 existing = self.graph.nodes[c.concept_id]
                 existing["chunk_ids"] = list(set(existing.get("chunk_ids", []) + c.chunk_ids))
                 existing["course_ids"] = list(set(existing.get("course_ids", []) + c.course_ids))
+                existing["source_chunks"] = _merge_source_chunks(existing.get("source_chunks", []), c.source_chunks)
+                existing["weight"] = max(float(existing.get("weight", 1.0)), float(c.weight))
+                existing["depth"] = min(int(existing.get("depth", 1)), int(c.depth))
                 if not existing.get("definition") and c.definition:
                     existing["definition"] = c.definition
             else:
@@ -37,6 +40,9 @@ class KnowledgeGraph:
                     concept_type=c.concept_type,
                     course_ids=c.course_ids,
                     chunk_ids=c.chunk_ids,
+                    depth=c.depth,
+                    weight=c.weight,
+                    source_chunks=c.source_chunks,
                 )
 
     def add_relations(self, relations: list[Relation]):
@@ -144,3 +150,15 @@ class KnowledgeGraph:
             source = edge.pop("source")
             target = edge.pop("target")
             self.graph.add_edge(source, target, **edge)
+
+
+def _merge_source_chunks(left: list[dict], right: list[dict]) -> list[dict]:
+    seen = set()
+    merged = []
+    for item in list(left or []) + list(right or []):
+        key = (item.get("chunk_id"), item.get("source_file"), item.get("page"))
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(item)
+    return merged

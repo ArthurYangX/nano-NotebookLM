@@ -57,10 +57,20 @@ const API = {
     return _post("/notes", { course_id: courseId, topic, format });
   },
 
+  async streamNotes(courseId, topic = null, format = "markdown", onEvent = null) {
+    return _stream("/notes/stream", { course_id: courseId, topic, format }, onEvent);
+  },
+
   async generateQuiz(courseId, topic = null, numQuestions = 6, difficulty = "medium") {
     return _post("/quiz", {
       course_id: courseId, topic, num_questions: numQuestions, difficulty,
     });
+  },
+
+  async streamQuiz(courseId, topic = null, numQuestions = 6, difficulty = "medium", onEvent = null) {
+    return _stream("/quiz/stream", {
+      course_id: courseId, topic, num_questions: numQuestions, difficulty,
+    }, onEvent);
   },
 
   async getMindmap(courseId) {
@@ -71,6 +81,12 @@ const API = {
     return _post("/report", {
       course_id: courseId, report_type: reportType, include_code: includeCode,
     });
+  },
+
+  async streamReport(courseId, reportType = "summary", includeCode = false, onEvent = null) {
+    return _stream("/report/stream", {
+      course_id: courseId, report_type: reportType, include_code: includeCode,
+    }, onEvent);
   },
 
   async analyzeExam(courseId) {
@@ -100,9 +116,60 @@ const API = {
     return _request("/status");
   },
 
+  async runSubagent(name, payload = {}) {
+    return _post("/subagent", { name, payload });
+  },
+
+  async getSessionLog() {
+    return _request("/session-log");
+  },
+
+  async appendSessionLog(courseId, kind, payload = {}) {
+    return _post("/session-log", { course_id: courseId, kind, payload });
+  },
+
   async getHealth() {
     return _request("/health");
   },
 };
 
 window.API = API;
+
+async function _stream(path, payload, onEvent) {
+  const res = await fetch(`${API_BASE}${path}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    const err = new Error(`HTTP ${res.status}`);
+    err.status = res.status;
+    throw err;
+  }
+  if (!res.body || !window.TextDecoder) {
+    return _request(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+  }
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let finalEvent = null;
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() || "";
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      const event = JSON.parse(line);
+      finalEvent = event;
+      if (onEvent) onEvent(event);
+    }
+  }
+  if (buffer.trim()) {
+    const event = JSON.parse(buffer);
+    finalEvent = event;
+    if (onEvent) onEvent(event);
+  }
+  return finalEvent;
+}

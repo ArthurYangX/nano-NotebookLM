@@ -1,4 +1,4 @@
-/* global React, MINDMAP */
+/* global React, MINDMAP, StudyState */
 const { useMemo: useMemoM, useState: useStateM, useRef: useRefM, useEffect: useEffectM } = React;
 
 // Simple radial layout: root center; branches on radial positions; leaves splayed from each branch.
@@ -66,7 +66,7 @@ function layoutMindmap(root, layout = "radial") {
   return { nodes, edges };
 }
 
-function MindMap({ layout, highlightedId, onNodeClick }) {
+function MindMap({ data, layout, highlightedId, onNodeClick, onSourceClick, onPractice }) {
   const [pan, setPan] = useStateM({ x: 0, y: 0 });
   const [zoom, setZoom] = useStateM(1);
   const [collapsed, setCollapsed] = useStateM(new Set());
@@ -76,7 +76,13 @@ function MindMap({ layout, highlightedId, onNodeClick }) {
   const dragRef = useRefM(null); // {kind: 'pan'|'node', ...}
   const [, forceRerender] = useStateM(0);
 
-  const { nodes, edges } = useMemoM(() => layoutMindmap(MINDMAP, layout), [layout]);
+  const graphData = data || MINDMAP;
+  const prepared = useMemoM(() => StudyState.prepareMindmap(graphData, { layout }), [graphData, layout]);
+  const { nodes, edges } = useMemoM(() => {
+    if (prepared.empty) return { nodes: [], edges: [] };
+    return prepared.nodes.length ? prepared : layoutMindmap(graphData, layout);
+  }, [prepared, graphData, layout]);
+  const selected = highlightedId ? StudyState.getMindmapNodeDetail(prepared, highlightedId) : null;
 
   const visibleIds = useMemoM(() => {
     const vis = new Set();
@@ -85,9 +91,11 @@ function MindMap({ layout, highlightedId, onNodeClick }) {
       if (collapsed.has(id)) return;
       nodes.filter(n => n.parent === id).forEach(n => walk(n.id));
     }
-    walk(MINDMAP.id);
+    const rootId = nodes.find(n => n.depth === 0)?.id || graphData.id;
+    if (rootId) walk(rootId);
+    if (vis.size <= 1 && nodes.length > vis.size) nodes.forEach(n => vis.add(n.id));
     return vis;
-  }, [nodes, collapsed]);
+  }, [nodes, collapsed, graphData.id]);
 
   const visNodes = nodes.filter(n => visibleIds.has(n.id));
   const visEdges = edges.filter(e => visibleIds.has(e.from) && visibleIds.has(e.to));
@@ -168,6 +176,7 @@ function MindMap({ layout, highlightedId, onNodeClick }) {
       data-screen-label="Mind map"
       onMouseDown={startCanvasPan}
     >
+      {prepared.empty && <div className="mindmap-empty">{prepared.placeholder}</div>}
       <div className="mindmap-toolbar" onMouseDown={(e) => e.stopPropagation()}>
         <button className="icon-btn" onClick={() => setZoom(z => Math.min(2, z + 0.15))}>+</button>
         <button className="icon-btn" onClick={() => setZoom(z => Math.max(0.5, z - 0.15))}>−</button>
@@ -194,8 +203,8 @@ function MindMap({ layout, highlightedId, onNodeClick }) {
           style={{ left: -1200, top: -900 }}
         >
           {visEdges.map((e, i) => {
-            const a = nodes.find(n => n.id === e.from);
-            const b = nodes.find(n => n.id === e.to);
+            const a = nodes.find(n => n.id === (e.from || e.source));
+            const b = nodes.find(n => n.id === (e.to || e.target));
             if (!a || !b) return null;
             const ap = posOf(a), bp = posOf(b);
             const ax = ap.x + 1200, ay = ap.y + 900;
@@ -208,6 +217,7 @@ function MindMap({ layout, highlightedId, onNodeClick }) {
                 d={`M ${ax} ${ay} C ${mx} ${ay}, ${mx} ${by}, ${bx} ${by}`}
                 stroke={isHot ? "var(--accent)" : "var(--rule-strong)"}
                 strokeWidth={isHot ? 1.5 : 1}
+                strokeDasharray={e.style?.dash || ""}
                 fill="none"
               />
             );
@@ -234,6 +244,8 @@ function MindMap({ layout, highlightedId, onNodeClick }) {
                 cursor: isBeingDragged ? "grabbing" : "grab",
                 zIndex: isBeingDragged ? 10 : isHot ? 2 : 1,
                 boxShadow: isBeingDragged ? "var(--shadow)" : undefined,
+                fontSize: n.style?.fontSize,
+                filter: n.style?.saturation ? `saturate(${0.8 + n.style.saturation})` : undefined,
               }}
               onMouseDown={(e) => startNodeDrag(e, n.id)}
             >
@@ -258,6 +270,20 @@ function MindMap({ layout, highlightedId, onNodeClick }) {
           <span>drag node · pan canvas · click = select</span>
         </div>
       </div>
+      {selected && (
+        <aside className="mindmap-detail">
+          <h3>{selected.label}</h3>
+          <p>{selected.definition || "No definition captured yet."}</p>
+          <button className="btn primary" onClick={() => onPractice && onPractice(selected.label)}>Practice 3</button>
+          <div className="source-list">
+            {(selected.source_chunks || []).map((chunk, i) => (
+              <button key={i} className="source-link" onClick={() => onSourceClick && onSourceClick(chunk)}>
+                {chunk.source_file || chunk.chunk_id || "source"} {chunk.page ? `p.${chunk.page}` : ""}
+              </button>
+            ))}
+          </div>
+        </aside>
+      )}
     </div>
   );
 }

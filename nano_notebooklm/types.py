@@ -105,13 +105,16 @@ class Concept(BaseModel):
     concept_type: str = "definition"  # definition, theorem, algorithm, example
     course_ids: list[str] = Field(default_factory=list)
     chunk_ids: list[str] = Field(default_factory=list)
+    depth: int = 1
+    weight: float = 1.0
+    source_chunks: list[dict] = Field(default_factory=list)
 
 
 class Relation(BaseModel):
     """A relationship between concepts."""
     source: str  # concept_id
     target: str  # concept_id
-    relation_type: str  # prerequisite, part_of, example_of, contrasts_with
+    relation_type: str  # is-a, part-of, depends-on, example-of, related
 
 
 # ── Skill models ─────────────────────────────────────────────────────

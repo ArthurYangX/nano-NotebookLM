@@ -36,13 +36,22 @@ function ReaderParagraph({ p, highlightedId, onHighlight, onCite }) {
   );
 }
 
-function Reader({ onHighlight, highlightedId, onCite }) {
+function Reader({ sources, activeId, activePage, onHighlight, highlightedId, onCite, notice }) {
+  const source = (sources || []).find(s => s.id === activeId) || (sources || [])[0];
+  const pageLabel = activePage ? `Page ${activePage}` : "Overview";
   return (
     <div className="reader" data-screen-label="Reader">
       <article className="page">
+        {notice && <div className="reader-notice">{notice}</div>}
         <div className="chapter-eye mono">{READER_DOC.chapter}</div>
-        <h1>{READER_DOC.title}</h1>
-        <div className="sub serif">{READER_DOC.sub}</div>
+        <h1>{source ? source.title : READER_DOC.title}</h1>
+        <div className="sub serif">{source ? `${pageLabel} · ${source.meta || ""}` : READER_DOC.sub}</div>
+
+        {highlightedId && (
+          <div className="reader-target active">
+            Highlighted chunk <b>{highlightedId}</b>
+          </div>
+        )}
 
         {READER_DOC.body.map((p, i) => (
           <ReaderParagraph
@@ -57,8 +66,8 @@ function Reader({ onHighlight, highlightedId, onCite }) {
         <div className="ornament">· · ·</div>
 
         <div className="page-footer mono">
-          <span>Marginalia · Organic Chemistry 301</span>
-          <span>Page 142 of 280</span>
+          <span>nano-NOTEBOOKLM Reader</span>
+          <span>{pageLabel}</span>
         </div>
       </article>
     </div>

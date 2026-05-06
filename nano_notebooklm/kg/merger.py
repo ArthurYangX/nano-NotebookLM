@@ -20,6 +20,9 @@ def merge_concepts(concepts: list[Concept]) -> list[Concept]:
             existing = merged[key]
             existing.chunk_ids = list(set(existing.chunk_ids + c.chunk_ids))
             existing.course_ids = list(set(existing.course_ids + c.course_ids))
+            existing.source_chunks = _merge_sources(existing.source_chunks, c.source_chunks)
+            existing.weight = max(existing.weight, c.weight)
+            existing.depth = min(existing.depth, c.depth)
             if not existing.definition and c.definition:
                 existing.definition = c.definition
         else:
@@ -51,3 +54,15 @@ def merge_relations(
 def _normalize_name(name: str) -> str:
     """Normalize concept name for deduplication."""
     return name.lower().strip().replace("-", " ").replace("_", " ")
+
+
+def _merge_sources(left: list[dict], right: list[dict]) -> list[dict]:
+    seen = set()
+    out = []
+    for item in list(left or []) + list(right or []):
+        key = (item.get("chunk_id"), item.get("source_file"), item.get("page"))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+    return out

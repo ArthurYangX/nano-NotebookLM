@@ -50,6 +50,14 @@ async def extract_concepts_from_chunk(
                 concept_type=rc.get("type", "definition"),
                 course_ids=[chunk.course_id],
                 chunk_ids=[chunk.chunk_id],
+                depth=_depth_for_type(rc.get("type", "definition")),
+                weight=_weight_for_concept(rc, chunk),
+                source_chunks=[{
+                    "chunk_id": chunk.chunk_id,
+                    "source_file": chunk.source_file,
+                    "location": chunk.location,
+                    "page": chunk.page,
+                }],
             ))
 
     relations = []
@@ -64,7 +72,7 @@ async def extract_concepts_from_chunk(
                 relations.append(Relation(
                     source=f"concept_{course_name}_{_slug(source)}",
                     target=f"concept_{course_name}_{_slug(target)}",
-                    relation_type=rr.get("type", "related_to"),
+                    relation_type=_normalize_relation(rr.get("type", "related")),
                 ))
 
     return concepts, relations
@@ -114,3 +122,36 @@ def _slug(name: str) -> str:
     slug = re.sub(r"[^\w\s-]", "", name.lower())
     slug = re.sub(r"[\s_]+", "_", slug).strip("_")
     return slug[:50]
+
+
+def _depth_for_type(concept_type: str) -> int:
+    t = str(concept_type or "").lower()
+    if t in {"course", "topic", "chapter"}:
+        return 0
+    if t in {"definition", "theorem", "algorithm"}:
+        return 1
+    return 2
+
+
+def _weight_for_concept(raw: dict[str, Any], chunk: Chunk) -> float:
+    score = raw.get("weight", raw.get("importance", 1.0))
+    try:
+        score = float(score)
+    except (TypeError, ValueError):
+        score = 1.0
+    name_len = len(str(raw.get("name", "")).split())
+    return max(1.0, min(10.0, score + min(name_len, 4) * 0.25))
+
+
+def _normalize_relation(relation_type: str) -> str:
+    value = str(relation_type or "related").lower().replace("_", "-")
+    aliases = {
+        "prerequisite": "depends-on",
+        "prerequisite-of": "depends-on",
+        "part_of": "part-of",
+        "related-to": "related",
+        "definition-of": "is-a",
+        "type-of": "is-a",
+    }
+    value = aliases.get(value, value)
+    return value if value in {"is-a", "part-of", "depends-on", "example-of", "related"} else "related"
