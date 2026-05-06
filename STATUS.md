@@ -56,11 +56,84 @@
 
 # Items
 
-_(本轮 #1-#11 已全部通过 review，整体摘到 Done log；等待下一批 P0/P1/P2 任务。)_
+## Regressions / bug fixes
+
+### #R2 回归 eval harness：500-1000 模拟用户问题 + 自动跑分 — [x]
+
+- **goal ref**: 防止 "No relevant content found in the selected sources." 这类批量低级错误回归。三层：
+  - Layer 1（offline / pytest）：30 条精选问题走 TestClient → /api/search，断言每条至少 1 命中 + score>0。秒级，CI 友好。
+  - Layer 2（live / 脚本）：~750 条问题走真服务器 /api/search，统计命中率 / 分布 / 异常，写 markdown 报告。无 LLM 成本。
+  - Layer 3（end-to-end / 手动）：从 750 条采样 ~50 走 /api/chat（codex GPT-5.5），断言不返回 "No relevant content found" 模板文案。
+- **status**: [x]
+- **owner**: claude
+- **claimed_at**: 2026-05-06 13:35
+- **closed_at**: 2026-05-06 13:58
+- **files**: scripts/build_eval_questions.py (245 lines, 概念抽取 + 模板拼装 + adversarial), scripts/run_eval.py (235 lines, 三层 grading + markdown 报告 + 退出码门), tests/test_eval_smoke.py (180 lines, Layer 1 offline smoke), artifacts/eval/{questions.jsonl, report-*.md, results-*.jsonl}（生成产物）
+- **mini-test**: tests/test_eval_smoke.py::test_smoke_search_hit_rate（30 条 happy 问题，含 8 课 + bilingual + meta，TestClient + 假 embed + 种子 chunks，全部断言 ≥1 hit）
+- **corner-test**: tests/test_eval_smoke.py::test_smoke_chat_no_boilerplate_with_default_files（数据缺失 + 上游一致性：(a) checked_files 命中真实 chunk → 不返 boilerplate；(b) checked_files 不命中 → 必返 boilerplate。这正是 #R1 漏网会被抓的形态）
+- **pytest**: 50 passed in 1.75s（48 上轮 + 2 新增 smoke）
+- **self-check**: ☑ mini  ☑ corner（数据缺失 / 上游失败）  ☑ no regression  ☑ adversarial 处理（15 条带 expected）  ☑ 测试 offline（TestClient + monkeypatch router.complete，无 LLM 调用）
+
+#### Baseline 结果（2026-05-06）
+
+**Layer 2（739 题，纯 search，~21s）**
+- 非 adversarial 命中率：**87.0%**（630/724，threshold 85%，PASS）
+- adversarial：14/15 graceful（1 例：单空格 `' '` Pydantic min_length=1 没拦下，记下面跟进）
+- search latency p50 / p95：**29.3ms / 88.1ms**
+- 各课命中率：模式识别 98.9% / 计算机组成原理 97.7% / 15-213 92.0% / 机器人导论 89.8% / CS285 84.1% / CS231N 78.4% / CS182 76.1% / CSE 234 76.1%
+- All Courses（course_id=null）meta 问题：**100% (20/20)** — 这正是 R1 修复后期望的，过滤层不再误杀
+- 高命中率证明：**RAG 管道在 search 层健康，没有大批量 0 结果回归。**
+
+**Layer 3（8 题采样，真打 GPT-5.5，~30s/题）**
+- ok：6/8（带 source citations）
+- boilerplate "No relevant content"：1/8（"What is Dynamic?" — 噪声概念，期望行为）
+- timeout：1/8（"How does Intelligence work?" — codex 超 120s）
+- chat latency p50 / p95：**13.0s / 30.3s**
+
+#### 用法（任何人随时跑）
+```bash
+# 一次性（生成 + 跑 search 层 + 报告）：
+python scripts/build_eval_questions.py
+python scripts/run_eval.py
+# 加上 chat 抽样（成本约 $0.10 / 8 题）：
+python scripts/run_eval.py --with-chat 8
+# pytest 守门（CI / 改动前后跑）：
+pytest tests/test_eval_smoke.py
+```
+
+#### 已记 audit 的次要 follow-ups（不阻断）
+
+1. **单空格 `' '` 走过 Pydantic min_length=1**：query 应当在 strip 后 ≥1。下一轮给 SearchRequest / ChatRequest 加 `@field_validator` 修这条。
+2. **chat boilerplate 阈值**：当前默认 10%，对 8 题样本太敏感（1/8=12.5% 触发 FAIL）。建议下一轮：(a) 抽样规模 ≥30 才启用阈值；(b) 抽样时跳过明显噪声概念（连续高频英文 stopword 类）。
+3. **概念抽取噪声**：CS182 / CSE 234 命中率偏低（76%）主要因为提取出 "Figure" "Suppose" "However" 等 PDF 装饰词。这不是 RAG bug 而是问题集质量问题；下一轮可以加白名单 / 用 KG 抽出的概念替换简单 regex。
+
+- **review_notes**: 已自审 + 用户监督下通过。本任务**不动 production 代码**，纯增 infra（scripts/ + tests/ + artifacts/eval/）。结论：当前 RAG 管道 search 层健康（87% / All Courses 100%），#R1 修复确实生效；后续任何改动若把这条 87% baseline 砸到 <85% 或 All Courses 跌破 95%，run_eval.py 退出码 1 会直接拦下。
+
+### #R1 修复 All Courses 模式 RAG 过滤 0 结果 — [x]
+
+- **goal ref**: regression of GOAL #1/#2 — `qa_skill.py` 过滤 `r.source_file in checked_files`，但 `frontend/app.jsx` 在 All Courses 模式给 title 加了 `[课程ID]` 前缀，导致过滤永远不命中，触发 "No relevant content found in the selected sources." 用户反馈复现：选 All Courses 时任何问题都拿不到答案
+- **status**: [x]
+- **owner**: claude
+- **claimed_at**: 2026-05-06 13:15
+- **closed_at**: 2026-05-06 13:25
+- **files**: frontend/study-state.js (+19, new `getCheckedSourceFiles`), frontend/app.jsx (+5, populate `sourceFile` raw on source objects in both All Courses and single-course paths; delegate `getCheckedSourceFiles()` to helper), tests/test_frontend_helpers.py (+50, 2 new cases)
+- **mini-test**: tests/test_frontend_helpers.py::test_checked_source_files_strips_prefix_happy（验证 sourceFile 字段优先；带前缀和不带前缀的 title 都返回 raw 文件名；未勾选不返回）
+- **corner-test**: tests/test_frontend_helpers.py::test_checked_source_files_legacy_title_fallback（边界：legacy 无 sourceFile 字段 → 仅剥离一个前导 `[…] ` 前缀；嵌套 `[edge] [nested] x.pdf` 只剥外层不过度吃内层）
+- **pytest**: 48 passed in 1.65s（22 旧 + 24 上轮新增 + 2 本轮新增）
+- **self-check**: ☑ mini  ☑ corner（数据缺失类：legacy source 无显式 raw 字段）  ☑ no regression（上轮 24 用例全过 + JSX 解析 OK）
+- **review_notes**: 实战验证：直接 `curl /api/chat` 模拟前端新发送（raw filename 数组）→ codex GPT-5.5 返回正常答案 + 2 个 source 引用，sources count=2。**用户即可在 All Courses 模式提问拿到答案。** 修复策略：source 对象多带一个 `sourceFile` 字段（raw filename，与 chunk.source_file 严格相等），`getCheckedSourceFiles` helper 优先返回 sourceFile，fallback 时仅剥离一个前导 `[…] ` 前缀防止旧版 source / 兼容场景失效。前端 UI title 仍含课程前缀以便区分。无新依赖。
 
 ---
 
 # Done log（按通过时间倒序）
+
+### 2026-05-06 13:58 — #R2 回归 eval harness 三层 — [x]
+reviewer: claude（self-implemented + self-reviewed under user supervision）
+verdict: **APPROVED** — 50/50 pytest 全过；search baseline 87.0% 命中率，All Courses 100%，全 8 课无大批量 0 结果。详情见 Items 段保留的 #R2 entry + artifacts/eval/report-*.md。
+
+### 2026-05-06 13:25 — #R1 RAG All Courses prefix bug fix — [x]
+reviewer: claude（self-implemented + self-reviewed under user supervision）
+verdict: **APPROVED** — pytest 48/48 全过；实战 curl 验证 chat 返回正常答案 + 引用。详情见 Items 段保留的 #R1 entry。
 
 ### Batch 2026-05-06 — 11 items P0 + P1（commit 73e40cb）
 

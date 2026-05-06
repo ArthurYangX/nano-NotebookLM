@@ -106,6 +106,7 @@ function App() {
                 id: `${courses[ci].id}_${s.id || i}`,
                 type: s.type === "pdf" ? "pdf" : s.type === "pptx" ? "ppt" : "txt",
                 title: `[${courses[ci].id}] ${s.title}`,
+                sourceFile: s.title,  // raw filename, used for backend filter
                 meta: `${s.chunks} chunks`,
                 checked: true,
                 collection: courses[ci].id,
@@ -122,6 +123,7 @@ function App() {
         id: s.id || `s${i}`,
         type: s.type === "pdf" ? "pdf" : s.type === "pptx" ? "ppt" : "txt",
         title: s.title,
+        sourceFile: s.title,  // raw filename, used for backend filter
         meta: `${s.chunks} chunks`,
         checked: true, // All checked by default
         collection: "main",
@@ -141,8 +143,10 @@ function App() {
   }, [tweaks.theme, tweaks.density, tweaks.baseSize]);
 
   // ── Get checked source file names for context filtering ──
+  // Delegates to StudyState.getCheckedSourceFiles which returns raw filenames
+  // (matching chunk.source_file) so the backend qa_skill filter actually hits.
   function getCheckedSourceFiles() {
-    return sources.filter(s => s.checked).map(s => s.title);
+    return StudyState.getCheckedSourceFiles(sources);
   }
 
   // ── API actions ──

@@ -73,6 +73,12 @@ async def request_logging_middleware(request: Request, call_next):
     _record_latency(request.url.path, elapsed_ms)
     response.headers["x-request-id"] = rid
     response.headers["x-response-time-ms"] = f"{elapsed_ms:.1f}"
+    # Dev-mode: prevent browser from caching JSX/JS so edits show up on plain
+    # reload. Babel-standalone otherwise serves stale code and produces
+    # confusing "fix didn't work" reports.
+    if request.url.path.startswith("/static") or request.url.path == "/":
+        response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        response.headers["Pragma"] = "no-cache"
     access_log.info(
         "rid=%s %s %s -> %d in %.1fms",
         rid, request.method, request.url.path, response.status_code, elapsed_ms,

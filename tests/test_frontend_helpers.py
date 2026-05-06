@@ -276,3 +276,51 @@ def test_observability_status_timeout():
         """
     )
     assert run_node(script).strip() == "ok"
+
+
+def test_checked_source_files_strips_prefix_happy():
+    """All Courses mode prepends '[course] ' to title for display, but the
+    backend qa_skill compares against raw source_file. The helper must return
+    the raw filename so the filter actually matches."""
+    script = textwrap.dedent(
+        """
+        const h = require('./frontend/study-state.js');
+        const sources = [
+          { id: 's1', title: '[计算机组成原理] 第五章.pdf', sourceFile: '第五章.pdf', checked: true },
+          { id: 's2', title: '第一章.pdf', sourceFile: '第一章.pdf', checked: true },
+          { id: 's3', title: '[CS182] hidden.pdf', sourceFile: 'hidden.pdf', checked: false },
+        ];
+        const out = h.getCheckedSourceFiles(sources);
+        if (out.length !== 2) throw new Error('expected 2 checked files, got ' + out.length);
+        if (out[0] !== '第五章.pdf') throw new Error('All Courses prefix not stripped: ' + out[0]);
+        if (out[1] !== '第一章.pdf') throw new Error('single course filename mangled: ' + out[1]);
+        console.log('ok');
+        """
+    )
+    assert run_node(script).strip() == "ok"
+
+
+def test_checked_source_files_legacy_title_fallback():
+    """Corner: source objects without explicit sourceFile (legacy / new uploads)
+    must still produce a usable filter value — strip a leading bracketed prefix
+    if present so the qa filter can still hit on All Courses titles."""
+    script = textwrap.dedent(
+        """
+        const h = require('./frontend/study-state.js');
+        const sources = [
+          { id: 's1', title: '[机器人导论] sensors.pdf', checked: true },
+          { id: 's2', title: 'plain.pdf', checked: true },
+          { id: 's3', title: '[edge] [nested] weird.pdf', checked: true },
+          { id: 's4', title: '[unchecked] x.pdf', checked: false },
+        ];
+        const out = h.getCheckedSourceFiles(sources);
+        if (out.length !== 3) throw new Error('expected 3 checked files, got ' + out.length);
+        if (out[0] !== 'sensors.pdf') throw new Error('legacy bracket strip failed: ' + out[0]);
+        if (out[1] !== 'plain.pdf') throw new Error('plain title mangled: ' + out[1]);
+        // Only strip ONE leading [...] prefix so legitimate filenames containing
+        // brackets do not get over-eaten.
+        if (out[2] !== '[nested] weird.pdf') throw new Error('over-stripped nested brackets: ' + out[2]);
+        console.log('ok');
+        """
+    )
+    assert run_node(script).strip() == "ok"

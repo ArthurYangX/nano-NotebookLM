@@ -57,6 +57,25 @@
     return String(data.content || data.report || data.summary || "No report content.");
   }
 
+  function getCheckedSourceFiles(sources) {
+    // Returns the raw filenames (matching chunk.source_file) for all checked
+    // sources. Frontend may decorate the visible title with a "[course] "
+    // prefix in All Courses mode — we must strip that here so the backend
+    // qa_skill filter (`r.source_file in checked_files`) actually matches.
+    return (sources || [])
+      .filter(s => s && s.checked !== false)
+      .map(s => {
+        if (!s) return "";
+        if (typeof s.sourceFile === "string" && s.sourceFile) return s.sourceFile;
+        const title = String(s.title || "");
+        // Strip a single leading "[…] " bracketed prefix, but only one — keeps
+        // legitimate bracketed filenames intact.
+        const stripped = title.replace(/^\[[^\]]*\]\s+/, "");
+        return stripped;
+      })
+      .filter(Boolean);
+  }
+
   function resolveCitationNavigation(refText, sources) {
     const raw = String(refText || "").replace(/^\[Source:\s*/i, "").replace(/\]$/, "").trim();
     const chunkMatch = raw.match(/\bchunk\s+([A-Za-z0-9_.:-]+)/i) || raw.match(/\b(c[0-9A-Za-z_.:-]+)\b/);
@@ -285,6 +304,7 @@
   return {
     createMemoryStorage,
     createSkillEntries,
+    getCheckedSourceFiles,
     resolveCitationNavigation,
     prepareMindmap,
     getMindmapNodeDetail,
