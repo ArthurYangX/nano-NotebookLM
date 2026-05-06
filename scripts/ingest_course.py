@@ -1,0 +1,36 @@
+"""CLI script to ingest course materials into the knowledge base."""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import sys
+from pathlib import Path
+
+# Add project root to path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from nano_notebooklm.kb.store import KBStore
+
+
+def main():
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
+
+    parser = argparse.ArgumentParser(description="Ingest course materials")
+    parser.add_argument("course_dir", type=str, help="Path to course directory")
+    parser.add_argument("--course-id", type=str, help="Course identifier (default: directory name)")
+    parser.add_argument("--build-index", action="store_true", help="Build search index after ingestion")
+    args = parser.parse_args()
+
+    kb = KBStore()
+    course = kb.ingest_course(args.course_dir, args.course_id)
+    print(f"Ingested course: {course.course_id}")
+
+    if args.build_index:
+        print("Building search index...")
+        kb.build_index(course.course_id)
+        print("Done!")
+
+
+if __name__ == "__main__":
+    main()

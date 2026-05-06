@@ -1,0 +1,59 @@
+[project]
+name = "nano-notebooklm"
+version = "0.1.0"
+description = "AI-powered study assistant: knowledge extraction, notes, exam prep, and more"
+requires-python = ">=3.10"
+dependencies = [
+    # AI backends
+    "anthropic>=0.40.0",
+    "openai>=1.50.0",
+    "tiktoken>=0.7.0",
+    # Document processing
+    "PyMuPDF>=1.24.0",
+    "python-pptx>=0.6.23",
+    "python-docx>=1.1.0",
+    # Embeddings & search
+    "sentence-transformers>=3.0",
+    "faiss-cpu>=1.8.0",
+    "rank-bm25>=0.2.2",
+    # Knowledge graph
+    "networkx>=3.3",
+    # Data handling
+    "pydantic>=2.7",
+    "numpy>=1.26",
+    # UI
+    "gradio>=5.0",
+    # Utilities
+    "rich>=13.0",
+    "python-dotenv>=1.0",
+    "aiohttp>=3.9",
+    # API server
+    "fastapi>=0.110",
+    "uvicorn>=0.27",
+    "python-multipart>=0.0.9",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "httpx>=0.27",
+]
+
+[project.scripts]
+nano-nlm = "nano_notebooklm.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["nano_notebooklm*", "ui*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::PendingDeprecationWarning",
+]
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"

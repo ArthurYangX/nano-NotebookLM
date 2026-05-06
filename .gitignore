@@ -1,0 +1,19 @@
+# Local environment
+.env
+.venv/
+
+# Python caches / build output
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+*.zip
+
+# Generated app data and personal study artifacts
+artifacts/
+
+# OS / editor noise
+.DS_Store

@@ -1,0 +1,494 @@
+"""FastAPI backend for nano-NOTEBOOKLM — serves API + static frontend."""
+
+from __future__ import annotations
+
+import json
+import logging
+import time
+import uuid
+from pathlib import Path
+from typing import Annotated, Any
+
+from fastapi import FastAPI, File, UploadFile, HTTPException, Request, status
+from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field, field_validator
+
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from nano_notebooklm.ai.router import ModelRouter
+from nano_notebooklm.kb.store import KBStore
+from nano_notebooklm.orchestrator.engine import Orchestrator
+from nano_notebooklm import config
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+)
+logger = logging.getLogger(__name__)
+access_log = logging.getLogger("nano.access")
+
+# ── Init core components ─────────────────────────────────────────────
+kb = KBStore()
+router = ModelRouter()
+orchestrator = Orchestrator(kb, router)
+
+app = FastAPI(
+    title="nano-NOTEBOOKLM API",
+    version="0.2.0",
+    description="AI-powered study assistant — knowledge extraction, notes, quizzes, and reports.",
+    contact={"name": "nano-NOTEBOOKLM"},
+)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+# ── Upload limits ────────────────────────────────────────────────────
+MAX_UPLOAD_SIZE_MB = 50
+MAX_UPLOAD_SIZE_BYTES = MAX_UPLOAD_SIZE_MB * 1024 * 1024
+ALLOWED_UPLOAD_SUFFIXES = {".pdf", ".pptx", ".docx", ".md", ".txt"}
+
+# ── Middleware: request ID, access log, latency ──────────────────────
+@app.middleware("http")
+async def request_logging_middleware(request: Request, call_next):
+    rid = request.headers.get("x-request-id") or uuid.uuid4().hex[:12]
+    request.state.request_id = rid
+    start = time.perf_counter()
+    try:
+        response = await call_next(request)
+    except Exception:
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        access_log.exception(
+            "rid=%s %s %s -> 500 in %.1fms (unhandled)",
+            rid, request.method, request.url.path, elapsed_ms,
+        )
+        raise
+    elapsed_ms = (time.perf_counter() - start) * 1000
+    response.headers["x-request-id"] = rid
+    response.headers["x-response-time-ms"] = f"{elapsed_ms:.1f}"
+    access_log.info(
+        "rid=%s %s %s -> %d in %.1fms",
+        rid, request.method, request.url.path, response.status_code, elapsed_ms,
+    )
+    return response
+
+
+# ── Global exception handlers ────────────────────────────────────────
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    rid = getattr(request.state, "request_id", "?")
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content={
+            "error": "validation_error",
+            "request_id": rid,
+            "detail": exc.errors(),
+        },
+    )
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    rid = getattr(request.state, "request_id", "?")
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "error": exc.detail if isinstance(exc.detail, str) else "http_error",
+            "request_id": rid,
+            "detail": exc.detail,
+        },
+        headers=exc.headers,
+    )
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    rid = getattr(request.state, "request_id", "?")
+    logger.exception("rid=%s unhandled error in %s %s", rid, request.method, request.url.path)
+    return JSONResponse(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content={
+            "error": "internal_error",
+            "request_id": rid,
+            "detail": str(exc),
+        },
+    )
+
+
+# ── Request/Response models (with validation) ───────────────────────
+class ChatRequest(BaseModel):
+    question: str = Field(..., min_length=1, max_length=4000)
+    course_id: str | None = Field(None, max_length=128)
+    top_k: int = Field(5, ge=1, le=50)
+    checked_files: list[str] | None = None
+
+
+class SearchRequest(BaseModel):
+    query: str = Field(..., min_length=1, max_length=2000)
+    course_id: str | None = Field(None, max_length=128)
+    top_k: int = Field(5, ge=1, le=50)
+
+
+class NoteRequest(BaseModel):
+    course_id: str = Field(..., min_length=1, max_length=128)
+    topic: str | None = Field(None, max_length=500)
+    format: str = Field("markdown", pattern=r"^(markdown|text|html)$")
+
+
+class QuizRequest(BaseModel):
+    course_id: str = Field(..., min_length=1, max_length=128)
+    topic: str | None = Field(None, max_length=500)
+    num_questions: int = Field(6, ge=1, le=30)
+    difficulty: str = Field("medium", pattern=r"^(easy|medium|hard)$")
+
+
+class ReportRequest(BaseModel):
+    course_id: str = Field(..., min_length=1, max_length=128)
+    report_type: str = Field("summary", max_length=64)
+    include_code: bool = False
+    format: str = Field("markdown", pattern=r"^(markdown|text|html)$")
+
+
+class IngestRequest(BaseModel):
+    course_dir: str = Field(..., min_length=1)
+    course_id: str | None = Field(None, max_length=128)
+
+
+class ExamAnalysisRequest(BaseModel):
+    course_id: str = Field(..., min_length=1, max_length=128)
+
+
+class MemoryUpdate(BaseModel):
+    key: str = Field(..., min_length=1, max_length=200)
+    value: Any
+
+
+# ── Course endpoints ─────────────────────────────────────────────────
+@app.get("/api/courses", tags=["courses"], summary="List courses with chunk counts")
+async def list_courses():
+    courses = orchestrator.list_courses()
+    result = []
+    for cid in courses:
+        chunks = kb.get_chunks(cid)
+        meta_path = config.ARTIFACTS_DIR / "courses" / cid / "course_meta.json"
+        meta = {}
+        if meta_path.exists():
+            try:
+                meta = json.loads(meta_path.read_text())
+            except json.JSONDecodeError:
+                logger.warning("Corrupt course_meta.json for %s", cid)
+        result.append({
+            "id": cid,
+            "name": meta.get("name", cid),
+            "chunks": len(chunks),
+            "documents": len(meta.get("documents", [])),
+        })
+    return {"courses": result}
+
+
+@app.get("/api/sources/{course_id}", tags=["courses"], summary="List source files for a course")
+async def get_sources(course_id: str):
+    chunks = kb.get_chunks(course_id)
+    if not chunks:
+        return {"sources": []}
+    sources: dict[str, dict] = {}
+    for c in chunks:
+        if c.source_file not in sources:
+            sources[c.source_file] = {
+                "id": c.doc_id,
+                "type": c.file_type.value,
+                "title": c.source_file,
+                "chunks": 0,
+                "checked": True,
+            }
+        sources[c.source_file]["chunks"] += 1
+    return {"sources": list(sources.values())}
+
+
+# ── Skill endpoints ──────────────────────────────────────────────────
+@app.post("/api/chat", tags=["skills"], summary="RAG chat with source citations")
+async def chat(req: ChatRequest):
+    result = await orchestrator.skills["qa"].execute({
+        "question": req.question,
+        "course_filter": req.course_id,
+        "top_k": req.top_k,
+        "checked_files": req.checked_files,
+    })
+    if not result.success:
+        raise HTTPException(status_code=502, detail=result.error or "qa skill failed")
+    return result.data
+
+
+@app.post("/api/search", tags=["skills"], summary="Hybrid search across knowledge base")
+async def search(req: SearchRequest):
+    results = kb.search(req.query, top_k=req.top_k, course_id=req.course_id)
+    return {
+        "results": [
+            {
+                "chunk_id": r.chunk_id,
+                "text": r.text,
+                "source_file": r.source_file,
+                "location": r.location,
+                "score": r.score,
+                "course_id": r.course_id,
+            }
+            for r in results
+        ]
+    }
+
+
+@app.post("/api/notes", tags=["skills"], summary="Generate structured study notes")
+async def generate_notes(req: NoteRequest):
+    result = await orchestrator.run_skill("note_generator", {
+        "course_id": req.course_id,
+        "topic": req.topic,
+        "format": req.format,
+    })
+    if not result.success:
+        raise HTTPException(status_code=502, detail=result.error or "note generation failed")
+    return result.data
+
+
+@app.post("/api/quiz", tags=["skills"], summary="Generate a practice quiz")
+async def generate_quiz(req: QuizRequest):
+    result = await orchestrator.run_skill("quiz_generator", {
+        "course_id": req.course_id,
+        "topic": req.topic,
+        "num_questions": req.num_questions,
+        "difficulty": req.difficulty,
+    })
+    if not result.success:
+        raise HTTPException(status_code=502, detail=result.error or "quiz generation failed")
+    return result.data
+
+
+@app.post("/api/exam-analysis", tags=["skills"], summary="Analyze exam patterns for a course")
+async def analyze_exam(req: ExamAnalysisRequest):
+    result = await orchestrator.run_skill("exam_analyzer", {"course_id": req.course_id})
+    if not result.success:
+        raise HTTPException(status_code=502, detail=result.error or "exam analysis failed")
+    return result.data
+
+
+@app.post("/api/report", tags=["skills"], summary="Generate a course report")
+async def generate_report(req: ReportRequest):
+    result = await orchestrator.run_skill("report_generator", {
+        "course_id": req.course_id,
+        "report_type": req.report_type,
+        "include_code": req.include_code,
+        "format": req.format,
+    })
+    if not result.success:
+        raise HTTPException(status_code=502, detail=result.error or "report generation failed")
+    return result.data
+
+
+@app.post("/api/mindmap/{course_id}", tags=["skills"], summary="Get or generate knowledge graph as mindmap tree")
+async def get_mindmap(course_id: str):
+    kg_path = config.ARTIFACTS_DIR / "courses" / course_id / "knowledge_graph.json"
+
+    if kg_path.exists():
+        try:
+            data = json.loads(kg_path.read_text())
+            return _kg_to_mindmap(data, course_id)
+        except json.JSONDecodeError:
+            logger.warning("Corrupt knowledge_graph.json for %s, regenerating", course_id)
+
+    from nano_notebooklm.kg.extractor import extract_from_chunks
+    from nano_notebooklm.kg.graph import KnowledgeGraph
+    from nano_notebooklm.kg.merger import merge_concepts, merge_relations
+
+    chunks = kb.get_chunks(course_id)
+    if not chunks:
+        raise HTTPException(404, f"No chunks for course '{course_id}'")
+
+    concepts, relations = await extract_from_chunks(chunks, course_id, router, max_chunks=30)
+    concepts = merge_concepts(concepts)
+    relations = merge_relations(relations)
+
+    kg = KnowledgeGraph()
+    kg.add_concepts(concepts)
+    kg.add_relations(relations)
+    kg.save(kg_path)
+
+    data = json.loads(kg_path.read_text())
+    return _kg_to_mindmap(data, course_id)
+
+
+# ── Ingest / upload ──────────────────────────────────────────────────
+@app.post("/api/ingest", tags=["ingest"], summary="Ingest a course directory")
+async def ingest_course(req: IngestRequest):
+    course_dir = Path(req.course_dir)
+    if not course_dir.exists() or not course_dir.is_dir():
+        raise HTTPException(404, f"Directory not found: {req.course_dir}")
+
+    cid = req.course_id or course_dir.name
+    course = kb.ingest_course(str(course_dir), cid)
+    kb.build_index(cid)
+    chunks = kb.get_chunks(cid)
+    return {
+        "course_id": cid,
+        "chunks": len(chunks),
+        "documents": len(course.documents),
+    }
+
+
+@app.post("/api/upload/{course_id}", tags=["ingest"], summary="Upload files to a course and index")
+async def upload_files(course_id: str, files: Annotated[list[UploadFile], File(...)]):
+    if not files:
+        raise HTTPException(400, "No files provided")
+
+    upload_dir = config.ARTIFACTS_DIR / "uploads" / course_id
+    upload_dir.mkdir(parents=True, exist_ok=True)
+
+    saved = 0
+    for f in files:
+        if not f.filename:
+            continue
+        suffix = Path(f.filename).suffix.lower()
+        if suffix not in ALLOWED_UPLOAD_SUFFIXES:
+            raise HTTPException(
+                400,
+                f"Unsupported file type '{suffix}'. Allowed: {sorted(ALLOWED_UPLOAD_SUFFIXES)}",
+            )
+        safe_name = Path(f.filename).name
+        dest = upload_dir / safe_name
+        content = await f.read()
+        if len(content) > MAX_UPLOAD_SIZE_BYTES:
+            raise HTTPException(
+                413,
+                f"File '{safe_name}' is {len(content) / 1024 / 1024:.1f}MB, exceeds limit of {MAX_UPLOAD_SIZE_MB}MB",
+            )
+        dest.write_bytes(content)
+        saved += 1
+
+    if saved == 0:
+        raise HTTPException(400, "No valid files saved")
+
+    course = kb.ingest_course(str(upload_dir), course_id)
+    kb.build_index(course_id)
+    chunks = kb.get_chunks(course_id)
+    return {
+        "course_id": course_id,
+        "files": saved,
+        "chunks": len(chunks),
+        "documents": len(course.documents),
+    }
+
+
+# ── Mastery ──────────────────────────────────────────────────────────
+@app.get("/api/mastery/{course_id}", tags=["learning"], summary="Get mastery scores and weak areas")
+async def get_mastery(course_id: str):
+    mastery_path = config.ARTIFACTS_DIR / "courses" / course_id / "mastery.json"
+    if not mastery_path.exists():
+        return {"mastery": {}, "weak_areas": []}
+    try:
+        data = json.loads(mastery_path.read_text())
+    except json.JSONDecodeError:
+        raise HTTPException(500, "Corrupt mastery.json")
+    weak = sorted(
+        [{"concept": v.get("concept", k), "score": v.get("score", 0.0)}
+         for k, v in data.items() if v.get("score", 1.0) < 0.5],
+        key=lambda x: x["score"],
+    )
+    return {"mastery": data, "weak_areas": weak}
+
+
+# ── Status / health ──────────────────────────────────────────────────
+@app.get("/api/status", tags=["system"], summary="System status and model usage")
+async def status_endpoint():
+    courses = orchestrator.list_courses()
+    total_chunks = sum(len(kb.get_chunks(c)) for c in courses)
+    return {
+        "backends": list(router.backends.keys()),
+        "courses": len(courses),
+        "total_chunks": total_chunks,
+        "usage": router.get_usage_summary(),
+        "embedding_mode": config.EMBEDDING_MODE,
+        "embedding_model": config.EMBEDDING_MODEL,
+        "version": app.version,
+    }
+
+
+@app.get("/api/health", tags=["system"], summary="Liveness probe")
+async def health():
+    return {"ok": True, "version": app.version}
+
+
+# ── Memory endpoints ────────────────────────────────────────────────
+from nano_notebooklm.orchestrator.memory import load_memory, save_memory, update_memory
+
+
+@app.get("/api/memory", tags=["memory"], summary="Get user memory")
+async def get_memory():
+    return load_memory()
+
+
+@app.post("/api/memory", tags=["memory"], summary="Update a single memory field")
+async def set_memory(req: MemoryUpdate):
+    update_memory(req.key, req.value)
+    return {"ok": True}
+
+
+@app.put("/api/memory", tags=["memory"], summary="Replace entire memory")
+async def replace_memory(data: dict):
+    save_memory(data)
+    return {"ok": True}
+
+
+# ── Helper ───────────────────────────────────────────────────────────
+def _kg_to_mindmap(kg_data: dict, course_id: str) -> dict:
+    """Convert KG JSON to mindmap tree structure for frontend."""
+    nodes = kg_data.get("nodes", [])
+    edges = kg_data.get("edges", [])
+
+    if not nodes:
+        return {"id": "root", "label": course_id, "children": []}
+
+    children_map: dict[str, list] = {}
+    for edge in edges:
+        src = edge.get("source", "")
+        children_map.setdefault(src, []).append(edge.get("target", ""))
+
+    targets = {e.get("target") for e in edges}
+    roots = [n for n in nodes if n.get("id") not in targets]
+    if not roots:
+        roots = nodes[:5]
+
+    node_map = {n["id"]: n for n in nodes}
+
+    def build_tree(node_id: str, depth: int = 0) -> dict:
+        node = node_map.get(node_id, {})
+        result = {
+            "id": node_id,
+            "label": node.get("name", node_id),
+        }
+        if depth < 3:
+            child_ids = children_map.get(node_id, [])
+            if child_ids:
+                result["children"] = [build_tree(cid, depth + 1) for cid in child_ids[:6]]
+        return result
+
+    root_children = [build_tree(r["id"]) for r in roots[:8]]
+    return {"id": "root", "label": course_id, "children": root_children}
+
+
+# ── Serve frontend ──────────────────────────────────────────────────
+FRONTEND_DIR = Path(__file__).parent.parent / "frontend"
+
+
+@app.get("/", include_in_schema=False)
+async def serve_index():
+    index = FRONTEND_DIR / "index.html"
+    if index.exists():
+        return FileResponse(index)
+    return HTMLResponse("<h1>nano-NOTEBOOKLM</h1><p>Frontend not found. Run setup first.</p>")
+
+
+app.mount("/static", StaticFiles(directory=str(FRONTEND_DIR), html=False), name="static")
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)

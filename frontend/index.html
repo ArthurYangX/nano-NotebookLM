@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>nano-NOTEBOOKLM — AI Study Workbench</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,500;0,8..60,600;1,8..60,400;1,8..60,500&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/styles.css" />
+
+  <script src="https://unpkg.com/react@18.3.1/umd/react.development.js" crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" crossorigin="anonymous"></script>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!-- API bridge (plain JS, no Babel needed) -->
+  <script src="/static/api.js"></script>
+
+  <!-- React components (Babel-transpiled) -->
+  <script type="text/babel" src="/static/tweaks-panel.jsx"></script>
+  <script type="text/babel" src="/static/data.jsx"></script>
+  <script type="text/babel" src="/static/library.jsx"></script>
+  <script type="text/babel" src="/static/reader.jsx"></script>
+  <script type="text/babel" src="/static/notes.jsx"></script>
+  <script type="text/babel" src="/static/mindmap.jsx"></script>
+  <script type="text/babel" src="/static/quiz.jsx"></script>
+  <script type="text/babel" src="/static/assistant.jsx"></script>
+  <script type="text/babel" src="/static/processing.jsx"></script>
+  <script type="text/babel" src="/static/app.jsx"></script>
+</body>
+</html>
