@@ -104,8 +104,32 @@ def test_search_returns_relevant_chunk(client):
     assert any("backprop" in res["text"].lower() for res in results)
 
 
+def test_validation_trimmed_search_happy(client):
+    r = client.post("/api/search", json={"query": "  backpropagation gradients  ", "top_k": 3})
+    assert r.status_code == 200
+    results = r.json()["results"]
+    assert results
+    assert any("backprop" in res["text"].lower() for res in results)
+
+
 def test_validation_rejects_empty_question(client):
     r = client.post("/api/chat", json={"question": ""})
+    assert r.status_code == 422
+    body = r.json()
+    assert body["error"] == "validation_error"
+    assert body["request_id"]
+
+
+def test_validation_rejects_whitespace_question_invalid(client):
+    r = client.post("/api/chat", json={"question": "   "})
+    assert r.status_code == 422
+    body = r.json()
+    assert body["error"] == "validation_error"
+    assert body["request_id"]
+
+
+def test_validation_rejects_whitespace_search_invalid(client):
+    r = client.post("/api/search", json={"query": "\n\t  "})
     assert r.status_code == 422
     body = r.json()
     assert body["error"] == "validation_error"

@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Annotated, Any
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, Request, status
+from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
@@ -95,7 +96,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
         content={
             "error": "validation_error",
             "request_id": rid,
-            "detail": exc.errors(),
+            "detail": jsonable_encoder(exc.errors()),
         },
     )
 
@@ -135,11 +136,21 @@ class ChatRequest(BaseModel):
     top_k: int = Field(5, ge=1, le=50)
     checked_files: list[str] | None = None
 
+    @field_validator("question")
+    @classmethod
+    def question_must_not_be_blank(cls, value: str) -> str:
+        return _strip_nonempty(value, "question")
+
 
 class SearchRequest(BaseModel):
     query: str = Field(..., min_length=1, max_length=2000)
     course_id: str | None = Field(None, max_length=128)
     top_k: int = Field(5, ge=1, le=50)
+
+    @field_validator("query")
+    @classmethod
+    def query_must_not_be_blank(cls, value: str) -> str:
+        return _strip_nonempty(value, "query")
 
 
 class NoteRequest(BaseModel):
@@ -185,6 +196,13 @@ class SessionEntryRequest(BaseModel):
     course_id: str | None = Field(None, max_length=128)
     kind: str = Field(..., min_length=1, max_length=64)
     payload: dict[str, Any] = Field(default_factory=dict)
+
+
+def _strip_nonempty(value: str, field_name: str) -> str:
+    stripped = value.strip()
+    if not stripped:
+        raise ValueError(f"{field_name} must not be blank")
+    return stripped
 
 
 # ── Course endpoints ─────────────────────────────────────────────────

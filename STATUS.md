@@ -58,6 +58,19 @@
 
 ## Regressions / bug fixes
 
+### #R3 Trim validation for chat/search queries
+
+- **goal ref**: #R2 audit follow-up — 单空格 `' '` 走过 Pydantic min_length=1。`SearchRequest.query` 与 `ChatRequest.question` 应在 strip 后 ≥1，避免 whitespace-only 输入进入 search/chat pipeline。
+- **status**: [review]
+- **owner**: codex
+- **claimed_at**: 2026-05-06 14:21
+- **files**: api/server.py (~20 touched lines: `jsonable_encoder` in validation handler, `_strip_nonempty`, `@field_validator` on `ChatRequest.question` / `SearchRequest.query`); tests/test_api_smoke.py (~24 touched lines: 3 validation smoke tests)
+- **mini-test**: tests/test_api_smoke.py::test_validation_trimmed_search_happy
+- **corner-test**: tests/test_api_smoke.py::test_validation_rejects_whitespace_question_invalid / tests/test_api_smoke.py::test_validation_rejects_whitespace_search_invalid（空输入 / 非法格式 → 422 + request_id）
+- **pytest**: `53 passed in 2.02s`（was 50；最后一行：`53 passed in 2.02s`，HEAD + #R3 patch 隔离验证）。当前含并行 #2-1 工作区全量也通过：`77 passed in 2.68s`。
+- **self-check**: ☑ mini  ☑ corner（whitespace / 全角空格 → 422 + request_id）  ☑ no regression
+- **review_notes**: #R3 隔离范围只触碰 `api/server.py` / `tests/test_api_smoke.py` / 本 block。早期红灯暴露 `RequestValidationError.errors()` 内含 `ctx.error=ValueError(...)`，直接进 `JSONResponse` 会触发 `TypeError: Object of type ValueError is not JSON serializable`；已在 validation handler 用 `jsonable_encoder(exc.errors())` 固定。测试 offline，无 LLM / 网络调用，无新依赖。
+
 ### #R2 回归 eval harness：500-1000 模拟用户问题 + 自动跑分 — [x]
 
 - **goal ref**: 防止 "No relevant content found in the selected sources." 这类批量低级错误回归。三层：
