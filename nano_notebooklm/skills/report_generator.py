@@ -64,6 +64,51 @@ class ReportGeneratorSkill(Skill):
     name = "report_generator"
     description = "Generate course reports with optional code and PPT outline"
 
+    def prepare_inputs(self, params: dict) -> dict | None:
+        """Round 2 #5: build the LLM inputs without invoking it so the
+        streaming endpoint can pipe deltas via router.complete_stream."""
+        course_id = params.get("course_id", "")
+        report_type = params.get("report_type", "summary")
+        include_code = params.get("include_code", False)
+        fmt = params.get("format", "markdown")
+        if not course_id:
+            return None
+        user_lang = params.get("user_lang")
+        results = self.kb.search(
+            f"key concepts summary overview {course_id}",
+            top_k=20,
+            course_id=course_id,
+        )
+        if not results:
+            return None
+        source_text = "\n\n---\n\n".join(
+            f"[Source: {r.source_file}, {r.location}]\n{r.text}"
+            for r in results
+        )
+        prompt = REPORT_PROMPT.format(
+            course_name=course_id,
+            report_type=report_type,
+            include_code="Yes" if include_code else "No",
+            source_text=source_text,
+            code_instructions=CODE_INSTRUCTIONS if include_code else "",
+            format=fmt,
+        )
+        system = REPORT_SYSTEM
+        binding = prompts.USER_LANG_BINDING(user_lang)
+        if binding:
+            system = f"{system}\n\n{binding}"
+        return {
+            "prompt": prompt,
+            "system": system,
+            "task_type": "report_writing",
+            "temperature": 0.3,
+            "max_tokens": 8192,
+            "course_id": course_id,
+            "report_type": report_type,
+            "format": fmt,
+            "sources_used": len(results),
+        }
+
     async def execute(self, params: dict) -> SkillResult:
         """
         Params:
@@ -77,38 +122,18 @@ class ReportGeneratorSkill(Skill):
         include_code = params.get("include_code", False)
         fmt = params.get("format", "markdown")
 
-        if not course_id:
-            return SkillResult(success=False, error="No course_id provided")
-
-        # 1. Gather course content
-        results = self.kb.search(
-            f"key concepts summary overview {course_id}",
-            top_k=20,
-            course_id=course_id,
-        )
-
-        if not results:
+        prepared = self.prepare_inputs(params)
+        if prepared is None:
+            if not course_id:
+                return SkillResult(success=False, error="No course_id provided")
             return SkillResult(success=False, error="No content found")
 
-        source_text = "\n\n---\n\n".join(
-            f"[Source: {r.source_file}, {r.location}]\n{r.text}"
-            for r in results
-        )
-
-        # 2. Generate report
-        prompt = REPORT_PROMPT.format(
-            course_name=course_id,
-            report_type=report_type,
-            include_code="Yes" if include_code else "No",
-            source_text=source_text,
-            code_instructions=CODE_INSTRUCTIONS if include_code else "",
-            format=fmt,
-        )
+        prompt = prepared["prompt"]
 
         resp = await self.router.complete(
             prompt,
             task_type="report_writing",
-            system=REPORT_SYSTEM,
+            system=prepared["system"],
             temperature=0.3,
             max_tokens=8192,
         )
@@ -141,6 +166,10 @@ class ReportGeneratorSkill(Skill):
                 "ppt_outline_path": str(ppt_path),
                 "report_type": report_type,
                 "format": fmt,
-                "sources_used": len(results),
+                # review-swarm fix-all v3 #C8: `results` was a local of
+                # prepare_inputs and is undefined here — call site raised
+                # NameError after writing both files. Use the count carried
+                # over via prepared.
+                "sources_used": prepared["sources_used"],
             },
         )

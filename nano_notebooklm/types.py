@@ -98,16 +98,29 @@ class SearchResult(BaseModel):
 
 # ── Knowledge graph models ───────────────────────────────────────────
 class Concept(BaseModel):
-    """An extracted concept from course materials."""
+    """An extracted concept from course materials.
+
+    M1 expands `concept_type` to also mean course root / topic:
+      - "root"  → depth=0, the course node (one per course)
+      - "topic" → depth=1, a macro-topic from Stage A extraction
+      - "definition" / "theorem" / "algorithm" / "example" → depth>=2 leaves
+    `parent_topic` carries the concept_id of the depth=1 topic a leaf
+    attaches to (None for roots, topics, or leaves the LLM couldn't place).
+    """
     concept_id: str
     name: str
     definition: str
-    concept_type: str = "definition"  # definition, theorem, algorithm, example
+    concept_type: str = "definition"  # root, topic, definition, theorem, algorithm, example
     course_ids: list[str] = Field(default_factory=list)
     chunk_ids: list[str] = Field(default_factory=list)
     depth: int = 1
     weight: float = 1.0
     source_chunks: list[dict] = Field(default_factory=list)
+    parent_topic: str | None = None
+    # R3-3: 1-based topological position among Stage A topics
+    # ("study Topic 1 before Topic 2"). None on roots, leaves, or
+    # whenever the LLM didn't emit `prerequisite_of` for that batch.
+    learning_order: int | None = None
 
 
 class Relation(BaseModel):

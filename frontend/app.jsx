@@ -40,6 +40,27 @@ function App() {
   const [masteryData, setMasteryData] = useState(null);
   const [sessionDays, setSessionDays] = useState({});
 
+  // ── R3-2: explicit user language preference ──
+  // Initialised from localStorage via the StudyState helpers (single source
+  // of truth — also used by Node-side tests). When null we render a one-time
+  // modal blocking the workspace until the user picks zh / en. Topbar chip
+  // shows the current value and re-opens the modal so the choice is reversible.
+  const [userLang, setUserLangState] = useState(() => StudyState.loadUserLang(window.localStorage));
+  const [showLangModal, setShowLangModal] = useState(false);
+  function commitUserLang(code) {
+    if (StudyState.saveUserLang(window.localStorage, code)) {
+      setUserLangState(code);
+      setShowLangModal(false);
+    }
+  }
+  // First-render guard: if no preference is persisted yet, open the modal.
+  // Re-running on mount (not on every state change) keeps the modal off when
+  // the user already picked, including across hot-reloads.
+  useEffect(() => {
+    if (userLang == null) setShowLangModal(true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   // ── localStorage helpers (per-course persistence) ──
   const STORAGE_PREFIX = "nano-nlm:v1";
   function storageKey(courseId, kind) {
@@ -167,7 +188,7 @@ function App() {
         } else if (event.type === "error") {
           setGenerationState(s => StudyState.recordGenerationFailure({ ...s, partial: event.partial || partial }, new Error(event.error), (s.failures || 0) + 1));
         }
-      });
+      }, { userLang });
       if (final && final.type === "error") throw new Error(final.error);
       const content = (final && final.content) || partial || "Notes generation failed.";
       setRealNotes(content);
@@ -190,7 +211,7 @@ function App() {
     setStreaming(true);
     setStreamProgress(0);
     try {
-      const data = await API.generateQuiz(activeCourse, topic);
+      const data = await API.generateQuiz(activeCourse, topic, 6, "medium", { userLang });
       const quiz = data.quiz || data || [];
       setRealQuiz(quiz);
       if (Array.isArray(quiz) && quiz.length > 0) saveCached(activeCourse, "quiz", quiz);
@@ -234,7 +255,7 @@ function App() {
             setReportData({ content: partial });
             setStreamProgress(p => p + 1);
           }
-        });
+        }, { userLang });
         const data = { content: (final && final.content) || partial };
         setReportData(data);
         saveCached(activeCourse, "report", data);
@@ -362,14 +383,27 @@ function App() {
             onChange={e => setActiveCourse(e.target.value || null)}
             style={{ background: "transparent", border: "1px solid var(--paper-3)", borderRadius: 4, padding: "2px 8px", fontFamily: "var(--mono)", fontSize: 11, color: "var(--ink-2)", minWidth: 180 }}
           >
-            <option value="">All Courses ({totalChunks} chunks)</option>
-            {courses.map(c => (
-              <option key={c.id} value={c.id}>{c.name} ({c.chunks} chunks)</option>
-            ))}
+            <option value="">🌐 All Courses ({totalChunks} chunks)</option>
+            {courses.map(c => {
+              const flag = c.lang === "zh" ? "🇨🇳" : c.lang === "mixed" ? "🌐" : "🇺🇸";
+              return (
+                <option key={c.id} value={c.id}>
+                  {flag} {c.name} ({c.chunks} chunks)
+                </option>
+              );
+            })}
           </select>
         </div>
         <div className="spacer"></div>
         <div className="topbar-actions">
+          <button
+            className="lang-chip mono"
+            title={userLang ? "Reply language preference (click to change)" : "Pick reply language"}
+            onClick={() => setShowLangModal(true)}
+            disabled={streaming}
+          >
+            {userLang === "zh" ? "中" : userLang === "en" ? "EN" : "?"}
+          </button>
           <button className="icon-btn" title="Generate Notes" onClick={handleGenerateNotes} disabled={streaming}>📝</button>
           <button className="icon-btn" title="Generate Quiz" onClick={handleGenerateQuiz} disabled={streaming}>❓</button>
           <button className="icon-btn" title="Build Knowledge Graph" onClick={handleGenerateMindmap} disabled={streaming}>🧠</button>
@@ -431,6 +465,7 @@ function App() {
                   }}
                   onRetry={handleRetryGeneration}
                   generationState={generationState}
+                  onCitation={handleCitation}
                 />
               : <ActionPlaceholder
                   title="Study Notes"
@@ -444,11 +479,16 @@ function App() {
             realMindmap
               ? <MindMap
                   data={realMindmap}
+                  courseId={activeCourse}
                   layout={tweaks.mindmapLayout}
                   highlightedId={highlightedNode}
                   onNodeClick={setHighlightedNode}
                   onSourceClick={handleMindmapSource}
                   onPractice={(topic) => handleGenerateQuiz(topic)}
+                  onDataChange={(data) => {
+                    setRealMindmap(data);
+                    if (activeCourse && data) saveCached(activeCourse, "mindmap", data);
+                  }}
                 />
               : <ActionPlaceholder
                   title="Knowledge Graph"
@@ -505,6 +545,7 @@ function App() {
         onSkillEntry={handleSkillEntry}
         onCitation={handleCitation}
         checkedFiles={getCheckedSourceFiles()}
+        userLang={userLang}
       />
 
       {/* ========= Status bar ========= */}
@@ -566,6 +607,38 @@ function App() {
             ]} />
         </TweakSection>
       </TweaksPanel>
+
+      {/* ========= R3-2 first-run / re-pick language modal ========= */}
+      {showLangModal && (
+        <div className="lang-modal-overlay" role="dialog" aria-modal="true">
+          <div className="lang-modal">
+            <h3 className="lang-modal-title">Choose your reply language</h3>
+            <p className="lang-modal-hint">
+              The assistant will reply ONLY in this language for chat, notes,
+              quiz, and report generations. You can change this anytime via
+              the topbar chip.
+            </p>
+            <div className="lang-modal-choices">
+              {StudyState.DEFAULT_LANG_CHOICES.map(c => (
+                <button
+                  key={c.code}
+                  className={"lang-modal-choice" + (userLang === c.code ? " active" : "")}
+                  onClick={() => commitUserLang(c.code)}
+                >
+                  <div className="lang-modal-choice-label">{c.label}</div>
+                  <div className="lang-modal-choice-hint mono">{c.hint}</div>
+                </button>
+              ))}
+            </div>
+            {userLang && (
+              <button
+                className="lang-modal-close mono"
+                onClick={() => setShowLangModal(false)}
+              >Cancel</button>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -590,32 +663,358 @@ function ActionPlaceholder({ title, desc, btnLabel, onAction, disabled, hint }) 
 }
 
 /* ── Markdown helpers ── */
+function escapeAttr(s) {
+  return String(s || "").replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
 function markdownToHtml(content) {
-  return String(content || "")
+  // Pull slug ids from the SAME function the TOC uses, so TOC click → DOM
+  // lookup is guaranteed to match (incl. 3+ duplicate heading dedupe).
+  const tocList = StudyState.slugifyHeadingsList(content);
+  const headingQueue = { 1: [], 2: [], 3: [] };
+  tocList.forEach(item => headingQueue[item.level].push(item.id));
+  function unescapeForSlug(s) {
+    return String(s)
+      .replace(/&amp;/g, "&").replace(/&lt;/g, "<")
+      .replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#39;/g, "'");
+  }
+  function headingHtml(level, text) {
+    // text is HTML-escaped at this point (see escapeHtmlSafe pass below);
+    // unescape for slug derivation so the fallback id matches the toc list,
+    // which slugs from raw markdown.
+    const id = headingQueue[level].shift() || StudyState.slugifyHeading(unescapeForSlug(text));
+    const inline = level === 2 ? " style='margin-top:20px'" : "";
+    return `<h${level} id="${escapeAttr(id)}" data-toc-id="${escapeAttr(id)}"${inline}>${text}</h${level}>`;
+  }
+  // review-swarm fix-all v3 #C3+#C4: escape ALL untrusted markdown content
+  // before running markdown regexes, so LLM output containing `<script>` or
+  // `<img onerror>` lands as text inside dangerouslySetInnerHTML instead of
+  // executing. Citations are stashed BEFORE escape so the visible chip text
+  // and `data-cite` attribute can carry the raw filename without
+  // double-escaping the wrapping `&` (the previous code escaped only the
+  // attribute and left the visible inner unescaped — second XSS path).
+  const escapeHtmlSafe = (typeof NanoMarkdown !== "undefined" && NanoMarkdown.escapeHtml)
+    ? NanoMarkdown.escapeHtml
+    : (s) => String(s == null ? "" : s)
+        .replace(/&/g, "&amp;").replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+  const _CITE_RE = /\[Source:\s*([^\]]+)\]/g;
+  const citationStore = [];
+  const withCitePlaceholders = String(content || "").replace(_CITE_RE, (_m, inner) => {
+    citationStore.push(inner);
+    return `CITE${citationStore.length - 1}`;
+  });
+  // Stash math BEFORE markdown regexes so $...$ / $$...$$ survive intact for
+  // KaTeX. The Notes panel uses a useEffect (RealNotesView) to call
+  // NanoMarkdown.renderMath after the html lands in the DOM — same path as
+  // the chat bubble. Falls back to in-line math-inline / math-block style if
+  // KaTeX failed to load.
+  const stash = (typeof NanoMarkdown !== "undefined" && NanoMarkdown.stashMath)
+    ? NanoMarkdown.stashMath(withCitePlaceholders)
+    : { text: withCitePlaceholders, restore: (h) => h };
+  let html = escapeHtmlSafe(stash.text)
     .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
-    .replace(/^### (.+)$/gm, "<h3>$1</h3>")
-    .replace(/^## (.+)$/gm, "<h2 style='margin-top:20px'>$1</h2>")
-    .replace(/^# (.+)$/gm, "<h1>$1</h1>")
+    .replace(/^### (.+)$/gm, (_m, t) => headingHtml(3, t))
+    .replace(/^## (.+)$/gm, (_m, t) => headingHtml(2, t))
+    .replace(/^# (.+)$/gm, (_m, t) => headingHtml(1, t))
     .replace(/^- (.+)$/gm, "<li>$1</li>")
     .replace(/((?:<li>.*?<\/li>\s*)+)/g, "<ul>$1</ul>")
     .replace(/`([^`]+)`/g, '<code>$1</code>')
-    .replace(/\\\[([\s\S]*?)\\\]/g, '<div class="math-block">$1</div>')
-    .replace(/\$\$([\s\S]*?)\$\$/g, '<div class="math-block">$1</div>')
-    .replace(/\$([^$\n]+?)\$/g, '<span class="math-inline">$1</span>')
-    .replace(/\[Source:\s*([^\]]+)\]/g, '<span class="ref-chip mono">$1</span>')
     .replace(/\n\n/g, "</p><p>")
     .replace(/\n/g, "<br/>");
+  html = stash.restore(html);
+  // Restore citation placeholders with safe button HTML — both the visible
+  // inner text and the data-cite attribute escape the raw source string.
+  html = html.replace(/CITE(\d+)/g, (_m, idx) => {
+    const inner = citationStore[Number(idx)] || "";
+    const safeInner = escapeHtmlSafe(inner);
+    const safeFull = escapeHtmlSafe(`[Source: ${inner}]`);
+    return `<button type="button" class="ref-chip mono" data-cite="${safeFull}">${safeInner}</button>`;
+  });
+  // Drop empty <p></p> introduced when math-display is hoisted out.
+  html = html.replace(/<p>\s*<\/p>/g, "");
+  return html;
 }
 
-/* ── Real Notes View ── */
-function RealNotesView({ content, streaming, activeCourse, onContentChange, generationState, onRetry }) {
+/* ── Real Notes View — reading UX (Range API + highlights + TOC + chip routing) ── */
+
+function findTextRangeInRoot(root, text, before, after) {
+  // Walk text nodes; concatenate to find `text` (preferring positions whose
+  // surrounding chars best match before/after). Returns a Range or null.
+  if (!root || !text) return null;
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null);
+  const nodes = [];
+  let combined = "";
+  while (walker.nextNode()) {
+    const n = walker.currentNode;
+    if (n.parentElement && n.parentElement.closest(".sel-menu, .hl-popover")) continue;
+    nodes.push({ node: n, start: combined.length, end: combined.length + n.nodeValue.length });
+    combined += n.nodeValue;
+  }
+  if (!combined) return null;
+  let cursor = 0;
+  let bestIdx = -1;
+  let bestScore = -1;
+  while (cursor <= combined.length - text.length) {
+    const idx = combined.indexOf(text, cursor);
+    if (idx < 0) break;
+    let score = 0;
+    if (before) {
+      const ctxBefore = combined.slice(Math.max(0, idx - before.length), idx);
+      if (ctxBefore.endsWith(before.slice(-Math.min(before.length, 12)))) score += 2;
+    }
+    if (after) {
+      const ctxAfter = combined.slice(idx + text.length, idx + text.length + after.length);
+      if (ctxAfter.startsWith(after.slice(0, Math.min(after.length, 12)))) score += 2;
+    }
+    if (!before && !after) score = 1;
+    if (score > bestScore) { bestScore = score; bestIdx = idx; }
+    if (bestScore >= 4) break;
+    cursor = idx + 1;
+  }
+  if (bestIdx < 0) return null;
+  const startAbs = bestIdx;
+  const endAbs = bestIdx + text.length;
+  function locate(absOffset) {
+    for (const entry of nodes) {
+      if (absOffset >= entry.start && absOffset <= entry.end) {
+        return { node: entry.node, offset: absOffset - entry.start };
+      }
+    }
+    return null;
+  }
+  const a = locate(startAbs);
+  const b = locate(endAbs);
+  if (!a || !b) return null;
+  const r = document.createRange();
+  try {
+    r.setStart(a.node, a.offset);
+    r.setEnd(b.node, b.offset);
+  } catch { return null; }
+  return r;
+}
+
+function wrapRangeWithMark(range, hl) {
+  // Wraps each text node segment in [range.startContainer .. range.endContainer]
+  // with its own <mark>. Cross-element selections get multiple marks but render
+  // continuously.
+  const root = range.commonAncestorContainer;
+  const walker = document.createTreeWalker(
+    root.nodeType === Node.TEXT_NODE ? root.parentNode : root,
+    NodeFilter.SHOW_TEXT,
+    {
+      acceptNode(node) {
+        const r = document.createRange();
+        try {
+          r.selectNodeContents(node);
+          if (range.compareBoundaryPoints(Range.END_TO_START, r) >= 0) return NodeFilter.FILTER_REJECT;
+          if (range.compareBoundaryPoints(Range.START_TO_END, r) <= 0) return NodeFilter.FILTER_REJECT;
+        } catch { return NodeFilter.FILTER_REJECT; }
+        if (node.parentElement && node.parentElement.closest("mark.hl")) return NodeFilter.FILTER_REJECT;
+        return NodeFilter.FILTER_ACCEPT;
+      },
+    },
+  );
+  const targets = [];
+  while (walker.nextNode()) targets.push(walker.currentNode);
+  targets.forEach(node => {
+    const startOffset = node === range.startContainer ? range.startOffset : 0;
+    const endOffset = node === range.endContainer ? range.endOffset : node.nodeValue.length;
+    if (endOffset <= startOffset) return;
+    const before = node.nodeValue.slice(0, startOffset);
+    const middle = node.nodeValue.slice(startOffset, endOffset);
+    const after = node.nodeValue.slice(endOffset);
+    if (!middle) return;
+    const mark = document.createElement("mark");
+    mark.className = `hl hl-${hl.color}`;
+    mark.dataset.hid = hl.id;
+    if (hl.note) mark.dataset.hasNote = "1";
+    mark.appendChild(document.createTextNode(middle));
+    const parent = node.parentNode;
+    if (before) parent.insertBefore(document.createTextNode(before), node);
+    parent.insertBefore(mark, node);
+    if (after) parent.insertBefore(document.createTextNode(after), node);
+    parent.removeChild(node);
+  });
+}
+
+function unwrapMark(mark) {
+  const parent = mark.parentNode;
+  if (!parent) return;
+  while (mark.firstChild) parent.insertBefore(mark.firstChild, mark);
+  parent.removeChild(mark);
+  if (parent.normalize) parent.normalize();
+}
+
+function applyHighlightsToDom(root, highlights) {
+  if (!root) return;
+  // Step 1 — unwrap any <mark.hl> whose hid is no longer in the new list.
+  // Without this the DOM mark survives `removeHighlight` because
+  // `dangerouslySetInnerHTML` only re-paints when `draft` itself changes.
+  const wantedIds = new Set((highlights || []).map(h => h.id));
+  root.querySelectorAll("mark.hl[data-hid]").forEach(m => {
+    if (!wantedIds.has(m.dataset.hid)) unwrapMark(m);
+  });
+  if (!highlights || !highlights.length) return;
+  // Step 2 — apply remaining highlights (longest first so big ones don't get
+  // split by short ones). Skip ones whose mark is already in the DOM (idempotent).
+  const ordered = highlights.slice().sort((a, b) => (b.text || "").length - (a.text || "").length);
+  ordered.forEach(hl => {
+    if (root.querySelector(`mark.hl[data-hid="${hl.id}"]`)) return;
+    const range = findTextRangeInRoot(root, hl.text, hl.before, hl.after);
+    if (!range) return;
+    try { wrapRangeWithMark(range, hl); } catch { /* ignore */ }
+  });
+}
+
+function NotesTOC({ items, activeId, onJump, onClose }) {
+  if (!items.length) return null;
+  return (
+    <nav className="notes-toc" aria-label="Table of contents">
+      <div className="toc-head mono">
+        <span>Contents</span>
+        {onClose && <button className="side-close" onClick={onClose} title="Hide TOC" aria-label="Hide TOC">×</button>}
+      </div>
+      <ul>
+        {items.map(it => (
+          <li key={it.id} className={`toc-l${it.level}` + (it.id === activeId ? " active" : "")}>
+            <button onClick={() => onJump(it.id)} title={it.text}>{it.text}</button>
+          </li>
+        ))}
+      </ul>
+    </nav>
+  );
+}
+
+function HighlightDrawer({ highlights, onJump, onRemove, onClose }) {
+  return (
+    <aside className="notes-hl-drawer">
+      <div className="hl-head mono">
+        <span>Highlights · {highlights.length}</span>
+        {onClose && <button className="side-close" onClick={onClose} title="Hide highlights" aria-label="Hide highlights">×</button>}
+      </div>
+      {!highlights.length && <p className="empty-state">Select text in the preview to highlight.</p>}
+      <ul>
+        {highlights.map(h => (
+          <li key={h.id} className={`hl-row hl-row-${h.color}`}>
+            <button className="hl-jump" onClick={() => onJump(h.id)} title={h.text}>
+              <span className={`hl-dot hl-${h.color}`}></span>
+              <span className="hl-text">{h.text.length > 60 ? h.text.slice(0, 57) + "…" : h.text}</span>
+            </button>
+            {h.note && <p className="hl-note">{h.note}</p>}
+            <button className="hl-remove" title="Remove" onClick={() => onRemove(h.id)}>×</button>
+          </li>
+        ))}
+      </ul>
+    </aside>
+  );
+}
+
+function RealNotesView({ content, streaming, activeCourse, onContentChange, generationState, onRetry, onCitation }) {
   const [draft, setDraft] = React.useState(content || "");
   const [editing, setEditing] = React.useState(false);
+  const [highlights, setHighlights] = React.useState([]);
+  const [tocItems, setTocItems] = React.useState([]);
+  const [activeTocId, setActiveTocId] = React.useState(null);
+  const [showToc, setShowToc] = React.useState(true);
+  const [showDrawer, setShowDrawer] = React.useState(true);
+  const [selMenu, setSelMenu] = React.useState(null); // {x, y, text, before, after}
+  const [popover, setPopover] = React.useState(null); // {x, y, hl}
+  const previewRef = React.useRef(null);
 
+  // Course switch — full reset (clears edit-mode + popovers + restores cached draft).
   React.useEffect(() => {
+    setSelMenu(null);
+    setPopover(null);
+    setEditing(false);
     const cached = activeCourse ? StudyState.loadNoteDraft(localStorage, activeCourse) : "";
     setDraft(cached || content || "");
-  }, [activeCourse, content]);
+  }, [activeCourse]);
+
+  // Streaming chunks — overwrite draft only while streaming, so a regenerate
+  // pass updates the preview without clobbering edits the user typed in
+  // Edit mode after the previous generation finished.
+  React.useEffect(() => {
+    if (editing) return;
+    if (!streaming) return;
+    if (typeof content === "string") setDraft(content);
+  }, [content, streaming, editing]);
+
+  // Highlights / TOC. During streaming we extract the TOC from the partial
+  // markdown but DO NOT prune highlights — the partial doesn't contain
+  // sections that haven't streamed yet, and pruning would silently delete
+  // their anchors from localStorage.
+  React.useEffect(() => {
+    if (!activeCourse) { setHighlights([]); setTocItems([]); return; }
+    setTocItems(StudyState.extractHeadingTOC(draft));
+    if (streaming) return;
+    const result = StudyState.pruneStaleHighlights(localStorage, activeCourse, draft);
+    setHighlights(result.kept);
+  }, [activeCourse, draft, streaming]);
+
+  // Re-apply highlights to DOM whenever preview html or highlights change.
+  // Skip during streaming — DOM is being rewritten per-token so any wrap is
+  // immediately discarded. Marks reappear once streaming completes.
+  React.useEffect(() => {
+    if (editing) return;
+    if (streaming) return;
+    const root = previewRef.current;
+    if (!root) return;
+    applyHighlightsToDom(root, highlights);
+  }, [draft, highlights, editing, streaming]);
+
+  // Run KaTeX after the preview HTML lands so $...$ / $$...$$ become real
+  // math. Skipped while editing (the textarea path doesn't render math) and
+  // throttled during streaming so partial chunks don't flicker — final state
+  // is rendered by the trailing-edge call after the stream settles.
+  const renderMathThrottled = React.useMemo(() => {
+    const fn = (typeof NanoMarkdown !== "undefined" && NanoMarkdown.renderMath)
+      ? NanoMarkdown.renderMath : null;
+    if (!fn) return () => {};
+    if (typeof NanoMarkdown.throttle === "function") {
+      return NanoMarkdown.throttle(fn, 200);
+    }
+    return fn;
+  }, []);
+  React.useEffect(() => {
+    if (editing) return;
+    const root = previewRef.current;
+    if (!root) return;
+    renderMathThrottled(root);
+  }, [draft, editing, streaming, renderMathThrottled]);
+
+  // Track which TOC section is currently in view (rAF-throttled).
+  React.useEffect(() => {
+    if (editing) return;
+    const root = previewRef.current;
+    if (!root) return;
+    // The scrolling ancestor is .notes-reader-body (.workspace / .main both
+    // overflow:hidden). Anchor the active-section heuristic to its viewport.
+    const scroller = root.closest(".notes-reader-body");
+    if (!scroller) return;
+    let ticking = false;
+    function compute() {
+      ticking = false;
+      const headings = root.querySelectorAll("h1[id], h2[id], h3[id]");
+      if (!headings.length) return;
+      const scrollerTop = scroller.getBoundingClientRect().top;
+      let current = headings[0].id;
+      for (const h of headings) {
+        const r = h.getBoundingClientRect();
+        if (r.top - scrollerTop < 100) current = h.id;
+        else break;
+      }
+      setActiveTocId(current);
+    }
+    function onScroll() {
+      if (ticking) return;
+      ticking = true;
+      requestAnimationFrame(compute);
+    }
+    compute();
+    scroller.addEventListener("scroll", onScroll, { passive: true });
+    return () => scroller.removeEventListener("scroll", onScroll);
+  }, [draft, editing, tocItems]);
 
   function updateDraft(value) {
     setDraft(value);
@@ -643,22 +1042,171 @@ function RealNotesView({ content, streaming, activeCourse, onContentChange, gene
     win.print();
   }
 
+  function captureSelection() {
+    const sel = window.getSelection();
+    if (!sel || sel.rangeCount === 0 || sel.isCollapsed) { setSelMenu(null); return; }
+    const range = sel.getRangeAt(0);
+    const root = previewRef.current;
+    if (!root || !root.contains(range.commonAncestorContainer)) { setSelMenu(null); return; }
+    const text = sel.toString().trim();
+    if (!text || text.length < 2) { setSelMenu(null); return; }
+    // A new selection always wins over any open popover — without this the
+    // popover from a previously clicked highlight blocks fresh highlighting.
+    setPopover(null);
+    const probe = { text, before: "", after: "" };
+    const idx = StudyState.locateHighlight(draft, probe);
+    if (idx >= 0) {
+      const ctx = StudyState.buildContextWindows(draft, idx, text);
+      probe.before = ctx.before;
+      probe.after = ctx.after;
+    }
+    const rect = range.getBoundingClientRect();
+    const stageRect = (root.closest(".notes-stage") || root).getBoundingClientRect();
+    setSelMenu({
+      x: rect.left + rect.width / 2 - stageRect.left,
+      y: rect.bottom - stageRect.top + 8,
+      text: probe.text,
+      before: probe.before,
+      after: probe.after,
+    });
+  }
+
+  function applyHighlightColor(color) {
+    if (!selMenu || !activeCourse) return;
+    const list = StudyState.addHighlight(localStorage, activeCourse, {
+      text: selMenu.text, before: selMenu.before, after: selMenu.after, color,
+    });
+    setHighlights(list);
+    setSelMenu(null);
+    window.getSelection() && window.getSelection().removeAllRanges();
+  }
+
+  function handlePreviewClick(e) {
+    // Source chip → Reader
+    const chip = e.target.closest && e.target.closest(".ref-chip[data-cite]");
+    if (chip) {
+      e.preventDefault();
+      const cite = chip.dataset.cite;
+      onCitation && onCitation(cite);
+      return;
+    }
+    // Existing highlight → popover (unless the click was the start of a new selection)
+    const mark = e.target.closest && e.target.closest("mark.hl[data-hid]");
+    if (mark) {
+      const hid = mark.dataset.hid;
+      const hl = highlights.find(h => h.id === hid);
+      if (!hl) return;
+      const stage = previewRef.current && (previewRef.current.closest(".notes-stage") || previewRef.current);
+      const stageRect = stage ? stage.getBoundingClientRect() : { left: 0, top: 0 };
+      const rect = mark.getBoundingClientRect();
+      setPopover({
+        x: rect.left + rect.width / 2 - stageRect.left,
+        y: rect.bottom - stageRect.top + 6,
+        hl,
+      });
+      return;
+    }
+    setPopover(null);
+  }
+
+  function updatePopoverHighlight(patch) {
+    if (!popover || !activeCourse) return;
+    const list = StudyState.updateHighlight(localStorage, activeCourse, popover.hl.id, patch);
+    setHighlights(list);
+    const next = list.find(h => h.id === popover.hl.id);
+    if (next) setPopover({ ...popover, hl: next });
+  }
+
+  function removePopoverHighlight() {
+    if (!popover || !activeCourse) return;
+    const list = StudyState.removeHighlight(localStorage, activeCourse, popover.hl.id);
+    setHighlights(list);
+    setPopover(null);
+  }
+
+  function jumpToHeading(id) {
+    const root = previewRef.current;
+    if (!root) return;
+    const target = root.querySelector(`#${CSS.escape(id)}`);
+    if (target) target.scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+
+  function jumpToHighlight(hid) {
+    const root = previewRef.current;
+    if (!root) return;
+    const target = root.querySelector(`mark.hl[data-hid="${hid}"]`);
+    if (target) {
+      target.scrollIntoView({ behavior: "smooth", block: "center" });
+      target.classList.add("hl-flash");
+      setTimeout(() => target.classList.remove("hl-flash"), 900);
+    }
+  }
+
+  function removeHighlightFromDrawer(hid) {
+    if (!activeCourse) return;
+    const list = StudyState.removeHighlight(localStorage, activeCourse, hid);
+    setHighlights(list);
+  }
+
   const html = markdownToHtml(draft);
 
   return (
-    <div className="reader-body" style={{ padding: "28px 40px" }}>
+    <div className="reader-body notes-reader-body">
       <div className="notes-toolbar">
-        <button className="btn ghost" onClick={() => setEditing(!editing)}>{editing ? "Preview" : "Edit"}</button>
+        <button className="btn ghost" onClick={() => { setEditing(!editing); setSelMenu(null); setPopover(null); }}>{editing ? "Preview" : "Edit"}</button>
         <button className="btn ghost" onClick={downloadMarkdown}>Markdown</button>
         <button className="btn ghost" onClick={exportPdf}>PDF</button>
+        <button className="btn ghost" onClick={() => setShowToc(v => !v)} disabled={editing}>{showToc ? "Hide TOC" : "Show TOC"}</button>
+        <button className="btn ghost" onClick={() => setShowDrawer(v => !v)} disabled={editing}>{showDrawer ? "Hide Highlights" : `Highlights · ${highlights.length}`}</button>
         {generationState?.retryable && <button className="btn primary" onClick={onRetry}>Retry</button>}
       </div>
       {streaming && <div style={{ color: "var(--accent)", marginBottom: 16, fontFamily: "var(--mono)", fontSize: 12 }}>Generating notes<span className="stream-cursor"></span></div>}
       {generationState?.status === "failed" && <div className="error-banner">{generationState.errorDetail}</div>}
-      {editing
-        ? <textarea className="notes-editor" value={draft} onChange={e => updateDraft(e.target.value)} />
-        : <div dangerouslySetInnerHTML={{ __html: "<p>" + html + "</p>" }} />
-      }
+      {editing ? (
+        <div>
+          <p className="notes-edit-hint mono">Editing raw markdown — highlights stay saved and reappear in Preview.</p>
+          <textarea className="notes-editor" value={draft} onChange={e => updateDraft(e.target.value)} />
+        </div>
+      ) : (
+        <div className="notes-stage">
+          {showToc && <NotesTOC items={tocItems} activeId={activeTocId} onJump={jumpToHeading} onClose={() => setShowToc(false)} />}
+          <div
+            ref={previewRef}
+            className="notes-preview"
+            onMouseUp={captureSelection}
+            onKeyUp={captureSelection}
+            onClick={handlePreviewClick}
+            dangerouslySetInnerHTML={{ __html: "<p>" + html + "</p>" }}
+          />
+          {showDrawer && <HighlightDrawer highlights={highlights} onJump={jumpToHighlight} onRemove={removeHighlightFromDrawer} onClose={() => setShowDrawer(false)} />}
+          {selMenu && (
+            <div className="sel-menu" style={{ left: selMenu.x, top: selMenu.y }} onMouseDown={e => e.preventDefault()}>
+              {StudyState.HIGHLIGHT_COLORS.map(c => (
+                <button key={c} className={`sel-color hl-${c}`} onClick={() => applyHighlightColor(c)} title={`Highlight (${c})`} />
+              ))}
+              <button className="sel-cancel" onClick={() => setSelMenu(null)}>×</button>
+            </div>
+          )}
+          {popover && (
+            <div className="hl-popover" style={{ left: popover.x, top: popover.y }} onMouseDown={e => e.stopPropagation()}>
+              <div className="hl-popover-row">
+                {StudyState.HIGHLIGHT_COLORS.map(c => (
+                  <button key={c} className={`sel-color hl-${c}` + (popover.hl.color === c ? " active" : "")}
+                    onClick={() => updatePopoverHighlight({ color: c })} title={c} />
+                ))}
+                <button className="hl-popover-del" onClick={removePopoverHighlight} title="Delete">Delete</button>
+                <button className="sel-cancel" onClick={() => setPopover(null)}>×</button>
+              </div>
+              <textarea
+                className="hl-note-input"
+                placeholder="Add note…"
+                value={popover.hl.note || ""}
+                onChange={e => updatePopoverHighlight({ note: e.target.value })}
+              />
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }

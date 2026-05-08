@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import unicodedata
 from collections import defaultdict
 
 from nano_notebooklm.types import Concept, Relation
@@ -11,11 +12,21 @@ logger = logging.getLogger(__name__)
 
 
 def merge_concepts(concepts: list[Concept]) -> list[Concept]:
-    """Deduplicate concepts by normalized name within the same course."""
-    merged: dict[str, Concept] = {}
+    """Deduplicate concepts by (concept_type, normalized name) within a course.
+
+    F1 (review-swarm): the dedup key is now compound. Pre-fix, a Stage A
+    topic like "Optimization" and a Stage B leaf concept also called
+    "Optimization" collapsed into one record — but their concept_ids differ
+    (`topic_<course>_optimization` vs `concept_<course>_optimization`), so
+    every part-of edge referencing the discarded id was silently dropped by
+    `KnowledgeGraph.add_relations`. By keying on concept_type as well, root /
+    topic / leaf with the same name now stay separate, and the structural
+    edges survive.
+    """
+    merged: dict[tuple[str, str], Concept] = {}
 
     for c in concepts:
-        key = _normalize_name(c.name)
+        key = (str(c.concept_type or "").lower(), _normalize_name(c.name))
         if key in merged:
             existing = merged[key]
             existing.chunk_ids = list(set(existing.chunk_ids + c.chunk_ids))
@@ -25,6 +36,9 @@ def merge_concepts(concepts: list[Concept]) -> list[Concept]:
             existing.depth = min(existing.depth, c.depth)
             if not existing.definition and c.definition:
                 existing.definition = c.definition
+            # Preserve the first-seen parent_topic; only override if missing.
+            if not existing.parent_topic and c.parent_topic:
+                existing.parent_topic = c.parent_topic
         else:
             merged[key] = c.model_copy()
 
@@ -52,8 +66,17 @@ def merge_relations(
 
 
 def _normalize_name(name: str) -> str:
-    """Normalize concept name for deduplication."""
-    return name.lower().strip().replace("-", " ").replace("_", " ")
+    """Normalize concept name for deduplication.
+
+    fix-all v3 #L1: NFKC normalisation collapses full-width / half-width
+    forms, Unicode compatibility variants, and most CJK punctuation
+    differences so a Stage A topic emitted as `卷積神經網絡` and a Stage
+    B leaf emitted as `卷积神经网络` (or "Ｃｏｎｖ" vs "Conv") aren't
+    persisted as two records.
+    """
+    s = unicodedata.normalize("NFKC", str(name or "")).lower().strip()
+    s = s.replace("-", " ").replace("_", " ")
+    return " ".join(s.split())
 
 
 def _merge_sources(left: list[dict], right: list[dict]) -> list[dict]:

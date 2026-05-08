@@ -18,11 +18,14 @@ async function _request(path, opts = {}) {
   return body;
 }
 
-function _post(path, payload) {
+function _post(path, payload, opts = {}) {
+  // opts can carry { signal } for AbortController support — passed through to
+  // fetch so callers (chat / search / notes) can cancel in-flight requests.
   return _request(path, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
+    ...opts,
   });
 }
 
@@ -35,10 +38,12 @@ const API = {
     return _request(`/sources/${encodeURIComponent(courseId)}`);
   },
 
-  async chat(question, courseId = null, topK = 5, checkedFiles = null) {
-    return _post("/chat", {
+  async chat(question, courseId = null, topK = 5, checkedFiles = null, { signal } = {}, { userLang = null } = {}) {
+    const body = {
       question, course_id: courseId, top_k: topK, checked_files: checkedFiles,
-    });
+    };
+    if (userLang) body.user_lang = userLang;
+    return _post("/chat", body, { signal });
   },
 
   async getMemory() {
@@ -53,28 +58,40 @@ const API = {
     return _post("/search", { query, course_id: courseId, top_k: topK });
   },
 
-  async generateNotes(courseId, topic = null, format = "markdown") {
-    return _post("/notes", { course_id: courseId, topic, format });
+  async generateNotes(courseId, topic = null, format = "markdown", { userLang = null } = {}) {
+    const body = { course_id: courseId, topic, format };
+    if (userLang) body.user_lang = userLang;
+    return _post("/notes", body);
   },
 
-  async streamNotes(courseId, topic = null, format = "markdown", onEvent = null) {
-    return _stream("/notes/stream", { course_id: courseId, topic, format }, onEvent);
+  async streamNotes(courseId, topic = null, format = "markdown", onEvent = null, { userLang = null } = {}) {
+    const body = { course_id: courseId, topic, format };
+    if (userLang) body.user_lang = userLang;
+    return _stream("/notes/stream", body, onEvent);
   },
 
-  async generateQuiz(courseId, topic = null, numQuestions = 6, difficulty = "medium") {
-    return _post("/quiz", {
+  async generateQuiz(courseId, topic = null, numQuestions = 6, difficulty = "medium", { userLang = null } = {}) {
+    const body = {
       course_id: courseId, topic, num_questions: numQuestions, difficulty,
-    });
+    };
+    if (userLang) body.user_lang = userLang;
+    return _post("/quiz", body);
   },
 
-  async streamQuiz(courseId, topic = null, numQuestions = 6, difficulty = "medium", onEvent = null) {
-    return _stream("/quiz/stream", {
+  async streamQuiz(courseId, topic = null, numQuestions = 6, difficulty = "medium", onEvent = null, { userLang = null } = {}) {
+    const body = {
       course_id: courseId, topic, num_questions: numQuestions, difficulty,
-    }, onEvent);
+    };
+    if (userLang) body.user_lang = userLang;
+    return _stream("/quiz/stream", body, onEvent);
   },
 
   async getMindmap(courseId) {
     return _request(`/mindmap/${encodeURIComponent(courseId)}`, { method: "POST" });
+  },
+
+  async editMindmap(courseId, ops) {
+    return _post(`/mindmap/${encodeURIComponent(courseId)}/edit`, { ops });
   },
 
   async generateReport(courseId, reportType = "summary", includeCode = false) {
@@ -83,10 +100,10 @@ const API = {
     });
   },
 
-  async streamReport(courseId, reportType = "summary", includeCode = false, onEvent = null) {
-    return _stream("/report/stream", {
-      course_id: courseId, report_type: reportType, include_code: includeCode,
-    }, onEvent);
+  async streamReport(courseId, reportType = "summary", includeCode = false, onEvent = null, { userLang = null } = {}) {
+    const body = { course_id: courseId, report_type: reportType, include_code: includeCode };
+    if (userLang) body.user_lang = userLang;
+    return _stream("/report/stream", body, onEvent);
   },
 
   async analyzeExam(courseId) {
@@ -110,6 +127,10 @@ const API = {
 
   async getMastery(courseId) {
     return _request(`/mastery/${encodeURIComponent(courseId)}`);
+  },
+
+  async getChunk(chunkId, { signal } = {}) {
+    return _request(`/chunks/${encodeURIComponent(chunkId)}`, { signal });
   },
 
   async getStatus() {
@@ -151,25 +172,44 @@ async function _stream(path, payload, onEvent) {
   }
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
+  // review-swarm fix-all v3 #C5 + M8: a single malformed NDJSON line (proxy
+  // keepalive, half-chunk, upstream HTML error page) used to crash the
+  // entire stream consumer with `JSON.parse` throwing — the user lost the
+  // remaining stream including the final `done` event. Now each line is
+  // parsed defensively and the running buffer has a hard cap so a missing
+  // newline can't OOM the client.
+  const MAX_LINE_BYTES = 1024 * 1024;
   let buffer = "";
   let finalEvent = null;
+  function _emit(line) {
+    let event;
+    try { event = JSON.parse(line); }
+    catch (e) {
+      if (typeof console !== "undefined") {
+        console.warn("NDJSON parse skip:", String(line).slice(0, 120));
+      }
+      return;
+    }
+    finalEvent = event;
+    if (onEvent) onEvent(event);
+  }
   while (true) {
     const { value, done } = await reader.read();
     if (done) break;
     buffer += decoder.decode(value, { stream: true });
+    if (buffer.length > MAX_LINE_BYTES) {
+      if (typeof console !== "undefined") {
+        console.warn("NDJSON buffer over " + MAX_LINE_BYTES + "B without newline; dropping");
+      }
+      buffer = "";
+    }
     const lines = buffer.split("\n");
     buffer = lines.pop() || "";
     for (const line of lines) {
       if (!line.trim()) continue;
-      const event = JSON.parse(line);
-      finalEvent = event;
-      if (onEvent) onEvent(event);
+      _emit(line);
     }
   }
-  if (buffer.trim()) {
-    const event = JSON.parse(buffer);
-    finalEvent = event;
-    if (onEvent) onEvent(event);
-  }
+  if (buffer.trim()) _emit(buffer);
   return finalEvent;
 }

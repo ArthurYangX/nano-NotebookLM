@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import threading
 from datetime import datetime
 from pathlib import Path
 
@@ -20,48 +22,74 @@ logger = logging.getLogger(__name__)
 
 MEMORY_PATH = config.ARTIFACTS_DIR / "user_memory.json"
 
+# review-swarm fix-all v3 #M4: serialise the read-modify-write sequence so
+# concurrent /api/memory POST requests can't last-write-wins each other,
+# and write atomically with fsync so a crash mid-write can't truncate the
+# memory file.
+_MEMORY_LOCK = threading.RLock()
+
 
 def load_memory() -> dict:
     """Load user memory from disk."""
-    if MEMORY_PATH.exists():
-        return json.loads(MEMORY_PATH.read_text())
-    return _default_memory()
+    with _MEMORY_LOCK:
+        if MEMORY_PATH.exists():
+            try:
+                return json.loads(MEMORY_PATH.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                logger.warning("user_memory.json is corrupt; falling back to defaults")
+                return _default_memory()
+        return _default_memory()
 
 
 def save_memory(memory: dict):
-    """Save user memory to disk."""
+    """Atomic + durable write of user memory."""
     memory["last_updated"] = datetime.now().isoformat()
     MEMORY_PATH.parent.mkdir(parents=True, exist_ok=True)
-    MEMORY_PATH.write_text(json.dumps(memory, ensure_ascii=False, indent=2))
+    payload = json.dumps(memory, ensure_ascii=False, indent=2).encode("utf-8")
+    with _MEMORY_LOCK:
+        tmp = MEMORY_PATH.with_suffix(".json.tmp")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+        try:
+            os.write(fd, payload)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(tmp, MEMORY_PATH)
+        try:
+            dir_fd = os.open(str(MEMORY_PATH.parent), os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            pass  # parent fsync unsupported on some FS
 
 
 def update_memory(key: str, value):
-    """Update a specific memory field."""
-    mem = load_memory()
-    mem[key] = value
-    save_memory(mem)
+    """Update a specific memory field — single critical section."""
+    with _MEMORY_LOCK:
+        mem = load_memory()
+        mem[key] = value
+        save_memory(mem)
 
 
 def add_interaction(course_id: str, question: str, summary: str):
     """Record a user interaction for context continuity."""
-    mem = load_memory()
-    interactions = mem.get("recent_interactions", [])
-    interactions.append({
-        "course": course_id,
-        "question": question[:200],
-        "summary": summary[:300],
-        "timestamp": datetime.now().isoformat(),
-    })
-    # Keep last 50 interactions
-    mem["recent_interactions"] = interactions[-50:]
-
-    # Update active courses
-    active = mem.get("active_courses", [])
-    if course_id and course_id not in active:
-        active.append(course_id)
-    mem["active_courses"] = active
-
-    save_memory(mem)
+    with _MEMORY_LOCK:
+        mem = load_memory()
+        interactions = mem.get("recent_interactions", [])
+        interactions.append({
+            "course": course_id,
+            "question": question[:200],
+            "summary": summary[:300],
+            "timestamp": datetime.now().isoformat(),
+        })
+        mem["recent_interactions"] = interactions[-50:]
+        active = mem.get("active_courses", [])
+        if course_id and course_id not in active:
+            active.append(course_id)
+        mem["active_courses"] = active
+        save_memory(mem)
 
 
 def get_context_prompt(course_id: str | None = None) -> str:

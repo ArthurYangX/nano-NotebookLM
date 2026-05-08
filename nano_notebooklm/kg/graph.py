@@ -20,7 +20,12 @@ class KnowledgeGraph:
         self.graph = nx.DiGraph()
 
     def add_concepts(self, concepts: list[Concept]):
-        """Add concepts as nodes."""
+        """Add concepts as nodes.
+
+        F6 (review-swarm): the explicit kwarg list previously dropped
+        `parent_topic`, so the field round-tripped as None through
+        save/load. Now it persists.
+        """
         for c in concepts:
             if self.graph.has_node(c.concept_id):
                 # Merge: extend chunk_ids and course_ids
@@ -32,6 +37,10 @@ class KnowledgeGraph:
                 existing["depth"] = min(int(existing.get("depth", 1)), int(c.depth))
                 if not existing.get("definition") and c.definition:
                     existing["definition"] = c.definition
+                if not existing.get("parent_topic") and c.parent_topic:
+                    existing["parent_topic"] = c.parent_topic
+                if existing.get("learning_order") is None and c.learning_order is not None:
+                    existing["learning_order"] = c.learning_order
             else:
                 self.graph.add_node(
                     c.concept_id,
@@ -43,6 +52,8 @@ class KnowledgeGraph:
                     depth=c.depth,
                     weight=c.weight,
                     source_chunks=c.source_chunks,
+                    parent_topic=c.parent_topic,
+                    learning_order=c.learning_order,
                 )
 
     def add_relations(self, relations: list[Relation]):
@@ -150,6 +161,63 @@ class KnowledgeGraph:
             source = edge.pop("source")
             target = edge.pop("target")
             self.graph.add_edge(source, target, **edge)
+
+
+def topo_sort_topics(
+    topic_ids: list[str],
+    prereq_edges: list[tuple[str, str]],
+    *,
+    weights: dict[str, float] | None = None,
+) -> list[str]:
+    """R3-3: stable topological sort over Stage A topics.
+
+    `prereq_edges` carries (a, b) meaning "a must be studied before b" —
+    i.e. an edge a → b in the precedence DAG. Returns topic ids in study
+    order. Ties broken by `weights[id]` (higher = earlier) so the heaviest
+    topic surfaces first when nothing else constrains the order; among
+    equal weights, by `topic_ids` input order so the result is stable for
+    fixture-replay tests.
+
+    On a cycle the precedence graph stops being a DAG. Rather than raise,
+    we degrade to weight-desc / input-order sort over the remaining ids
+    so the caller can still assign learning_order numbers and the mindmap
+    renders. The whole feature is best-effort for the student.
+    """
+    in_topics = list(topic_ids)
+    weight_of = dict(weights or {})
+    rank = {tid: i for i, tid in enumerate(in_topics)}
+
+    indeg: dict[str, int] = {tid: 0 for tid in in_topics}
+    succ: dict[str, list[str]] = {tid: [] for tid in in_topics}
+    for src, dst in prereq_edges:
+        if src not in indeg or dst not in indeg or src == dst:
+            continue
+        succ[src].append(dst)
+        indeg[dst] += 1
+
+    def _key(tid: str) -> tuple[float, int]:
+        return (-float(weight_of.get(tid, 0.0)), rank[tid])
+
+    ready = sorted([tid for tid, d in indeg.items() if d == 0], key=_key)
+    out: list[str] = []
+    while ready:
+        nxt = ready.pop(0)
+        out.append(nxt)
+        for child in succ[nxt]:
+            indeg[child] -= 1
+            if indeg[child] == 0:
+                ready.append(child)
+        ready.sort(key=_key)
+
+    if len(out) != len(in_topics):
+        # Cycle — the remaining nodes never reached indeg=0. Sort what's
+        # left by weight-desc and append; better degraded order than no
+        # learning_order at all.
+        leftover = [tid for tid in in_topics if tid not in set(out)]
+        leftover.sort(key=_key)
+        out.extend(leftover)
+
+    return out
 
 
 def _merge_source_chunks(left: list[dict], right: list[dict]) -> list[dict]:

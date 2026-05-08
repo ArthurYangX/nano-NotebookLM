@@ -11,21 +11,29 @@ from nano_notebooklm.types import FileType, PageInfo
 
 
 def extract_pdf(filepath: str) -> list[PageInfo]:
-    """Extract text page-by-page from a PDF."""
+    """Extract text page-by-page from a PDF.
+
+    fix-all v3 #L2: doc.close() previously ran only after the page loop
+    completed; a malformed PDF that raised inside `page.get_text()`
+    leaked the open document handle. Wrap in try/finally so the handle
+    is always released.
+    """
     import fitz
 
     doc = fitz.open(filepath)
     pages = []
-    for page_num in range(len(doc)):
-        page = doc[page_num]
-        text = page.get_text().strip()
-        if text and len(text) > 30:
-            pages.append(PageInfo(
-                text=text,
-                page=page_num + 1,
-                total_pages=len(doc),
-            ))
-    doc.close()
+    try:
+        for page_num in range(len(doc)):
+            page = doc[page_num]
+            text = page.get_text().strip()
+            if text and len(text) > 30:
+                pages.append(PageInfo(
+                    text=text,
+                    page=page_num + 1,
+                    total_pages=len(doc),
+                ))
+    finally:
+        doc.close()
     return pages
 
 

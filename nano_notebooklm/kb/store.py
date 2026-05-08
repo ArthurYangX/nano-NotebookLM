@@ -90,6 +90,9 @@ class KBStore:
         self._bm25_index: BM25Index | None = None
         self._hybrid: HybridSearch | None = None
         self._all_chunks: list[Chunk] = []
+        # chunk_id → Chunk lookup, lazily populated by find_chunk. Invalidated
+        # whenever build_index runs (single-source-of-truth: _all_chunks).
+        self._chunk_index: dict[str, Chunk] | None = None
 
     @property
     def embed_fn(self) -> Callable:
@@ -163,37 +166,66 @@ class KBStore:
         return course
 
     def build_index(self, course_id: str | None = None):
-        """Build search indices for a course or all courses."""
-        chunks = self._load_all_chunks(course_id)
-        if not chunks:
+        """Build search indices.
+
+        review-swarm fix-all v3 #C7: a single-course rebuild used to
+        overwrite the global in-memory hybrid index with only that course's
+        chunks, so a fresh `/api/upload/<X>` silently broke search for every
+        other course. Behaviour now:
+
+        - When ``course_id`` is given, also persist that course's
+          per-course on-disk index (so future selective loads work).
+        - In every code path, recompute the in-memory hybrid index from the
+          full ``_load_all_chunks(None)`` set and persist it as the global
+          index. Subsequent ``search`` calls always see the union of
+          courses regardless of which course triggered the rebuild.
+        """
+        index_dir = self.artifacts_dir / "indices"
+
+        if course_id:
+            course_chunks = self._load_all_chunks(course_id)
+            if course_chunks:
+                course_vector = VectorIndex(self.embed_fn)
+                course_vector.build(course_chunks)
+                course_vector.save(index_dir / "faiss" / course_id)
+                course_bm25 = BM25Index()
+                course_bm25.build(course_chunks)
+                course_bm25.save(index_dir / "bm25" / f"{course_id}.json")
+
+        all_chunks = self._load_all_chunks(None)
+        if not all_chunks:
             logger.warning("No chunks to index")
             return
 
-        self._all_chunks = chunks
+        self._all_chunks = all_chunks
 
-        # Build vector index
-        logger.info(f"Building vector index for {len(chunks)} chunks...")
+        logger.info(f"Building global vector index for {len(all_chunks)} chunks...")
         self._vector_index = VectorIndex(self.embed_fn)
-        self._vector_index.build(chunks)
+        self._vector_index.build(all_chunks)
 
-        # Build BM25 index
-        logger.info("Building BM25 index...")
+        logger.info("Building global BM25 index...")
         self._bm25_index = BM25Index()
-        self._bm25_index.build(chunks)
+        self._bm25_index.build(all_chunks)
 
-        # Create hybrid search
         self._hybrid = HybridSearch(self._vector_index, self._bm25_index)
 
-        # Save indices
-        index_dir = self.artifacts_dir / "indices"
-        suffix = course_id if course_id else "global"
-        self._vector_index.save(index_dir / "faiss" / suffix)
-        self._bm25_index.save(index_dir / "bm25" / f"{suffix}.pkl")
+        # Invalidate find_chunk cache — _all_chunks just changed.
+        self._chunk_index = None
 
-        logger.info(f"Index built: {self._vector_index.total_vectors} vectors")
+        self._vector_index.save(index_dir / "faiss" / "global")
+        self._bm25_index.save(index_dir / "bm25" / "global.json")
+
+        logger.info(f"Global index built: {self._vector_index.total_vectors} vectors")
 
     def search(self, query: str, top_k: int = config.DEFAULT_TOP_K, course_id: str | None = None) -> list[SearchResult]:
-        """Search across indexed chunks."""
+        """Search across indexed chunks.
+
+        fix-all v3 #M8: a single-course filter previously fetched only
+        ``top_k * 3`` global hits and post-filtered, which falsely reported
+        zero results for small courses dominated by a larger sibling. We
+        now widen the fetch progressively until we get enough course-
+        matching hits or hit a generous ceiling.
+        """
         # Always load global index first (covers all courses)
         if self._hybrid is None:
             self._load_indices(None)  # Load global index
@@ -201,18 +233,67 @@ class KBStore:
         if self._hybrid is None:
             return []
 
-        results = self._hybrid.search(query, top_k=top_k * 3 if course_id else top_k)
+        if not course_id:
+            return self._hybrid.search(query, top_k=top_k)
 
-        # Filter by course if specified
-        if course_id:
-            results = [r for r in results if r.course_id == course_id]
-
-        return results[:top_k]
+        for fetch_k in (top_k * 3, top_k * 10, top_k * 30):
+            results = self._hybrid.search(query, top_k=fetch_k)
+            filtered = [r for r in results if r.course_id == course_id]
+            if len(filtered) >= top_k:
+                return filtered[:top_k]
+            # If the global index returned fewer than fetch_k, we've
+            # exhausted the corpus already — no point widening further.
+            if len(results) < fetch_k:
+                return filtered[:top_k]
+        return filtered[:top_k]
 
     def get_chunks(self, course_id: str | None = None) -> list[Chunk]:
         """Get all chunks, optionally filtered by course."""
         chunks = self._load_all_chunks(course_id)
         return chunks
+
+    def find_chunk(self, chunk_id: str) -> Chunk | None:
+        """Look up a single chunk by id without scanning. The lookup dict is
+        built lazily over `_all_chunks` (populated by build_index) the first
+        time it's needed; on cache miss we don't fall through to a disk
+        reload — that fallback exists in `get_chunks` and is multi-second
+        from inside an event-loop tool handler.
+        """
+        if not chunk_id:
+            return None
+        if self._chunk_index is None and self._all_chunks:
+            self._chunk_index = {c.chunk_id: c for c in self._all_chunks}
+        if self._chunk_index is None:
+            return None
+        return self._chunk_index.get(chunk_id)
+
+    def peek_chunks(self, course_id: str, n: int = 30) -> list[Chunk]:
+        """Return up to ``n`` chunks from a course without loading the full
+        chunks.json into Pydantic models.
+
+        Used by language fingerprinting so the first chat call against a new
+        course doesn't pay 100s of ms to instantiate 1500+ Chunk objects just
+        to inspect 30. Reads + parses JSON, slices, then validates only the
+        slice.
+
+        On any read / parse / validation error returns ``[]`` and logs a
+        warning. The previous implementation fell back to a full
+        ``get_chunks`` load — that defeated the optimisation precisely when
+        it was most needed (corrupt or schema-drifted chunks.json) and was
+        silent. Returning an empty list lets the caller (lang fingerprint)
+        default cleanly to the safe "en" fingerprint.
+        """
+        try:
+            chunks_path = self.artifacts_dir / "courses" / course_id / "chunks.json"
+            if not chunks_path.exists():
+                return []
+            with open(chunks_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return [Chunk(**item) for item in data[:n]]
+        except Exception:  # noqa: BLE001 — fingerprint must never crash chat
+            logger.warning("peek_chunks(%s, %d) failed; returning [] for safe "
+                           "fingerprint default", course_id, n, exc_info=True)
+            return []
 
     def _load_all_chunks(self, course_id: str | None = None) -> list[Chunk]:
         """Load chunks from disk."""
@@ -244,7 +325,10 @@ class KBStore:
         suffix = course_id if course_id else "global"
 
         faiss_dir = index_dir / "faiss" / suffix
-        bm25_path = index_dir / "bm25" / f"{suffix}.pkl"
+        bm25_path = index_dir / "bm25" / f"{suffix}.json"
+        # Legacy .pkl files (pre fix-all v3 #C6) are intentionally not loaded
+        # — pickle.load was the RCE risk; on a fresh build a .json sibling
+        # appears next to it and supersedes the legacy file.
 
         if faiss_dir.exists() and bm25_path.exists():
             self._vector_index = VectorIndex(self.embed_fn)
@@ -255,4 +339,5 @@ class KBStore:
 
             self._hybrid = HybridSearch(self._vector_index, self._bm25_index)
             self._all_chunks = self._vector_index.chunks
+            self._chunk_index = None  # Lazy rebuild on next find_chunk call.
             logger.info(f"Loaded indices: {self._vector_index.total_vectors} vectors")

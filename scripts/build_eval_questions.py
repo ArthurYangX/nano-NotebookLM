@@ -16,9 +16,11 @@ Run:
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import re
 import sys
+import warnings
 from collections import Counter
 from pathlib import Path
 
@@ -100,6 +102,8 @@ EN_STOPWORDS = set(
     "Then When Where Which While Some All None Each Both Either Same Other "
     "Such More Most Less Many Few Any Few Every".split()
 )
+EN_STOPWORDS_LOWER = {w.lower() for w in EN_STOPWORDS}
+JIEBA_CONCEPT_FLAGS = {"n", "vn", "eng"}
 
 
 def _is_zh_concept(s: str) -> bool:
@@ -113,15 +117,47 @@ def _looks_like_term(s: str) -> bool:
     if _is_zh_concept(s):
         return s not in ZH_STOPWORDS and not all(c in "。，、；：？！.,;:?!" for c in s)
     # English term: must be capitalized or contain digits/symbols, and >= 4 chars
-    return len(s) >= 4 and s not in EN_STOPWORDS and not s.isdigit()
+    if len(s) < 4 or s.lower() in EN_STOPWORDS_LOWER or s.isdigit():
+        return False
+    return s[0].isupper() or s.isupper() or "-" in s or any(c.isdigit() for c in s)
+
+
+def _load_jieba_posseg():
+    try:
+        return importlib.import_module("jieba.posseg")
+    except ModuleNotFoundError:
+        warnings.warn(
+            "jieba not available; falling back to regex Chinese concept extraction",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return None
+
+
+def _is_jieba_concept_flag(flag: str) -> bool:
+    return flag in JIEBA_CONCEPT_FLAGS or flag.startswith("n")
+
+
+def _iter_zh_terms(text: str, posseg) -> list[str]:
+    if posseg is None:
+        return re.findall(r"[一-鿿]{2,4}", text)
+    terms: list[str] = []
+    for token in posseg.cut(text):
+        word = str(getattr(token, "word", "")).strip()
+        flag = str(getattr(token, "flag", "")).strip()
+        if word and _is_jieba_concept_flag(flag):
+            terms.append(word)
+    return terms
 
 
 def extract_concepts(chunks: list[dict], top_n: int = 80) -> list[str]:
     counter: Counter = Counter()
+    posseg = _load_jieba_posseg()
     for chunk in chunks:
         text = chunk.get("text", "")
-        # Chinese 2-4 char terms
-        for m in re.findall(r"[一-鿿]{2,4}", text):
+        # Chinese terms: prefer jieba POS cuts; fall back to the old regex if
+        # jieba is unavailable so eval generation still works offline.
+        for m in _iter_zh_terms(text, posseg):
             if _looks_like_term(m):
                 counter[m] += 1
         # English: CamelCase / ALL-CAPS / hyphenated terms

@@ -17,6 +17,65 @@ class NoteGeneratorSkill(Skill):
     name = "note_generator"
     description = "Generate structured study notes from course materials"
 
+    def prepare_inputs(self, params: dict) -> dict | None:
+        """Build the LLM inputs without invoking it. Returns None if the
+        precondition fails (e.g. no chunks). Round 2 #5 uses this so the
+        streaming endpoint can reuse the same prompt and pipe deltas
+        directly through `router.complete_stream` instead of running the
+        whole skill then chunking the result.
+        """
+        course_id = params.get("course_id", "")
+        topic = params.get("topic")
+        note_format = params.get("format", "markdown")
+        user_lang = params.get("user_lang")
+
+        if not course_id:
+            return None
+
+        if topic:
+            results = self.kb.search(topic, top_k=15, course_id=course_id)
+        else:
+            chunks = self.kb.get_chunks(course_id)
+            if not chunks:
+                return None
+            results = self.kb.search(
+                f"key concepts definitions theorems examples for {course_id}",
+                top_k=20,
+                course_id=course_id,
+            )
+        if not results:
+            return None
+
+        source_text = "\n\n---\n\n".join(
+            f"[Source: {r.source_file}, {r.location}]\n{r.text}"
+            for r in results
+        )
+        format_instructions = (prompts.NOTE_FORMAT_LATEX
+                               if note_format == "latex"
+                               else prompts.NOTE_FORMAT_MARKDOWN)
+        prompt = prompts.NOTE_GENERATION_PROMPT.format(
+            course_name=course_id,
+            topic=topic or "Full Course Overview",
+            format=note_format,
+            source_text=source_text,
+            format_instructions=format_instructions,
+        )
+        system = prompts.NOTE_GENERATION_SYSTEM
+        binding = prompts.USER_LANG_BINDING(user_lang)
+        if binding:
+            system = f"{system}\n\n{binding}"
+        return {
+            "prompt": prompt,
+            "system": system,
+            "task_type": "note_generation",
+            "temperature": 0.3,
+            "max_tokens": 8192,
+            "format": note_format,
+            "topic": topic or "Full Course",
+            "sources_used": len(results),
+            "course_id": course_id,
+        }
+
     async def execute(self, params: dict) -> SkillResult:
         """
         Params:
@@ -30,60 +89,36 @@ class NoteGeneratorSkill(Skill):
         note_format = params.get("format", "markdown")
         scope = params.get("scope", "full")
 
-        if not course_id:
-            return SkillResult(success=False, error="No course_id provided")
-
-        # 1. Retrieve relevant chunks
-        if topic:
-            results = self.kb.search(topic, top_k=15, course_id=course_id)
-        else:
-            # Get all chunks for the course (limited for API cost)
+        prepared = self.prepare_inputs(params)
+        if prepared is None:
+            if not course_id:
+                return SkillResult(success=False, error="No course_id provided")
             chunks = self.kb.get_chunks(course_id)
             if not chunks:
                 return SkillResult(success=False, error=f"No chunks found for course {course_id}")
-            # Sample representative chunks
-            results = self.kb.search(
-                f"key concepts definitions theorems examples for {course_id}",
-                top_k=20,
-                course_id=course_id,
-            )
-
-        if not results:
             return SkillResult(success=False, error="No relevant content found")
 
-        # 2. Build source text
-        source_text = "\n\n---\n\n".join(
-            f"[Source: {r.source_file}, {r.location}]\n{r.text}"
-            for r in results
-        )
-
-        # 3. Format instructions
-        if note_format == "latex":
-            format_instructions = prompts.NOTE_FORMAT_LATEX
-        else:
-            format_instructions = prompts.NOTE_FORMAT_MARKDOWN
-
-        # 4. Generate notes via LLM
-        prompt = prompts.NOTE_GENERATION_PROMPT.format(
-            course_name=course_id,
-            topic=topic or "Full Course Overview",
-            format=note_format,
-            source_text=source_text,
-            format_instructions=format_instructions,
-        )
-
         resp = await self.router.complete(
-            prompt,
-            task_type="note_generation",
-            system=prompts.NOTE_GENERATION_SYSTEM,
-            temperature=0.3,
-            max_tokens=8192,
+            prepared["prompt"],
+            task_type=prepared["task_type"],
+            system=prepared["system"],
+            temperature=prepared["temperature"],
+            max_tokens=prepared["max_tokens"],
         )
 
-        # 5. Save to file
+        # 5. Save to file. Defense-in-depth: even though all callers (the API
+        # endpoint and the agent's generate_note tool) now whitelist
+        # course_id against orchestrator.list_courses(), we re-assert the
+        # resolved output path stays under ARTIFACTS_DIR/courses/ — `course_id`
+        # values like "../../etc" would otherwise let any future caller
+        # write outside the artifacts tree.
         ext = ".tex" if note_format == "latex" else ".md"
         topic_slug = _slugify(topic) if topic else "full_course"
-        output_dir = config.ARTIFACTS_DIR / "courses" / course_id / "notes"
+        output_dir = (config.ARTIFACTS_DIR / "courses" / course_id / "notes").resolve()
+        allowed_root = (config.ARTIFACTS_DIR / "courses").resolve()
+        if not output_dir.is_relative_to(allowed_root):
+            return SkillResult(success=False,
+                               error=f"course_id {course_id!r} resolves outside artifacts root")
         output_dir.mkdir(parents=True, exist_ok=True)
         output_path = output_dir / f"{topic_slug}{ext}"
         output_path.write_text(resp.content, encoding="utf-8")
@@ -95,7 +130,7 @@ class NoteGeneratorSkill(Skill):
                 "content": resp.content,
                 "format": note_format,
                 "topic": topic or "Full Course",
-                "sources_used": len(results),
+                "sources_used": prepared["sources_used"],
                 "model": resp.model,
             },
         )

@@ -47,6 +47,8 @@ TASK_ROUTES: dict[str, str] = {
     "note_generation": "claude",
     "quiz_generation": "openai",
     "qa_answer": "claude",
+    "qa_general": "claude",
+    "translate_query": "openai",
     "exam_analysis": "openai",
     "report_writing": "claude",
     "cross_review": "alternate",

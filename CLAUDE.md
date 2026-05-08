@@ -24,11 +24,13 @@ frontend/          React UI (Claude Design) — served as static files
 
 api/server.py      FastAPI backend — REST API + static file serving
   ├── /api/chat           RAG Q&A with source citations
+  ├── /api/agent/stream   Multi-turn tool-calling agent (NDJSON event stream)
   ├── /api/notes          Structured note generation
   ├── /api/quiz           Practice quiz generation
   ├── /api/exam-analysis  Exam pattern analysis (JSON body)
   ├── /api/report         Course report generation
-  ├── /api/mindmap/{id}   Knowledge graph extraction
+  ├── /api/mindmap/{id}        Two-stage KG extraction + user-edit overlay
+  ├── /api/mindmap/{id}/edit   Apply student ops (add/update/delete/connect)
   ├── /api/upload/{id}    File upload + indexing (50MB cap, whitelisted suffixes)
   ├── /api/memory         User memory persistence
   ├── /api/courses        Course listing
@@ -46,7 +48,9 @@ nano_notebooklm/   Python backend modules
   ├── kb/           FAISS vector + BM25 keyword + RRF hybrid search
   ├── kg/           Knowledge graph (NetworkX + Mermaid)
   ├── skills/       QA, notes, quiz, exam analysis, mastery, reports
-  └── orchestrator/ Skill routing, parallel execution, memory
+  └── orchestrator/ Skill routing, parallel execution, memory,
+                    agent_loop (multi-turn tool calling) +
+                    tools/ (search_kb, read_chunk, list_courses, generate_note)
 ```
 
 ## Key Conventions
@@ -72,9 +76,50 @@ nano_notebooklm/   Python backend modules
 
 ## Maturity Notes
 
-- API: input validation via Pydantic, 422 errors return
-  `{error: "validation_error", request_id, detail}`. All responses include
-  `x-request-id` and `x-response-time-ms` headers.
+- API: input validation via Pydantic with strip-then-validate (whitespace-only
+  → 422), 422 errors return `{error: "validation_error", request_id, detail}`.
+  All responses include `x-request-id` and `x-response-time-ms` headers.
+  `/api/chat` carries a `ChatResponse` model with `path: Literal["rag", "general",
+  "translated", "cross-course"] | None` (forbidden extras) and optional
+  `original_query` / `translated_query` / `general_reason` / `filter_empty` /
+  `filter_low_quality` side fields.
+- Smart routing (Round 2 #1+#2+#3): chat input goes through
+  `router_intent.classify_input` — short / greeting / pure-punctuation queries
+  skip RAG and go to a general GPT path; RAG results pass a score gate
+  (`top1≥τ AND hits≥min_hits` OR `top1≥2τ AND hits≥1`); on 0-hit + course/query
+  language mismatch (and not mixed) the query is translated once (5s budget,
+  no retry) and the search is retried; still failing → cross-course fallback
+  (search All Courses, surface results from a sibling course with a "本课无相关
+  内容" annotation); finally → general path. Path decision surfaces as a chip
+  in the assistant UI; topbar dropdown shows 🇨🇳/🇺🇸/🌐 per course.
+- Real streaming (Round 2 #5): `/api/notes/stream` and `/api/report/stream`
+  pipe `router.complete_stream` deltas straight through to NDJSON `chunk`
+  events (codex `responses.create(stream=True)` → asyncio.Queue bridge from
+  the executor thread); `/api/quiz/stream` keeps pseudo-streaming because
+  partial JSON is unparseable mid-flight. First-token UX dropped from ~13s to
+  <1.5s on codex GPT-5.5.
+- Tool-calling agent (`/api/agent/stream`): multi-turn ReAct loop using
+  `chat.completions(stream=True, tools=[...])`. Four built-in tools —
+  `search_kb`, `read_chunk`, `list_courses`, `generate_note`. NDJSON event
+  vocabulary: `{type: "text", delta}` / `{type: "tool_call", name,
+  arguments, call_id}` / `{type: "tool_result", name, call_id, result}` /
+  `{type: "done", answer, turns, max_turns_hit, budget_hit}` /
+  `{type: "error", error, partial}`. Read-only tool calls in a single turn
+  run via `asyncio.gather` (`run_tool_calls` partitioning); generate_note
+  serializes. Hardening: course_id whitelisted against
+  `orchestrator.list_courses()` in every tool, dedicated 2-worker
+  `_agent_executor` (so agent runs can't starve notes/report/qa pool),
+  bounded `Queue(maxsize=256)` with thread-side backpressure, cancellation
+  via `threading.Event` + `stream.close()`, per-tool `asyncio.wait_for`
+  timeout (30s read-only / 60s generate_note), aggregate
+  `tool_result` budget (200KB → done.budget_hit=True), max_turns guard
+  (default 8). Frontend rendering contract: `tool_result.result` and
+  `error.partial` are untrusted text — render as `<pre>` / `<code>`,
+  never as HTML or markdown.
+- CJK fallbacks (Round 2 #6): all global font stacks
+  (`--serif`/`--sans`/`--mono`) end with PingFang SC / Microsoft YaHei /
+  Hiragino Sans GB / Noto Sans SC; long Chinese filenames in citation chips
+  ellipsis-clip with hover-to-expand title.
 - P0/P1 learning UX: frontend now exposes all six skills, clickable citations
   route to Reader highlights, notes are editable with Markdown/PDF export,
   quiz answers persist with stale detection and wrong-only review, mastery can
@@ -85,6 +130,25 @@ nano_notebooklm/   Python backend modules
 - Knowledge graph: KG payloads carry depth / weight / source_chunks plus typed
   relations; frontend mind map uses weight/depth styling, detail panels, source
   links, pan/zoom/drag, collapse, and empty-state handling.
+- Mind map M1+M2+M3 (2026-05-06): KG extraction is now two-stage — Stage A
+  produces `course_overview` + 5–9 macro topics (one LLM call, sanitized name
+  ≤80 chars / definition ≤300 chars, 15s `asyncio.wait_for` ceiling); Stage B
+  per-chunk extraction injects topics so each concept declares a `parent_topic`.
+  Output graph has explicit `concept_type="root"` (depth=0) + topic nodes
+  (depth=1) + leaf concepts (depth≥2) connected by `part-of` edges (child →
+  parent). Merger dedups by `(concept_type, normalized_name)` so a Stage A
+  topic and a same-named Stage B leaf don't collapse. Frontend layout
+  (`prepareMindmap`) is parent-aware recursive radial: slice ∝ subtree leaf
+  count; root rendered as a course card; per-topic HSL hue inherited by
+  descendants. The map is editable: dblclick edit, N add child, Del delete
+  (root protected), shift+drag to connect with relation popup. Edits go to
+  `POST /api/mindmap/{id}/edit` (per-course `asyncio.Lock` + atomic temp-file
+  rename); persisted to `artifacts/courses/<id>/mindmap_edits.json` and
+  replayed on every GET, so re-extraction never clobbers student work.
+  Endpoint validates that `add_node.parent_id` / `add_edge` source+target
+  exist in the graph and returns `op_results: [{op, status, reason}]` so the
+  client can surface skipped ops; the frontend shows `● N op skipped` /
+  `● save failed` chips in the toolbar instead of console-warn-only.
 - Observability: `/api/status` includes backend, latency p50 samples, and cost
   fields; the frontend status bar displays degraded state if the backend is
   unavailable.
@@ -94,4 +158,4 @@ nano_notebooklm/   Python backend modules
   hash-based fake embeddings and monkeypatched search/LLM paths).
 - Still missing for production: auth / multi-tenant, request rate limits,
   background-task ingestion, OpenAPI client codegen, structured metrics
-  (Prometheus). Mastery / KG editing are read-only.
+  (Prometheus). Mastery is still read-only (KG editing landed in M3).

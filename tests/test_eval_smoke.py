@@ -115,6 +115,11 @@ def smoke_client(monkeypatch, tmp_path, fake_embed_fn):
         ))
 
     monkeypatch.setenv("ARTIFACTS_DIR", str(art))
+    # Disable the score gate floor for smoke — the hash-based fake_embed_fn
+    # produces RRF scores in the ~0.016-0.033 range which are below the
+    # production-tuned 0.020 default; in real corpora top hits comfortably
+    # exceed it. This matches the chat_client fixture in test_router_intent.
+    monkeypatch.setenv("RAG_SCORE_GATE_TOP1", "0.0")
     from nano_notebooklm import config
     monkeypatch.setattr(config, "ARTIFACTS_DIR", art)
     from nano_notebooklm.kb import store as kb_store

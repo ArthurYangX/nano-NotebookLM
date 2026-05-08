@@ -21,6 +21,7 @@ dependencies = [
     # Data handling
     "pydantic>=2.7",
     "numpy>=1.26",
+    "jieba>=0.42.1",
     # UI
     "gradio>=5.0",
     # Utilities

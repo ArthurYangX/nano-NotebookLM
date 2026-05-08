@@ -34,6 +34,7 @@ class QuizGeneratorSkill(Skill):
         difficulty = params.get("difficulty", "medium")
         question_types = params.get("question_types", ["multiple_choice", "short_answer", "calculation"])
         weak_concepts = params.get("weak_concepts")
+        user_lang = params.get("user_lang")
 
         if not course_id:
             return SkillResult(success=False, error="No course_id provided")
@@ -69,11 +70,15 @@ class QuizGeneratorSkill(Skill):
             source_text=source_text,
         )
 
+        system = prompts.QUIZ_GENERATION_SYSTEM
+        binding = prompts.USER_LANG_BINDING(user_lang)
+        if binding:
+            system = f"{system}\n\n{binding}"
         try:
             quiz_data = await self.router.complete_structured(
                 prompt,
                 task_type="quiz_generation",
-                system=prompts.QUIZ_GENERATION_SYSTEM,
+                system=system,
                 temperature=0.7,
             )
         except Exception as e:

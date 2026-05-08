@@ -45,9 +45,18 @@
   --shadow: 0 2px 8px oklch(0.4 0.012 70 / 0.07), 0 1px 0 oklch(0.86 0.012 70);
 
   /* Type */
-  --serif: "Source Serif 4", "Source Serif Pro", "Iowan Old Style", Georgia, serif;
-  --sans: "IBM Plex Sans", -apple-system, system-ui, sans-serif;
-  --mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  /* Round 2 #6: append CJK fallbacks (PingFang macOS, Microsoft YaHei Win,
+     Hiragino Sans GB, Noto Sans SC) to every stack so Chinese course names
+     and answers don't fall back to the broken Songti / Heiti glyphs that
+     ship with some browser default profiles. */
+  --serif: "Source Serif 4", "Source Serif Pro", "Iowan Old Style", Georgia,
+           "Songti SC", "PingFang SC", "Microsoft YaHei", "Hiragino Sans GB",
+           "Noto Sans SC", serif;
+  --sans: "IBM Plex Sans", -apple-system, system-ui,
+          "PingFang SC", "Microsoft YaHei", "Hiragino Sans GB",
+          "Noto Sans SC", sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo,
+          "PingFang SC", "Microsoft YaHei", "Noto Sans Mono CJK SC", monospace;
 
   --base-size: 15px;
   --density: 1;
@@ -1083,6 +1092,51 @@ body::before {
   top: 0; left: 0;
 }
 
+/* R3-3: learning-order badge on topic nodes ("1 / 2 / 3 ..."). Top-left
+   so it doesn't overlap the right-side collapse toggle. */
+.mm-order-badge {
+  position: absolute;
+  left: -8px;
+  top: -8px;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  background: var(--ink);
+  color: var(--paper);
+  border: 1px solid var(--ink);
+  border-radius: 9px;
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 700;
+  display: grid;
+  place-items: center;
+  line-height: 1;
+  pointer-events: none;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.18);
+}
+
+/* R3-3: deep-dive side panel that streams the 5-line + 3-quiz answer.
+   Sits on the right edge but sized larger than `.mindmap-detail` so
+   the streamed text + tool-call transcript fit. */
+.mm-deepdive-panel {
+  position: absolute;
+  right: 16px;
+  top: 64px;
+  width: 340px;
+  max-height: calc(100% - 100px);
+  overflow: auto;
+  background: var(--paper);
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--radius);
+  padding: 14px 16px;
+  box-shadow: var(--shadow);
+  z-index: 7;
+}
+.mm-deepdive-panel-msg {
+  font-family: var(--serif);
+  color: var(--ink);
+}
+
 /* ============ Quiz ============ */
 .quiz-wrap {
   height: 100%;
@@ -1354,6 +1408,296 @@ body::before {
   margin-bottom: 12px;
   font-size: 13px;
 }
+
+/* ─── Notes reading UX (R6) ─── */
+/* `.workspace` and `.main` both `overflow: hidden`, so the Notes view must
+   own its own scroll container (mirrors `.reader { height:100%; overflow-y:auto }`).
+   sticky inside .notes-stage anchors against THIS scrolling box, not the
+   viewport — so `top: 0` here means "stay at the top of the visible
+   workspace as the user scrolls the body". */
+.notes-reader-body {
+  height: 100%;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 28px 40px;
+  max-width: none;
+  scroll-behavior: smooth;
+}
+.notes-edit-hint {
+  font-size: 11px;
+  color: var(--ink-3);
+  margin: 0 0 8px 0;
+}
+/* No fixed height + no overflow:hidden on the stage so the OUTER container
+   (.workspace / .reader-body) keeps its natural scroll. The TOC and drawer
+   stick to the top of the viewport via position:sticky as the user scrolls
+   the main content. */
+.notes-stage {
+  position: relative;
+  display: grid;
+  grid-template-columns: 200px 1fr 260px;
+  gap: 24px;
+  align-items: start;
+}
+.notes-stage > .notes-preview {
+  scroll-behavior: smooth;
+  min-width: 0;
+}
+.notes-stage > .notes-preview p,
+.notes-stage > .notes-preview li { line-height: 1.7; }
+.notes-stage > .notes-preview h1,
+.notes-stage > .notes-preview h2,
+.notes-stage > .notes-preview h3 { scroll-margin-top: 64px; /* clear sticky toolbar */ }
+
+/* TOC sidebar */
+.notes-toc {
+  position: sticky;
+  top: 56px; /* clear the sticky .notes-toolbar above */
+  align-self: start;
+  max-height: calc(100vh - 220px);
+  overflow: auto;
+  border-right: 1px solid var(--rule);
+  padding-right: 8px;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--ink-3);
+}
+.notes-toc .toc-head,
+.notes-hl-drawer .hl-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.notes-toc .toc-head {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--ink-4);
+  margin-bottom: 8px;
+}
+.side-close {
+  background: transparent;
+  border: none;
+  color: var(--ink-4);
+  cursor: pointer;
+  font-size: 16px;
+  line-height: 1;
+  padding: 0 4px;
+  border-radius: 3px;
+}
+.side-close:hover { color: var(--ink); background: var(--paper-2); }
+.notes-toc ul { list-style: none; padding: 0; margin: 0; }
+.notes-toc li { margin: 0; }
+.notes-toc li button {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: transparent;
+  border: none;
+  padding: 4px 8px 4px 6px;
+  border-left: 2px solid transparent;
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  border-radius: 0 4px 4px 0;
+}
+.notes-toc li button:hover { background: var(--paper-2); color: var(--ink); }
+.notes-toc li.toc-l1 button { font-weight: 600; color: var(--ink-2); }
+.notes-toc li.toc-l2 button { padding-left: 18px; }
+.notes-toc li.toc-l3 button { padding-left: 30px; color: var(--ink-4); }
+.notes-toc li.active button {
+  border-left-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent-ink);
+}
+
+/* Highlights drawer */
+.notes-hl-drawer {
+  position: sticky;
+  top: 56px; /* clear the sticky .notes-toolbar above */
+  align-self: start;
+  max-height: calc(100vh - 220px);
+  overflow: auto;
+  border-left: 1px solid var(--rule);
+  padding-left: 12px;
+  font-size: 12.5px;
+}
+.notes-hl-drawer .hl-head {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--ink-4);
+  margin-bottom: 8px;
+}
+.notes-hl-drawer ul { list-style: none; padding: 0; margin: 0; }
+.notes-hl-drawer .hl-row {
+  position: relative;
+  padding: 8px 22px 8px 8px;
+  border-radius: 4px;
+  margin-bottom: 6px;
+  border: 1px solid var(--rule);
+  background: var(--paper);
+}
+.notes-hl-drawer .hl-row:hover { background: var(--paper-2); }
+.notes-hl-drawer .hl-jump {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: transparent;
+  border: none;
+  padding: 0;
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+}
+.notes-hl-drawer .hl-dot {
+  display: inline-block;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  margin-right: 6px;
+  vertical-align: middle;
+}
+.notes-hl-drawer .hl-text { vertical-align: middle; }
+.notes-hl-drawer .hl-note {
+  margin: 6px 0 0 0;
+  padding: 6px 8px;
+  background: var(--paper-2);
+  border-left: 2px solid var(--accent);
+  border-radius: 0 4px 4px 0;
+  font-size: 11.5px;
+  color: var(--ink-3);
+  white-space: pre-wrap;
+}
+.notes-hl-drawer .hl-remove {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  background: transparent;
+  border: none;
+  color: var(--ink-4);
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+  padding: 2px 6px;
+}
+.notes-hl-drawer .hl-remove:hover { color: var(--crimson); }
+
+/* Inline mark colors (preview) */
+mark.hl {
+  border-radius: 2px;
+  padding: 0 1px;
+  cursor: pointer;
+  transition: filter 120ms;
+}
+mark.hl-yellow { background: oklch(0.93 0.13 95); color: inherit; }
+mark.hl-green  { background: oklch(0.91 0.12 145); color: inherit; }
+mark.hl-pink   { background: oklch(0.91 0.10 0); color: inherit; }
+mark.hl[data-has-note="1"] {
+  box-shadow: inset 0 -2px 0 0 var(--accent);
+}
+mark.hl:hover { filter: brightness(0.95); }
+mark.hl-flash { animation: hl-flash 0.9s ease-out; }
+@keyframes hl-flash {
+  0%   { outline: 2px solid var(--accent); outline-offset: 1px; }
+  100% { outline: 2px solid transparent; outline-offset: 1px; }
+}
+
+/* Selection menu / popover */
+.sel-menu, .hl-popover {
+  position: absolute;
+  z-index: 30;
+  background: var(--paper);
+  border: 1px solid var(--rule-strong);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px oklch(0% 0 0 / 0.12);
+  padding: 6px 8px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  transform: translateX(-50%);
+}
+.hl-popover {
+  flex-direction: column;
+  align-items: stretch;
+  padding: 8px;
+  min-width: 220px;
+}
+.hl-popover-row { display: flex; gap: 6px; align-items: center; }
+.sel-color {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  border: 2px solid transparent;
+  cursor: pointer;
+  padding: 0;
+}
+.sel-color.active { border-color: var(--ink); }
+.sel-color.hl-yellow { background: oklch(0.93 0.13 95); }
+.sel-color.hl-green  { background: oklch(0.91 0.12 145); }
+.sel-color.hl-pink   { background: oklch(0.91 0.10 0); }
+.sel-cancel, .hl-popover-del {
+  background: transparent;
+  border: none;
+  color: var(--ink-3);
+  cursor: pointer;
+  font-size: 13px;
+  padding: 0 6px;
+}
+.hl-popover-del { font-size: 11px; color: var(--crimson); margin-left: auto; }
+.hl-popover-del:hover { text-decoration: underline; }
+.hl-note-input {
+  margin-top: 6px;
+  width: 100%;
+  min-height: 60px;
+  resize: vertical;
+  border: 1px solid var(--rule);
+  border-radius: 4px;
+  padding: 6px 8px;
+  font: inherit;
+  font-size: 12px;
+  color: var(--ink);
+  background: var(--paper);
+}
+
+/* Source chip is now a clickable button */
+.notes-preview .ref-chip {
+  cursor: pointer;
+  border: 1px solid var(--rule);
+  background: var(--paper-2);
+  font-family: var(--mono);
+  padding: 1px 6px;
+  border-radius: 3px;
+  color: var(--ink-3);
+  font-size: 0.85em;
+}
+.notes-preview .ref-chip:hover {
+  background: var(--accent-soft);
+  color: var(--accent-ink);
+  border-color: var(--accent);
+}
+
+/* Auto-collapse columns when one or both panels are hidden so the preview
+   takes the freed space instead of leaving a dead grid track. */
+.notes-stage:has(> .notes-toc):not(:has(> .notes-hl-drawer)) {
+  grid-template-columns: 200px 1fr;
+}
+.notes-stage:not(:has(> .notes-toc)):has(> .notes-hl-drawer) {
+  grid-template-columns: 1fr 260px;
+}
+.notes-stage:not(:has(> .notes-toc)):not(:has(> .notes-hl-drawer)) {
+  grid-template-columns: 1fr;
+}
+
+@media (max-width: 1100px) {
+  .notes-stage { grid-template-columns: 1fr !important; }
+  .notes-toc, .notes-hl-drawer { position: static; max-height: none; border: none; padding: 8px 0; }
+}
+
 .reader-notice,
 .reader-target {
   border: 1px solid var(--amber);
@@ -1369,6 +1713,52 @@ body::before {
   border-color: var(--accent);
   background: var(--accent-soft);
   color: var(--accent-ink);
+}
+.chunk-err {
+  color: var(--crimson);
+  font-style: italic;
+}
+.chunk-retry {
+  background: transparent;
+  border: 1px solid var(--crimson);
+  color: var(--crimson);
+  border-radius: 3px;
+  padding: 0 6px;
+  font-size: 10px;
+  cursor: pointer;
+  font-style: normal;
+}
+.chunk-retry:hover {
+  background: var(--crimson);
+  color: var(--paper);
+}
+.chunk-block {
+  margin: 18px 0;
+}
+.chunk-block .chunk-context,
+.chunk-block .chunk-target {
+  position: relative;
+  padding: 12px 14px 12px 18px;
+  margin: 8px 0;
+  border-left: 2px solid var(--rule);
+  font-family: var(--serif);
+  font-size: 14px;
+  line-height: 1.7;
+  color: var(--ink-2);
+}
+.chunk-block .chunk-target {
+  border-left-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--ink-1);
+  font-weight: 500;
+}
+.chunk-marker {
+  display: block;
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  opacity: 0.7;
+  margin-bottom: 4px;
 }
 .skill-grid {
   display: grid;
@@ -1532,6 +1922,33 @@ body::before {
 }
 .msg.ai .bubble { color: var(--ink); }
 
+/* Round 2 #1: routing chip — surfaces which path produced this answer
+   (rag / general / translated / cross-course / filter-empty fallback). */
+.path-chip {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 9px;
+  letter-spacing: 0.06em;
+  font-family: var(--mono);
+  border: 1px solid var(--rule);
+  background: var(--paper);
+  color: var(--ink-3);
+  text-transform: none;
+  vertical-align: 1px;
+}
+.path-chip.path-rag { border-color: var(--accent); color: var(--accent-ink); background: var(--accent-soft); }
+.path-chip.path-general { border-color: var(--rule); color: var(--ink-4); }
+.path-chip.path-translated { border-color: var(--amber); color: oklch(0.42 0.08 70); background: var(--amber-soft); }
+.path-chip.path-cross-course { border-color: var(--plum); color: var(--plum); background: var(--plum-soft); }
+.path-chip.path-filter-empty { border-color: var(--crimson); color: var(--crimson); background: var(--crimson-soft); }
+.path-chip-detail {
+  margin-left: 4px;
+  opacity: 0.75;
+  font-size: 9px;
+}
+
 .msg .refs {
   display: flex;
   flex-wrap: wrap;
@@ -1547,6 +1964,14 @@ body::before {
   padding: 1px 6px;
   border-radius: 2px;
   cursor: pointer;
+  /* Round 2 #6: long Chinese filenames (e.g. "深入理解计算机系统(中文版).pdf")
+     used to wrap and break the chip layout. Cap width and ellipsis; the full
+     name lives in the title attribute (set in JSX) for hover discoverability. */
+  max-width: 28ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: middle;
 }
 
 /* Thinking steps */
@@ -1636,6 +2061,20 @@ body::before {
   font-size: 14px;
 }
 .asst-input .send:hover { background: var(--accent); }
+.asst-input .send:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+  background: var(--ink-3, #888);
+}
+.asst-input .send.cancel {
+  background: var(--crimson);
+  color: var(--paper);
+  font-size: 18px;
+  line-height: 1;
+}
+.asst-input .send.cancel:hover {
+  background: oklch(0.50 0.18 25);
+}
 
 /* ============ Status bar ============ */
 .statusbar {
@@ -1851,33 +2290,98 @@ body::before {
 }
 
 /* ── Message rendering enhancements ── */
-.bubble p { margin: 0 0 8px 0; }
+/* Tighter paragraph cadence so consecutive sentences read as a flowing
+ * block instead of a list of widely-spaced lines (user feedback 2026-05-06). */
+.bubble p { margin: 0 0 4px 0; line-height: 1.55; }
 .bubble p:last-child { margin-bottom: 0; }
-.bubble h3 { font-size: 14px; font-weight: 600; margin: 12px 0 4px; }
-.bubble h4 { font-size: 13px; font-weight: 600; margin: 10px 0 4px; }
-.bubble ul { margin: 4px 0 8px 0; padding-left: 18px; }
-.bubble li { margin: 2px 0; }
+.bubble p + p { margin-top: 4px; }
+.bubble br { line-height: 1.2; }
+.bubble h3 { font-size: 14px; font-weight: 600; margin: 10px 0 3px; }
+.bubble h4 { font-size: 13px; font-weight: 600; margin: 8px 0 3px; }
+.bubble ul { margin: 3px 0 6px 0; padding-left: 18px; }
+.bubble li { margin: 1px 0; line-height: 1.5; }
 .bubble code { background: var(--paper-2); padding: 1px 5px; border-radius: 3px; font-family: var(--mono); font-size: 0.9em; }
 .bubble strong { font-weight: 600; color: var(--ink); }
 
+/* Display math wrapper: KaTeX produces its own .katex-display inside.
+ * We give it the visual anchor (accent border, light tint) so a rendered
+ * equation still reads as a labeled artifact in the chat flow. */
+.math-display {
+  display: block;
+  background: var(--paper-2);
+  border-left: 3px solid var(--accent);
+  padding: 10px 14px;
+  margin: 10px 0;
+  text-align: center;
+  overflow-x: auto;
+  border-radius: 0 4px 4px 0;
+}
+.math-display .katex-display {
+  margin: 0;
+}
+/* KaTeX inline rendering — ensure it inherits bubble color and stays visually
+ * coherent with surrounding prose (no overflow on long fractions). */
+.bubble .katex {
+  font-size: 1em;
+  color: var(--ink);
+}
+.bubble .katex-display {
+  margin: 8px 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+/* Fallback: if KaTeX fails to load (offline / CDN block), the legacy
+ * mono-chip style at least keeps formulas distinguishable from prose. */
 .math-block {
   display: block;
   background: var(--paper-2);
   border-left: 3px solid var(--accent);
-  padding: 8px 12px;
-  margin: 8px 0;
+  padding: 10px 14px;
+  margin: 10px 0;
   font-family: var(--mono);
-  font-size: 0.9em;
+  font-size: 0.95em;
+  text-align: center;
   overflow-x: auto;
   white-space: pre-wrap;
   border-radius: 0 4px 4px 0;
+  color: var(--ink);
 }
 .math-inline {
   font-family: var(--mono);
-  font-size: 0.9em;
+  font-size: 0.92em;
   background: var(--paper-2);
-  padding: 1px 4px;
-  border-radius: 2px;
+  padding: 1px 5px;
+  border-radius: 3px;
+  color: var(--ink);
+  border: 1px solid var(--rule);
+}
+
+/* Quick-suggestion row toggle. Hidden state collapses to a small chip the
+ * user can click to bring suggestions back. */
+.asst-suggest .suggest-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  margin-left: auto;
+  padding: 2px 8px;
+  border: 1px dashed var(--rule);
+  border-radius: 999px;
+  cursor: pointer;
+  color: var(--ink-3, var(--ink-2));
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  background: transparent;
+  user-select: none;
+}
+.asst-suggest .suggest-toggle:hover {
+  color: var(--ink);
+  border-color: var(--accent);
+}
+.asst-suggest.collapsed {
+  padding: 4px 10px;
+  border-top: 1px solid var(--rule);
+  display: flex;
+  justify-content: flex-end;
 }
 
 .ref-chip {
@@ -1900,3 +2404,113 @@ body::before {
   color: white;
   border-color: var(--accent);
 }
+
+/* ─── R3-1 (2026-05-07): .reader-body scroll container ─── */
+/* RealQuizView / SkillsDashboard / SessionHistory use this class as their
+ * outermost wrapper. `.workspace` is `overflow:hidden`, so without an
+ * explicit scroll container these tabs silently clipped any content past
+ * the viewport (the user-reported "quiz can't scroll" bug). Notes view
+ * uses `.reader-body .notes-reader-body` together — `.notes-reader-body`
+ * already declares its own scroll/padding so it remains unaffected.
+ *
+ * Padding and max-width are NOT set here on purpose: consumer divs pass
+ * inline `style={{padding: "28px 40px"}}`, and `.notes-reader-body` sets
+ * its own padding. Adding them here would shadow either path under
+ * equal class-specificity (last-source-wins). */
+.reader-body {
+  height: 100%;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+/* ─── R3-2 (2026-05-07): user language preference modal + chip ─── */
+/* The modal blocks the workspace on first launch (until the student picks
+ * zh / en) and re-opens via the topbar chip thereafter. Visually we lean on
+ * the existing paper / ink palette so the modal looks native; the overlay
+ * uses an alpha layer so the workspace is still legible underneath when the
+ * student wants to flip the choice mid-session. */
+.lang-chip {
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  background: transparent;
+  color: var(--ink-2);
+  border: 1px solid var(--paper-3);
+  border-radius: 6px;
+  padding: 4px 9px;
+  cursor: pointer;
+  transition: background 0.12s ease, border-color 0.12s ease;
+}
+.lang-chip:hover { background: var(--paper-2); border-color: var(--ink-4); }
+.lang-chip:disabled { opacity: 0.4; cursor: default; }
+
+.lang-modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.32);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+.lang-modal {
+  background: var(--paper-1);
+  color: var(--ink-1);
+  border: 1px solid var(--paper-3);
+  border-radius: 10px;
+  padding: 28px 32px 22px;
+  max-width: 460px;
+  width: calc(100% - 32px);
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.18);
+}
+.lang-modal-title {
+  margin: 0 0 6px;
+  font-size: 18px;
+  font-weight: 600;
+}
+.lang-modal-hint {
+  margin: 0 0 18px;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--ink-3);
+}
+.lang-modal-choices {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+.lang-modal-choice {
+  background: var(--paper-2);
+  border: 1px solid var(--paper-3);
+  border-radius: 8px;
+  padding: 14px 14px 12px;
+  cursor: pointer;
+  text-align: left;
+  transition: border-color 0.12s ease, background 0.12s ease;
+}
+.lang-modal-choice:hover { border-color: var(--ink-4); background: var(--paper-1); }
+.lang-modal-choice.active { border-color: var(--accent); background: var(--paper-1); }
+.lang-modal-choice-label {
+  font-size: 16px;
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+.lang-modal-choice-hint {
+  font-size: 10px;
+  color: var(--ink-4);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.lang-modal-close {
+  display: block;
+  margin: 16px auto 0;
+  background: transparent;
+  border: none;
+  color: var(--ink-4);
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+.lang-modal-close:hover { color: var(--ink-2); }

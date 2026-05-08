@@ -85,6 +85,24 @@ class ModelRouter:
 
         raise RuntimeError(f"All retries exhausted: {last_error}")
 
+    async def complete_stream(
+        self,
+        prompt: str,
+        task_type: str = "",
+        system: str = "",
+        temperature: float = 0.7,
+        max_tokens: int = 4096,
+    ):
+        """Stream content deltas. Routing matches `complete()`. No retry —
+        once tokens have shipped, retrying would duplicate output. Backends
+        without genuine streaming fall back to single-chunk yield via the
+        default `LLMBackend.complete_stream` implementation."""
+        backend = self.get_backend(task_type)
+        async for delta in backend.complete_stream(
+            prompt, system=system, temperature=temperature, max_tokens=max_tokens,
+        ):
+            yield delta
+
     async def complete_structured(
         self,
         prompt: str,

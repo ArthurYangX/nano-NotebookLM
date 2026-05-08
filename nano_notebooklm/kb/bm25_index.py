@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import pickle
 from pathlib import Path
 
 from rank_bm25 import BM25Okapi
@@ -17,14 +16,19 @@ class BM25Index:
     def __init__(self):
         self.bm25: BM25Okapi | None = None
         self.chunks: list[Chunk] = []
+        # review-swarm fix-all v3 #C6: keep tokenized corpus around so
+        # save/load can serialise it as JSON instead of pickling the
+        # BM25Okapi object (pickle.load is RCE-bait if anything ever writes
+        # a poisoned indices/bm25/*.json into artifacts/).
+        self._tokenized: list[list[str]] | None = None
 
     def build(self, chunks: list[Chunk]):
         """Build BM25 index from chunks."""
         if not chunks:
             return
         self.chunks = list(chunks)
-        tokenized = [_tokenize(c.text) for c in chunks]
-        self.bm25 = BM25Okapi(tokenized)
+        self._tokenized = [_tokenize(c.text) for c in chunks]
+        self.bm25 = BM25Okapi(self._tokenized)
 
     def search(self, query: str, top_k: int = 5) -> list[SearchResult]:
         """Search for relevant chunks by keyword matching."""
@@ -52,18 +56,30 @@ class BM25Index:
         return results
 
     def save(self, save_path: str | Path):
-        """Save BM25 index to disk."""
+        """Persist tokenized corpus + chunks as JSON. The BM25Okapi instance
+        itself is not serialised; ``load`` rebuilds it from the tokenized
+        documents so a poisoned file can't smuggle a callable across the
+        deserialisation boundary."""
         save_path = Path(save_path)
         save_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(save_path, "wb") as f:
-            pickle.dump({"bm25": self.bm25, "chunks": [c.model_dump() for c in self.chunks]}, f)
+        state = {
+            "tokenized": self._tokenized,
+            "chunks": [c.model_dump() for c in self.chunks],
+        }
+        save_path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
 
     def load(self, save_path: str | Path):
-        """Load BM25 index from disk."""
-        with open(save_path, "rb") as f:
-            data = pickle.load(f)
-        self.bm25 = data["bm25"]
-        self.chunks = [Chunk(**item) for item in data["chunks"]]
+        """Load BM25 index from disk (JSON only — pickle support removed)."""
+        save_path = Path(save_path)
+        data = json.loads(save_path.read_text(encoding="utf-8"))
+        self.chunks = [Chunk(**item) for item in data.get("chunks", [])]
+        tokenized = data.get("tokenized")
+        if tokenized:
+            self._tokenized = list(tokenized)
+            self.bm25 = BM25Okapi(self._tokenized)
+        else:
+            self._tokenized = None
+            self.bm25 = None
 
 
 def _tokenize(text: str) -> list[str]:
