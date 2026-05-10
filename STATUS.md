@@ -228,28 +228,34 @@
 - **review_notes**: 预置 8 门课**物理文件保留**（artifacts/courses/{15-213,...}），仅 UI 默认隐藏，等 R4-4 GraphRAG 验收过后再决定是否物理删除。`courseModeRef` 用 `useRef` 而非 `useState`：URL 在 mount 时一次确定，整个 session 不变；用 ref 避免无意义 re-render。getCourses 强制带 `?mode=user`（即使是默认值）让请求一眼能在 access log 里区分 R4 模式。`PRESET_COURSE_IDS` 在 conftest 没新增 fixture — 直接 monkeypatch ARTIFACTS_DIR + reload server 模仿 v4 fix-all 模式。无新依赖。
 - **conflict notes**: 单文件后端改动 + 单文件前端改动，无并发 lock 风险。
 
-### #R4-2 upload-only 全链路 + Processing 实进度（NDJSON streaming）— [claude]
+### #R4-2 upload-only 全链路 + Processing 实进度（NDJSON streaming）— [review]
 
 - **goal ref**: GOAL.md Round 4 #R4-2
-- **status**: [claude]
+- **status**: [review]
 - **owner**: claude
 - **claimed_at**: 2026-05-10 23:00
-- **files (planned)**:
-  - `api/server.py`：`/api/upload/{cid}` 改成 NDJSON streaming（沿用 v4 #A6/A7 的 `asyncio.to_thread` off-load）；事件 schema `{type:"stage", stage:"chunking|embedding|kg_stage_a|kg_stage_b", progress:0-100, detail?}` + `done` / `error`
-  - `nano_notebooklm/ingest/`：现有 chunker / embedder 加 progress callback；`nano_notebooklm/kg/extractor.py` 在 Stage A / Stage B 之间发 callback
-  - `frontend/processing.jsx`：接 NDJSON，渲染 4 段进度条 + 当前阶段文案 + retry 按钮
-  - `frontend/api.js`：新增 `streamUpload(courseId, file, onEvent)` 帮手
-  - **新增** `tests/test_upload_stream.py`
-- **mini-test**: `test_upload_stream_emits_four_stages` / `test_processing_jsx_renders_stage_progress_grep` / `test_api_js_stream_upload_helper_exists`
-- **corner-test**: `test_upload_stream_pdf_corrupt_emits_error_no_partial` / `test_upload_stream_kg_stage_a_timeout_preserves_chunks` / `test_upload_stream_concurrent_same_course_serializes`
-- **conflict notes**: 端点签名变更（从 form-data POST 返 JSON 改成 NDJSON stream），需在 `frontend/api.js` 旧 `uploadFile` 入口 deprecate 并在 `library.jsx` 调用面切换。R4-1 的 `/api/courses` 改动与本项不冲突（不同端点）。
+- **submitted_at**: 2026-05-10 23:50
+- **files**:
+  - `api/server.py`（+~150 行：`_UPLOAD_LOCKS` per-course pipeline lock + `_save_uploaded_file` helper + `/api/upload/{cid}` 重写为 NDJSON `StreamingResponse`，4 阶段事件 chunking / embedding / kg_stage_a / kg_stage_b + done / error）
+  - `nano_notebooklm/kg/extractor.py`（+~14 行：`extract_from_chunks` 加可选 `progress_callback=None`；Stage A 入口 0% / 出口 100%；Stage B 每 batch 后按 `min(99, int(100 * done/total))` 触发，结束 100%）
+  - `frontend/api.js`（uploadFiles 重写：可选 `onEvent` + fetch + getReader + TextDecoder + MAX_LINE_BYTES 缓冲；返回最后一个 NDJSON 事件给老调用者）
+  - `frontend/app.jsx`（onStartUpload：setProcessing 初始化 `stages` 4-key 0% + onEvent → setProcessing patch；error 留在 processing 屏；done 后 1.2s 自动清屏）
+  - `frontend/processing.jsx`（**完全重写**：`STAGE_DEFS` 数组驱动 4 行；每行 `.pstep-bar` + 实时百分比 + ✓/✕ glyph；`processing-error` block + retry button；`processing-done` chip）
+  - `frontend/styles.css`（+45 行末尾：`.pstep-bar` / `.pstep-bar-fill` / `.processing-error` / `.processing-retry` / `.processing-done`）
+  - **新增** `tests/test_upload_stream.py`（197 行，4 mini + 5 corner）
+- **mini-test**: `test_upload_stream_emits_four_stages` / `test_upload_stream_progress_monotonic_per_stage` / `test_processing_jsx_renders_stage_progress_grep` / `test_api_js_upload_files_supports_on_event`
+- **corner-test**: `test_upload_stream_rejects_unsupported_suffix`（pre-stream 400） / `test_upload_stream_rejects_dotdot_course_id`（pre-stream 400 — `foo..bar`） / `test_upload_stream_extractor_failure_emits_error_event`（KG 失败 → NDJSON error + `error="upload_pipeline_failed"` 不泄漏 vendor 字符串 + 已落盘 chunks 仍可见） / `test_upload_stream_concurrent_same_course_serializes` / `test_extract_from_chunks_signature_accepts_progress_callback`
+- **pytest**: **597 passed in 401s**（v4 baseline 580 + R4-1 8 条 + R4-2 9 条 = 597，零 regression）
+- **self-check**: ☑ mini  ☑ corner（5 类全覆盖：非法格式 / 上游失败 / 数据缺失 / 兼容 / 前端契约）  ☑ no regression  ☑ offline（fake_embed_fn + monkeypatch extractor）  ☐ 浏览器实测：reviewer 真上传一个 PDF/MD 看 4 段进度条（用户提供的 `test-pdf/lecture_8.pdf` 122 页 1.3MB 作 fixture）
+- **review_notes**: **breaking change**：端点响应从 JSON 变 NDJSON。仓库内只有 `frontend/app.jsx` 一处调用面，已同步切换；`uploadFiles` 仍接受老的 2-arg 签名（不传 onEvent），返回最后一个 NDJSON 事件（仍含 `chunks` / `documents` / `kg_nodes`）作为兼容。后端 Stage A 失败 fallback 路径不会触发 kg_stage_b 100%——这是 fallback 不走 batched extraction 的已知缝隙，不影响 done/error 终态。**无新依赖**。
+- **conflict notes**: 与 R4-3（codex 锁中）零冲突（纯前端 vs 主要后端）。与 R4-4/R4-5 在 `api/server.py` 上：R4-2 占 `_UPLOAD_LOCKS` / `_save_uploaded_file` / `upload_files` block；R4-4 占 `/api/chat` 主体；R4-5 占 `ChatRequest` 模型 + `/api/status`；物理隔离。
 
-### #R4-3 思维导图换成知识图谱视图（force-directed + relation labels）— [ ]
+### #R4-3 思维导图换成知识图谱视图（force-directed + relation labels）— [codex]
 
 - **goal ref**: GOAL.md Round 4 #R4-3
-- **status**: [ ]  ← 2026-05-10 23:30 释放给 codex（纯前端、零 server.py 冲突，最适合并行）
-- **owner**:
-- **claimed_at**:
+- **status**: [codex]  ← 2026-05-10 23:30 释放给 codex（纯前端、零 server.py 冲突，最适合并行）
+- **owner**: codex
+- **claimed_at**: 2026-05-10 23:27
 - **files (planned)**:
   - `frontend/index.html`：CDN script 加 d3-force（`<script src="https://cdn.jsdelivr.net/npm/d3-force@3"></script>`）
   - `frontend/study-state.js`：保留 `prepareMindmap` 重命名为 `prepareMindmapTree`（向后兼容 + R3-3 测试）；新增 `prepareMindmapForce(graph)` 返回 `{nodes, links}` 喂 d3

@@ -117,15 +117,70 @@ const API = {
     return _post("/ingest", { course_dir: courseDir, course_id: courseId });
   },
 
-  async uploadFiles(courseId, files) {
+  // R4-2: /api/upload/{cid} now streams NDJSON (4 stages → done|error).
+  // ``onEvent`` receives `{type:"stage", stage, progress, detail?}` /
+  // `{type:"done", course_id, files, chunks, documents, kg_nodes}` /
+  // `{type:"error", error, stage?}`. Returns the final event so callers
+  // who only care about completion can `await` it like the old endpoint.
+  async uploadFiles(courseId, files, onEvent = null) {
     const formData = new FormData();
     for (const file of files) {
       formData.append("files", file);
     }
-    return _request(`/upload/${encodeURIComponent(courseId)}`, {
+    const res = await fetch(`${API_BASE}/upload/${encodeURIComponent(courseId)}`, {
       method: "POST",
       body: formData,
     });
+    if (!res.ok) {
+      const err = new Error(`HTTP ${res.status}`);
+      err.status = res.status;
+      try { err.body = await res.json(); } catch { /* non-JSON */ }
+      throw err;
+    }
+    if (!res.body || !window.TextDecoder) {
+      // Fallback: consume the entire response as text and parse line-by-line.
+      const text = await res.text();
+      let last = null;
+      for (const line of text.split("\n")) {
+        if (!line.trim()) continue;
+        try {
+          const ev = JSON.parse(line);
+          last = ev;
+          if (onEvent) onEvent(ev);
+        } catch { /* skip */ }
+      }
+      return last;
+    }
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    const MAX_LINE_BYTES = 1024 * 1024;
+    let buffer = "";
+    let finalEvent = null;
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      if (buffer.length > MAX_LINE_BYTES) {
+        buffer = "";
+      }
+      const lines = buffer.split("\n");
+      buffer = lines.pop() || "";
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        let ev;
+        try { ev = JSON.parse(line); } catch { continue; }
+        finalEvent = ev;
+        if (onEvent) onEvent(ev);
+      }
+    }
+    if (buffer.trim()) {
+      try {
+        const ev = JSON.parse(buffer);
+        finalEvent = ev;
+        if (onEvent) onEvent(ev);
+      } catch { /* skip */ }
+    }
+    return finalEvent;
   },
 
   async getMastery(courseId) {

@@ -334,34 +334,55 @@ function App() {
       }, 200);
 
       try {
-        await API.uploadFiles(courseName, files);
+        // R4-2: NDJSON-streamed upload. Each `stage` event ticks the
+        // matching progress bar; `done` flips the row to ✓; `error`
+        // surfaces a retry button.
+        setProcessing({
+          file: files[0].name,
+          step: 0,
+          stages: { chunking: 0, embedding: 0, kg_stage_a: 0, kg_stage_b: 0 },
+          errorStage: null,
+          errorMsg: null,
+          done: false,
+        });
+        const final = await API.uploadFiles(courseName, files, (ev) => {
+          if (!ev) return;
+          if (ev.type === "stage") {
+            setProcessing(p => p ? {
+              ...p,
+              stages: { ...(p.stages || {}), [ev.stage]: ev.progress },
+            } : p);
+          } else if (ev.type === "done") {
+            setProcessing(p => p ? { ...p, done: true } : p);
+          } else if (ev.type === "error") {
+            setProcessing(p => p ? { ...p, errorStage: ev.stage || "unknown", errorMsg: ev.error } : p);
+          }
+        });
         clearInterval(iv);
         setUploading(null);
-        setProcessing({ file: files[0].name, step: 0 });
+        if (final && final.type === "error") {
+          // Stay on processing screen so user sees the error + retry.
+          return;
+        }
         const data = await API.getCourses(courseModeRef.current);
         setCourses(data.courses || []);
         setActiveCourse(courseName);
       } catch (err) {
         clearInterval(iv);
         setUploading(null);
-        alert("Upload failed: " + err.message);
+        setProcessing(p => p ? { ...p, errorStage: "transport", errorMsg: err.message } : null);
       }
     };
     input.click();
   }
 
-  // Processing animation
+  // R4-2: auto-dismiss the processing screen ~1.2s after `done` fires.
+  // No longer fakes progress — the stream provides real percentages.
   useEffect(() => {
-    if (!processing) return;
-    const iv = setInterval(() => {
-      setProcessing(p => {
-        if (!p) return p;
-        if (p.step >= 5) { clearInterval(iv); return null; }
-        return { ...p, step: p.step + 1 };
-      });
-    }, 900);
-    return () => clearInterval(iv);
-  }, [processing?.file]);
+    if (!processing || !processing.done) return;
+    const t = setTimeout(() => setProcessing(null), 1200);
+    return () => clearTimeout(t);
+  }, [processing?.done]);
 
   const effectiveMode = processing ? "processing" : mode;
   const activeSources = sources.filter(s => s.checked);
@@ -531,7 +552,15 @@ function App() {
                 />
           )}
           {effectiveMode === "processing" && (
-            <Processing fileName={processing.file} activeStep={processing.step} />
+            <Processing
+              fileName={processing.file}
+              activeStep={processing.step}
+              stages={processing.stages}
+              errorStage={processing.errorStage}
+              errorMsg={processing.errorMsg}
+              done={processing.done}
+              onRetry={() => setProcessing(null)}
+            />
           )}
           {effectiveMode === "skills" && (
             <SkillsDashboard

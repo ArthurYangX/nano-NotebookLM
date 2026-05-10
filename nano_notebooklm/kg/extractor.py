@@ -304,6 +304,7 @@ async def extract_from_chunks(
     course_name: str,
     router: ModelRouter,
     max_chunks: int = 50,
+    progress_callback=None,
 ) -> tuple[list[Concept], list[Relation]]:
     """Two-stage extraction.
 
@@ -315,6 +316,12 @@ async def extract_from_chunks(
     If Stage A fails or yields no topics, falls back to legacy single-stage
     extraction (no root, no topics, just per-chunk concepts) so we don't
     regress Round 1 behavior on this code path.
+
+    R4-2: ``progress_callback`` (optional) is called as
+    ``progress_callback(stage, percent)`` where ``stage`` is one of
+    ``"kg_stage_a"``/``"kg_stage_b"`` and ``percent`` is 0–100. Server-side
+    upload streaming uses this to drive a live progress bar; existing
+    callers that omit it are unaffected.
     """
     if not chunks:
         return [], []
@@ -323,6 +330,8 @@ async def extract_from_chunks(
     source_files = sorted({c.source_file for c in chunks if c.source_file})
 
     # Stage A
+    if progress_callback is not None:
+        progress_callback("kg_stage_a", 0)
     overview, topics, prereq_edges = await extract_course_overview_and_topics(
         course_id=course_name,
         course_name=course_name,
@@ -330,6 +339,8 @@ async def extract_from_chunks(
         sample_chunks=sampled,
         router=router,
     )
+    if progress_callback is not None:
+        progress_callback("kg_stage_a", 100)
 
     # R3-3: assign topological learning_order to topics. Empty prereq_edges
     # → leave learning_order=None on every topic so the frontend doesn't
@@ -346,6 +357,8 @@ async def extract_from_chunks(
             t.learning_order = position.get(t.concept_id)
 
     # Stage B in batches of 5 — same concurrency profile as before.
+    if progress_callback is not None:
+        progress_callback("kg_stage_b", 0)
     batch_size = 5
     all_concepts: list[Concept] = []
     all_relations: list[Relation] = []
@@ -364,6 +377,12 @@ async def extract_from_chunks(
             concepts, relations = result
             all_concepts.extend(concepts)
             all_relations.extend(relations)
+        if progress_callback is not None:
+            done = min(i + batch_size, len(sampled))
+            pct = max(1, min(99, int(100 * done / max(1, len(sampled)))))
+            progress_callback("kg_stage_b", pct)
+    if progress_callback is not None:
+        progress_callback("kg_stage_b", 100)
 
     if not topics:
         # Fallback path — Stage A produced nothing. Return per-chunk

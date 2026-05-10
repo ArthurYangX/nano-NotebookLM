@@ -1362,8 +1362,86 @@ async def ingest_course(req: IngestRequest):
     }
 
 
-@app.post("/api/upload/{course_id}", tags=["ingest"], summary="Upload files to a course and index")
+# R4-2: per-course upload-pipeline lock — two concurrent uploads to the
+# same course id race on `chunks.json` / `course_meta.json` / FAISS index
+# rebuild. Serialise them so the second waits behind the first instead of
+# corrupting state. Keys are course_id strings; entries are reused across
+# requests so concurrent same-course requests synchronise on the same lock.
+_UPLOAD_LOCKS: dict[str, "_asyncio.Lock"] = {}
+
+
+def _upload_lock_for(course_id: str) -> "_asyncio.Lock":
+    import asyncio as _asyncio
+    lock = _UPLOAD_LOCKS.get(course_id)
+    if lock is None:
+        lock = _asyncio.Lock()
+        _UPLOAD_LOCKS[course_id] = lock
+    return lock
+
+
+def _ndjson(event: dict) -> str:
+    return json.dumps(event, ensure_ascii=False) + "\n"
+
+
+async def _save_uploaded_file(f: UploadFile, dest: Path, suffix: str) -> int:
+    """Stream one upload body into ``dest`` with the 50MB cap enforced
+    in 64KB chunks (fix-all v3 #H2). Returns bytes written. Caller is
+    responsible for the .pptx / .docx zip-bomb check."""
+    import asyncio as _asyncio
+    chunk_size = 64 * 1024
+    written = 0
+    try:
+        out = open(dest, "wb")
+        try:
+            while True:
+                chunk = await f.read(chunk_size)
+                if not chunk:
+                    break
+                written += len(chunk)
+                if written > MAX_UPLOAD_SIZE_BYTES:
+                    out.close()
+                    try:
+                        dest.unlink()
+                    except OSError:
+                        pass
+                    raise HTTPException(
+                        413,
+                        f"File '{dest.name}' exceeds limit of {MAX_UPLOAD_SIZE_MB}MB",
+                    )
+                await _asyncio.to_thread(out.write, chunk)
+        finally:
+            if not out.closed:
+                out.close()
+    except HTTPException:
+        raise
+    except Exception:
+        try:
+            dest.unlink()
+        except OSError:
+            pass
+        raise
+    return written
+
+
+@app.post("/api/upload/{course_id}", tags=["ingest"], summary="Upload files to a course (NDJSON-streamed pipeline)")
 async def upload_files(course_id: str, files: Annotated[list[UploadFile], File(...)]):
+    """R4-2: NDJSON-streamed upload pipeline.
+
+    Saves files synchronously (size + suffix + zip-bomb checks raise
+    HTTPException straight to the caller — no half-streamed errors), then
+    returns ``application/x-ndjson`` with one event per stage:
+
+    - ``{type:"stage", stage, progress, detail?}`` — one or more per stage,
+      stages are ``chunking | embedding | kg_stage_a | kg_stage_b``
+    - ``{type:"done", course_id, files, chunks, documents}`` — terminal success
+    - ``{type:"error", error, stage?, partial?}`` — terminal failure
+
+    Existing v3/v4 hardening (file-cap, zip-bomb, ``asyncio.to_thread``
+    off-load) preserved verbatim; the streaming wrapper sits *outside*
+    those guards.
+    """
+    import asyncio as _asyncio
+
     course_id = _validate_course_id_path(course_id)
     if not files:
         raise HTTPException(400, "No files provided")
@@ -1371,6 +1449,7 @@ async def upload_files(course_id: str, files: Annotated[list[UploadFile], File(.
     upload_dir = config.ARTIFACTS_DIR / "uploads" / course_id
     upload_dir.mkdir(parents=True, exist_ok=True)
 
+    # ── Pre-stream: save files (errors short-circuit with HTTP 4xx) ──
     saved = 0
     for f in files:
         if not f.filename:
@@ -1383,46 +1462,7 @@ async def upload_files(course_id: str, files: Annotated[list[UploadFile], File(.
             )
         safe_name = Path(f.filename).name
         dest = upload_dir / safe_name
-        # review-swarm fix-all v3 #H2: stream the upload body in 64KB chunks
-        # and abort as soon as we exceed the cap. Previously
-        # `content = await f.read()` loaded the entire body into memory
-        # before the size check — a single multi-GB body could OOM the
-        # worker before the 50MB limit ever ran.
-        chunk_size = 64 * 1024
-        written = 0
-        # fix-all v4 #A7: keep `await f.read(chunk_size)` (already async,
-        # off-loop) but push the synchronous file write to a worker
-        # thread so 800 sync writes for a 50MB upload don't block the
-        # asyncio loop and starve concurrent endpoints.
-        import asyncio as _asyncio
-        try:
-            out = open(dest, "wb")
-            try:
-                while True:
-                    chunk = await f.read(chunk_size)
-                    if not chunk:
-                        break
-                    written += len(chunk)
-                    if written > MAX_UPLOAD_SIZE_BYTES:
-                        out.close()
-                        try: dest.unlink()
-                        except OSError: pass
-                        raise HTTPException(
-                            413,
-                            f"File '{safe_name}' exceeds limit of {MAX_UPLOAD_SIZE_MB}MB",
-                        )
-                    await _asyncio.to_thread(out.write, chunk)
-            finally:
-                if not out.closed:
-                    out.close()
-        except HTTPException:
-            raise
-        except Exception:
-            try: dest.unlink()
-            except OSError: pass
-            raise
-        # fix-all v3 #H3: ZIP-based formats (.pptx/.docx) get a decompression
-        # bomb sanity check before extractors run.
+        written = await _save_uploaded_file(f, dest, suffix)
         if suffix in (".pptx", ".docx"):
             _check_zip_safety(dest, written)
         saved += 1
@@ -1430,22 +1470,105 @@ async def upload_files(course_id: str, files: Annotated[list[UploadFile], File(.
     if saved == 0:
         raise HTTPException(400, "No valid files saved")
 
-    router_intent.clear_lang_cache(course_id)
-    # fix-all v4 #A6 + #A7: ingest + build_index can take minutes for the
-    # full corpus (PDF parse loop + sentence-transformers embedding +
-    # FAISS/BM25 build). Run on a worker thread so the asyncio loop
-    # doesn't stall and other requests stay responsive.
-    import asyncio as _asyncio
-    course = await _asyncio.to_thread(kb.ingest_course, str(upload_dir), course_id)
-    await _asyncio.to_thread(kb.build_index, course_id)
-    router_intent.clear_lang_cache(course_id)
-    chunks = kb.get_chunks(course_id)
-    return {
-        "course_id": course_id,
-        "files": saved,
-        "chunks": len(chunks),
-        "documents": len(course.documents),
-    }
+    # ── Stream: 4 ingest stages, NDJSON one event per line ──
+    async def _events():
+        loop = _asyncio.get_running_loop()
+        # Per-course pipeline lock prevents two concurrent uploads from
+        # racing on chunks.json / FAISS index. Acquire inside the
+        # generator so the wait time itself is observable as a delay
+        # before any stage event fires (the client just sees a slow
+        # connection — fine).
+        async with _upload_lock_for(course_id):
+            try:
+                # Stage 1: chunking (synchronous; off-loaded to worker).
+                yield _ndjson({"type": "stage", "stage": "chunking", "progress": 0})
+                course_obj = await _asyncio.to_thread(
+                    kb.ingest_course, str(upload_dir), course_id
+                )
+                yield _ndjson({
+                    "type": "stage", "stage": "chunking", "progress": 100,
+                    "detail": {"documents": len(course_obj.documents)},
+                })
+
+                # Stage 2: embedding (FAISS + BM25 rebuild for the course).
+                yield _ndjson({"type": "stage", "stage": "embedding", "progress": 0})
+                await _asyncio.to_thread(kb.build_index, course_id)
+                router_intent.clear_lang_cache(course_id)
+                chunks = kb.get_chunks(course_id)
+                yield _ndjson({
+                    "type": "stage", "stage": "embedding", "progress": 100,
+                    "detail": {"chunks": len(chunks)},
+                })
+
+                # Stages 3 + 4: KG extraction. The extractor's
+                # progress_callback is invoked from the same loop, so a
+                # plain queue + drain is enough to interleave with our
+                # async generator.
+                kg_queue: _asyncio.Queue = _asyncio.Queue(maxsize=64)
+
+                def _progress(stage: str, pct: int):
+                    try:
+                        kg_queue.put_nowait({"type": "stage", "stage": stage, "progress": pct})
+                    except _asyncio.QueueFull:
+                        pass  # backpressure: drop intermediate frames
+
+                from nano_notebooklm.kg.extractor import extract_from_chunks
+                from nano_notebooklm.kg.graph import KnowledgeGraph
+                from nano_notebooklm.kg.merger import merge_concepts, merge_relations
+
+                async def _extract_task():
+                    if not chunks:
+                        # Empty corpus — emit zero-length stage events so
+                        # the client sees the 4-stage contract regardless.
+                        _progress("kg_stage_a", 100)
+                        _progress("kg_stage_b", 100)
+                        return [], []
+                    return await extract_from_chunks(
+                        chunks, course_id, router, max_chunks=30,
+                        progress_callback=_progress,
+                    )
+
+                extract_task = _asyncio.create_task(_extract_task())
+                # Drain the queue until extraction completes. Use wait()
+                # so we can flush any final events after the task ends.
+                while not extract_task.done():
+                    try:
+                        ev = await _asyncio.wait_for(kg_queue.get(), timeout=0.5)
+                        yield _ndjson(ev)
+                    except _asyncio.TimeoutError:
+                        continue
+                # Drain remaining events.
+                while not kg_queue.empty():
+                    yield _ndjson(kg_queue.get_nowait())
+
+                concepts, relations = await extract_task
+                concepts = merge_concepts(concepts)
+                relations = merge_relations(relations)
+                kg = KnowledgeGraph()
+                kg.add_concepts(concepts)
+                kg.add_relations(relations)
+                kg_path = config.ARTIFACTS_DIR / "courses" / course_id / "knowledge_graph.json"
+                await _asyncio.to_thread(kg.save, kg_path)
+
+                # Done.
+                yield _ndjson({
+                    "type": "done",
+                    "course_id": course_id,
+                    "files": saved,
+                    "chunks": len(chunks),
+                    "documents": len(course_obj.documents),
+                    "kg_nodes": len(concepts),
+                })
+            except Exception as e:
+                # fix-all v4 #A3: stable error code, no vendor leakage.
+                logger.exception("upload pipeline failed for %s", course_id)
+                yield _ndjson({
+                    "type": "error",
+                    "error": "upload_pipeline_failed",
+                    "stage": getattr(e, "stage", None),
+                })
+
+    return StreamingResponse(_events(), media_type="application/x-ndjson")
 
 
 # ── Chunks (Reader content) ──────────────────────────────────────────

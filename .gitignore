@@ -24,3 +24,9 @@ artifacts/
 # Unrelated sibling projects (kept here only locally)
 previous-agent/
 
+# Local Claude Code project config (per-machine)
+.claude/
+
+# Local-only PDF fixtures for browser smoke tests
+test-pdf/
+
