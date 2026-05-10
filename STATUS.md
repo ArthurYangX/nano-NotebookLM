@@ -244,12 +244,12 @@
 - **corner-test**: `test_upload_stream_pdf_corrupt_emits_error_no_partial` / `test_upload_stream_kg_stage_a_timeout_preserves_chunks` / `test_upload_stream_concurrent_same_course_serializes`
 - **conflict notes**: 端点签名变更（从 form-data POST 返 JSON 改成 NDJSON stream），需在 `frontend/api.js` 旧 `uploadFile` 入口 deprecate 并在 `library.jsx` 调用面切换。R4-1 的 `/api/courses` 改动与本项不冲突（不同端点）。
 
-### #R4-3 思维导图换成知识图谱视图（force-directed + relation labels）— [claude]
+### #R4-3 思维导图换成知识图谱视图（force-directed + relation labels）— [ ]
 
 - **goal ref**: GOAL.md Round 4 #R4-3
-- **status**: [claude]
-- **owner**: claude
-- **claimed_at**: 2026-05-10 23:00
+- **status**: [ ]  ← 2026-05-10 23:30 释放给 codex（纯前端、零 server.py 冲突，最适合并行）
+- **owner**:
+- **claimed_at**:
 - **files (planned)**:
   - `frontend/index.html`：CDN script 加 d3-force（`<script src="https://cdn.jsdelivr.net/npm/d3-force@3"></script>`）
   - `frontend/study-state.js`：保留 `prepareMindmap` 重命名为 `prepareMindmapTree`（向后兼容 + R3-3 测试）；新增 `prepareMindmapForce(graph)` 返回 `{nodes, links}` 喂 d3
@@ -258,7 +258,9 @@
   - **新增** `tests/test_mindmap_force_layout.py`
 - **mini-test**: `test_mindmap_jsx_uses_force_layout_grep` / `test_prepare_mindmap_force_returns_node_link_shape` / `test_relation_filter_chip_grep`
 - **corner-test**: `test_prepare_mindmap_force_handles_100_nodes` / `test_relation_filter_zero_edges_renders_isolated_nodes` / `test_r3_3_edit_affordances_still_grepable`（dblclick / N / Del / shift+drag 在新 layout 下仍能触发 commitOps）
-- **conflict notes**: 与 R4-1（app.jsx）共享 `study-state.js`，但 R4-1 只动 courses dropdown 段，R4-3 只动 prepareMindmap 段（文件中段），无重叠。
+- **conflict notes**: 纯前端任务，与 R4-2/R4-4/R4-5 都不冲突。**R4-3 owner（codex）只许动**：(a) `frontend/index.html`（追加 d3-force CDN script 标签）；(b) `frontend/study-state.js` 的 **`prepareMindmap` 函数及其测试**（rename 为 `prepareMindmapTree` + 新增 `prepareMindmapForce`），**不许动**文件末尾的 user-lang helpers / saveUserLang / loadUserLang；(c) `frontend/mindmap.jsx` **整个**文件（layout 重写自由，但必须保留 R3-3 的 NodeDeepDivePanel + commitOps + KGEdit popup 等编辑接口）；(d) `frontend/styles.css` **新增**末尾 `.kg-edge-*` 段（不动任何已有 selector）；(e) **新建** `tests/test_mindmap_force_layout.py`。
+  - **不许动**：app.jsx / api.js / api/server.py / 任何后端 / processing.jsx / upload 链路 / qa_skill / router_intent。
+  - **特别注意**：R3-3 的 explain-node 端点 + alt+click → NodeDeepDivePanel 链路必须保留，新 layout 下点击事件重接到 d3 selection.on("click")。dblclick 编辑 / N 加子 / Del 删 / shift+drag 连边的 commitOps 路径**完整保留**。
 
 ### #R4-4 GraphRAG retriever 接进 /api/chat（path="graphrag"）— **本轮最重要** — [claude]
 
@@ -279,12 +281,12 @@
 - **corner-test**: `test_graph_search_falls_back_to_rag_when_kg_missing` / `test_graph_search_zero_hits_falls_back_to_rag` / `test_graph_search_hop_limit_2_caps_chunks_at_30` / `test_concept_embedding_lazy_when_missing` / `test_chat_response_path_literal_includes_graphrag`
 - **conflict notes**: graph_search 是新文件不冲突；qa_skill.py / router_intent.py / api/server.py 改动需在 R4-1（server.py courses 改动）合入后再 rebase 一次。
 
-### #R4-5 Backend backend 切换 chip：codex GPT-5.4 / Qwen2.5-7B-RAFT — [claude]
+### #R4-5 Backend backend 切换 chip：codex GPT-5.4 / Qwen2.5-7B-RAFT — [ ]
 
 - **goal ref**: GOAL.md Round 4 #R4-5
-- **status**: [claude]
-- **owner**: claude
-- **claimed_at**: 2026-05-10 23:00
+- **status**: [ ]  ← 2026-05-10 23:30 释放给 codex（与 R4-2/R4-4 共享 server.py，但 section 物理隔离见 conflict notes）
+- **owner**:
+- **claimed_at**:
 - **files (planned)**:
   - **新增** `nano_notebooklm/ai/qwen_raft_backend.py`：HTTP client 到 AutoDL Gradio `:6006/api/predict`；env `QWEN_RAFT_URL` + 可选 `QWEN_RAFT_TOKEN`
   - `nano_notebooklm/ai/router.py`（或 `openai_backend.py`）：抽象 `complete()`/`complete_stream()` 接口，按 `backend` 参数 dispatch
@@ -293,7 +295,10 @@
   - **新增** `tests/test_qwen_backend.py`
 - **mini-test**: `test_chat_routes_to_qwen_when_backend_qwen_raft` / `test_status_endpoint_lists_qwen_when_url_configured`
 - **corner-test**: `test_chat_qwen_url_unconfigured_returns_422` / `test_chat_qwen_timeout_falls_back_to_codex_with_flag` / `test_status_endpoint_returns_200_when_qwen_unavailable`
-- **conflict notes**: 跟 R4-1/R4-4 都改 `api/server.py`，需要在前置 land 后接 rebase；新建 backend 文件本身无冲突。
+- **conflict notes**: 跟 R4-2/R4-4 共享 `api/server.py` 和 `frontend/app.jsx`，但 section 物理隔离规则**强制**：
+  - **R4-5 owner 只许动**：(a) `nano_notebooklm/ai/qwen_raft_backend.py`（**新文件**）；(b) `nano_notebooklm/ai/router.py` 的 backend dispatch 接口（如果文件不存在就新建，否则在文件**末尾追加** dispatch helper）；(c) `api/server.py` 的 **`ChatRequest` 模型定义段** + **`/api/status` 端点函数**（**仅这两处**），不许动 `/api/upload/{cid}` / `/api/chat` 主体 / `/api/courses` / `/api/mindmap/*` / 任何 Pydantic 模型以外的 endpoint；(d) `frontend/app.jsx` 的 **`<div className="topbar-actions">` 块内**（紧挨 lang-chip 之后追加 backend chip），不许动 courseModeRef / 课程下拉 / 空态 CTA / Library / workspace / Assistant 调用面；(e) **新建** `frontend/styles.css` **末尾追加**`.backend-chip` 样式段；(f) **新建** `tests/test_qwen_backend.py`。
+  - **不许动**（lock 期间触碰即视为越权）：upload endpoint / ingest 链路 / kg/extractor.py / qa_skill / router_intent / kb/graph_search.py / mindmap.jsx / processing.jsx / api.js streamUpload / study-state.js。
+  - 与 R4-2/R4-4 在 server.py 上的 merge 顺序：R4-2 先 land → R4-5 rebase 一次（仅 ChatRequest model 段附近可能 conflict，机械 resolve）→ R4-4 land 时再吃一次 ChatResponse.path Literal 的小改动。
 
 ## Round 2 P0
 
