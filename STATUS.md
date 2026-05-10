@@ -207,12 +207,12 @@
 >
 > **预置课暂保留物理文件**（不删 `artifacts/courses/{15-213,CS182,...}`），UI 默认隐藏，等 R4-4 验收过了再决定清理。回滚点：URL `?show_preset=1` 切回 mode=all 看到全部。
 
-### #R4-1 数据切换：隐藏预置课 + UI 改"我的上传"空态 — [ ]
+### #R4-1 数据切换：隐藏预置课 + UI 改"我的上传"空态 — [claude]
 
 - **goal ref**: GOAL.md Round 4 #R4-1
-- **status**: [ ]
-- **owner**:
-- **claimed_at**:
+- **status**: [claude]
+- **owner**: claude
+- **claimed_at**: 2026-05-10 23:00
 - **files (planned)**:
   - `nano_notebooklm/config.py`：新增常量 `PRESET_COURSE_IDS = frozenset({"15-213","CS182","CS231N","CS285","CSE 234","机器人导论","计算机组成原理","模式识别"})`
   - `api/server.py`：`/api/courses` 加 `mode: Literal["all","user"] | None = None`（默认 user）；`mode=user` 时过滤 PRESET_COURSE_IDS
@@ -222,12 +222,12 @@
 - **corner-test**: `test_courses_endpoint_mode_all_includes_presets` / `test_courses_endpoint_invalid_mode_returns_422` / `test_courses_user_mode_with_real_uploads_keeps_them`
 - **conflict notes**: 单文件后端改动 + 单文件前端改动，无并发 lock 风险。
 
-### #R4-2 upload-only 全链路 + Processing 实进度（NDJSON streaming）— [ ]
+### #R4-2 upload-only 全链路 + Processing 实进度（NDJSON streaming）— [claude]
 
 - **goal ref**: GOAL.md Round 4 #R4-2
-- **status**: [ ]
-- **owner**:
-- **claimed_at**:
+- **status**: [claude]
+- **owner**: claude
+- **claimed_at**: 2026-05-10 23:00
 - **files (planned)**:
   - `api/server.py`：`/api/upload/{cid}` 改成 NDJSON streaming（沿用 v4 #A6/A7 的 `asyncio.to_thread` off-load）；事件 schema `{type:"stage", stage:"chunking|embedding|kg_stage_a|kg_stage_b", progress:0-100, detail?}` + `done` / `error`
   - `nano_notebooklm/ingest/`：现有 chunker / embedder 加 progress callback；`nano_notebooklm/kg/extractor.py` 在 Stage A / Stage B 之间发 callback
@@ -238,12 +238,12 @@
 - **corner-test**: `test_upload_stream_pdf_corrupt_emits_error_no_partial` / `test_upload_stream_kg_stage_a_timeout_preserves_chunks` / `test_upload_stream_concurrent_same_course_serializes`
 - **conflict notes**: 端点签名变更（从 form-data POST 返 JSON 改成 NDJSON stream），需在 `frontend/api.js` 旧 `uploadFile` 入口 deprecate 并在 `library.jsx` 调用面切换。R4-1 的 `/api/courses` 改动与本项不冲突（不同端点）。
 
-### #R4-3 思维导图换成知识图谱视图（force-directed + relation labels）— [ ]
+### #R4-3 思维导图换成知识图谱视图（force-directed + relation labels）— [claude]
 
 - **goal ref**: GOAL.md Round 4 #R4-3
-- **status**: [ ]
-- **owner**:
-- **claimed_at**:
+- **status**: [claude]
+- **owner**: claude
+- **claimed_at**: 2026-05-10 23:00
 - **files (planned)**:
   - `frontend/index.html`：CDN script 加 d3-force（`<script src="https://cdn.jsdelivr.net/npm/d3-force@3"></script>`）
   - `frontend/study-state.js`：保留 `prepareMindmap` 重命名为 `prepareMindmapTree`（向后兼容 + R3-3 测试）；新增 `prepareMindmapForce(graph)` 返回 `{nodes, links}` 喂 d3
@@ -254,12 +254,12 @@
 - **corner-test**: `test_prepare_mindmap_force_handles_100_nodes` / `test_relation_filter_zero_edges_renders_isolated_nodes` / `test_r3_3_edit_affordances_still_grepable`（dblclick / N / Del / shift+drag 在新 layout 下仍能触发 commitOps）
 - **conflict notes**: 与 R4-1（app.jsx）共享 `study-state.js`，但 R4-1 只动 courses dropdown 段，R4-3 只动 prepareMindmap 段（文件中段），无重叠。
 
-### #R4-4 GraphRAG retriever 接进 /api/chat（path="graphrag"）— **本轮最重要** — [ ]
+### #R4-4 GraphRAG retriever 接进 /api/chat（path="graphrag"）— **本轮最重要** — [claude]
 
 - **goal ref**: GOAL.md Round 4 #R4-4
-- **status**: [ ]
-- **owner**:
-- **claimed_at**:
+- **status**: [claude]
+- **owner**: claude
+- **claimed_at**: 2026-05-10 23:00
 - **blocked_by**: R4-1 + R4-2（需要 KG + chunks 都 upload-only 跑通才能端到端测）。可以与 R4-1/R4-2 并行写后端代码 + 单元测（用 fixture KG），只在 PR 之前等前置 land。
 - **files (planned)**:
   - **新增** `nano_notebooklm/kb/graph_search.py`：`graph_search(query, course_id, top_k_concepts=5, hop_limit=2) -> List[Chunk]`；BFS 沿边扩展 + dedup + weight sort + chunks 上限 30
@@ -273,12 +273,12 @@
 - **corner-test**: `test_graph_search_falls_back_to_rag_when_kg_missing` / `test_graph_search_zero_hits_falls_back_to_rag` / `test_graph_search_hop_limit_2_caps_chunks_at_30` / `test_concept_embedding_lazy_when_missing` / `test_chat_response_path_literal_includes_graphrag`
 - **conflict notes**: graph_search 是新文件不冲突；qa_skill.py / router_intent.py / api/server.py 改动需在 R4-1（server.py courses 改动）合入后再 rebase 一次。
 
-### #R4-5 Backend backend 切换 chip：codex GPT-5.4 / Qwen2.5-7B-RAFT — [ ]
+### #R4-5 Backend backend 切换 chip：codex GPT-5.4 / Qwen2.5-7B-RAFT — [claude]
 
 - **goal ref**: GOAL.md Round 4 #R4-5
-- **status**: [ ]
-- **owner**:
-- **claimed_at**:
+- **status**: [claude]
+- **owner**: claude
+- **claimed_at**: 2026-05-10 23:00
 - **files (planned)**:
   - **新增** `nano_notebooklm/ai/qwen_raft_backend.py`：HTTP client 到 AutoDL Gradio `:6006/api/predict`；env `QWEN_RAFT_URL` + 可选 `QWEN_RAFT_TOKEN`
   - `nano_notebooklm/ai/router.py`（或 `openai_backend.py`）：抽象 `complete()`/`complete_stream()` 接口，按 `backend` 参数 dispatch
