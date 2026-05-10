@@ -1,7 +1,7 @@
 # GOAL: 把 nano-NOTEBOOKLM 变成"我每天会真的打开来学习"的工具
 
 > 这是一份 self-contained 的 goal prompt。任何一个新 Claude 会话拿到它都能直接接着往下干。
-> 最后更新：2026-05-07（Round 3 起步）。
+> 最后更新：2026-05-10（Round 4 起步：KG 驱动的 upload-only 重构）。
 
 ## Definition of done（什么叫"可用"）
 
@@ -138,6 +138,54 @@ R3-3. ☐ **思维导图：学习顺序角标 + 节点深探（agent stream）**
    - mini：(a) Stage A LLM stub 给 prerequisite_of → extractor 落成 depends-on edges + 拓扑序；(b) /api/mindmap payload 含 learning_order；(c) /api/mindmap/{cid}/explain-node 端点 NDJSON 输出 tool_call/tool_result/done
    - corner：(a) topics 成环 → 退化按 weight 降序（边界）；(b) LLM 无 prerequisite_of 字段 → learning_order=None，老 mindmap 仍渲（兼容）；(c) explain-node node_id 不存在 → 404（数据缺失）；(d) explain-node 路径穿越 course_id → 400（非法格式）；(e) 前端契约 grep：mindmap.jsx 含 `e.altKey` + `requestNodeDeepDive` + `<NodeDeepDivePanel>`
 
+## Round 4 Success criteria（用户 2026-05-10 方向调整 — 5 条 checklist）
+
+> **方向调整背景**：用户实测 Round 1-3 后发现两件事：(a) 现有 8 门预置课的 BM25/向量 retrieve 效果不稳，质量门槛 + 翻译重试虽然兜住了 UX 但根因是 retrieve 不准；(b) "思维导图"在底层数据上已经是知识图谱（`nano_notebooklm/kg/` 是 networkx 图 + part-of/prerequisite_of 类型化关系），只是前端渲染成径向树。本轮把方向定为：抛弃预置 chunks，换成 **upload-only 冷启动 + KG 视图 + GraphRAG retriever**，让 retrieve 走"概念节点匹配 → 邻居扩展 → 拉 source_chunks"路径，而不是直接 BM25 + 向量。
+>
+> 主力 backend 仍是 codex GPT-5.4；远端 AutoDL Qwen2.5-7B-RAFT 升级为可选 backend（topbar chip 切换）。
+
+R4-1. ☐ **数据切换：隐藏预置课 + UI 改"我的上传"空态**
+   - **背景**：当前 `artifacts/courses/` 有 8 门预置课（15-213, CS182, CS231N, CS285, CSE 234, 机器人导论, 计算机组成原理, 模式识别），是 Round 1 ingest 的产物。Round 4 想让用户**只看自己上传的文档**，避免新流程被旧 chunks 污染。**先保留物理文件**（不删，留作回滚点），UI 默认隐藏，等 R4-4 GraphRAG 验收过了再决定是否清理。
+   - **修法**：
+     - 后端：`/api/courses` 增加 `mode` query param（`"all" | "user"`，默认 `"user"`）；`"user"` 模式下过滤掉 8 个 hardcoded 预置课名（list 写在 `nano_notebooklm/config.py` 常量 `PRESET_COURSE_IDS`）。
+     - 前端：app.jsx 课程下拉默认调 `mode=user`；空列表时渲染"上传文档开始"空态卡片（带"上传第一个文档"按钮直接跳到 Library/Upload）；调试模式（URL `?show_preset=1`）下传 `mode=all` 看到全部。
+   - mini：`test_courses_endpoint_user_mode_excludes_presets`（GET `/api/courses?mode=user` 不含预置课）；`test_app_jsx_empty_state_grep`（grep app.jsx 含"上传文档开始"或等价文案）。
+   - corner：(a) `mode=all` → 含预置课（兼容回滚）；(b) `mode=invalid` → 422；(c) 用户上传一门课后空态消失，下拉只有那一门。
+
+R4-2. ☐ **upload-only 全链路 + Processing 实进度**
+   - **背景**：`/api/upload/{cid}` 端点已有，但前端 Processing 页只显示静态文案；冷启动场景下用户上传一个 50 页 PDF，要等 chunk + embed + KG Stage A + Stage B 全跑完（可能 1-3 分钟）才看到结果，没有中间反馈是体验杀手。
+   - **修法**：
+     - 后端：`/api/upload/{cid}` 改成 **streaming NDJSON 端点**，事件类型 `{type: "stage", stage: "chunking|embedding|kg_stage_a|kg_stage_b", progress: 0-100, detail?}` + 终态 `{type: "done", course_id, doc_count, chunk_count, kg_node_count}` / `{type: "error", error, partial}`。stage 之间走 `asyncio.to_thread` off-load（v4 已经做了 a6/a7）。
+     - 前端：processing.jsx 接 NDJSON stream，渲染 4 段进度条 + 当前阶段文案；失败保留 partial info + retry 按钮。
+   - mini：`test_upload_stream_emits_four_stages`（发一个小 PDF → 收到 chunking/embedding/kg_stage_a/kg_stage_b 至少各 1 次 + 最终 done）；`test_processing_jsx_renders_progress_grep`（grep processing.jsx 含 stage 渲染）。
+   - corner：(a) PDF 解析失败（损坏文件）→ NDJSON `error` 事件 + done 不发 + 不写 partial chunks；(b) Stage A 超时（>15s）→ error 事件 detail 含 `stage_a_timeout`，但不影响已写好的 chunks；(c) 同时上传两个文档到同一 course → 串行处理，第二个等第一个 done 后开始（per-course lock）。
+
+R4-3. ☐ **思维导图换成知识图谱视图（force-directed + relation labels）**
+   - **背景**：当前 mindmap.jsx 是径向 tree layout（slice ∝ subtree leaf count），强调层级关系但弱化了 cross-topic 关系（part-of / prerequisite_of / depends-on）。换成 force-directed graph，显式渲染 relation 边标签 + 按 relation 类型过滤。**保留 R3-3 的所有编辑能力**（dblclick 编辑 / N 加子 / Del 删 / shift+drag 连边 / alt+click 节点深探）。
+   - **修法**：
+     - 前端：mindmap.jsx 重写 layout 部分（保留 KGEdit / commitOps / NodeDeepDivePanel 不变），引入 d3-force CDN（CDN React 模式下 `<script src="https://cdn.jsdelivr.net/npm/d3-force@3"></script>`）。节点用现有 type/depth 配色；边按 relation 着色（part-of=灰、prerequisite_of=橙箭头、depends-on=蓝虚线、其他=细灰）。toolbar 加 relation filter checkbox（默认全显）。
+     - 数据契约不变：`/api/mindmap/{cid}` 仍返 `{nodes, edges, course_overview}`；只在前端把它喂给 d3-force 而非 prepareMindmap。`prepareMindmap` 老函数保留为 `prepareMindmapTree`（向后兼容 + 测试），新 layout 入口是 `prepareMindmapForce`。
+   - mini：`test_mindmap_jsx_uses_force_layout_grep`（grep mindmap.jsx 含 `d3.forceSimulation` 或等价 import）；`test_prepare_mindmap_force_returns_node_link_shape`（study-state.js 的 prepareMindmapForce 返回 `{nodes: [{id,x,y,...}], links: [{source,target,relation}]}`）。
+   - corner：(a) 100+ 节点 layout 不阻塞（异步 simulation tick；初始位置用现有 prepareMindmapTree 给的极坐标 jitter）；(b) relation 过滤后剩 0 条边 → 仍渲染孤立节点 + chip "已过滤所有关系"；(c) shift+drag 连边的 popup / dblclick 编辑 / Del 删 这些 R3-3 编辑 affordance 在新 layout 下仍能用（pixel 命中测试用 d3 现有 `selection.on("click")` 重接）。
+
+R4-4. ☐ **GraphRAG retriever 接进 /api/chat（path="graphrag"）**
+   - **背景**：现在 RAG 是 `kb.search(query)` → BM25 + 向量 RRF。GraphRAG 的核心区别：query 先 → 找最相关的 KG 概念节点 → 沿 part-of / prerequisite_of / depends-on 边扩展 1-2 跳 → 收集这些节点的 `source_chunks` → 喂 LLM。优势是当 query 是"卷积层和池化层有什么关系"这类 cross-concept 问题时，纯向量会拉两个独立 chunk，GraphRAG 能直接定位 prerequisite_of 边连接的节点对。
+   - **修法**：
+     - 新文件 `nano_notebooklm/kb/graph_search.py`：`graph_search(query, course_id, top_k_concepts=5, hop_limit=2) -> List[Chunk]`。流程：(a) embed query → cosine 算和每个 concept node 的相似度（concept node embedding 缓存在 `knowledge_graph.json` 里，新增 `concept_embedding: List[float]` 字段，extract 时一次性算）；(b) 取 top_k_concepts 个；(c) BFS 沿边扩展到 hop_limit；(d) 收集所有触达节点的 `source_chunks`，去重 + 按 weight 排序；(e) 截断到 top_k chunks。
+     - `qa_skill.py` 入口加分支：当 course_id 有 `knowledge_graph.json` 时，先跑 graph_search，结果非空（≥2 hits）走 `path="graphrag"`；否则降级到现有 BM25/向量 RRF（path="rag"）。`router_intent` 增加 `graphrag` 分支（在 rag 之前判）。
+     - `/api/chat` 的 `ChatResponse.path` Literal 增加 `"graphrag"`；前端 chip 加新样式（绿色"图检索"）。
+   - mini：`test_graph_search_returns_chunks_from_neighbor_nodes`（造 4 节点 KG：A-part_of-B, B-prereq_of-C, D 独立；query 命中 A → 应取回 A/B/C 的 source_chunks，不取 D）；`test_chat_uses_graphrag_path_when_kg_present`（POST /api/chat → response.path == "graphrag"）。
+   - corner：(a) `knowledge_graph.json` 不存在 → 自动降级到 RAG path（兼容旧课）；(b) graph_search 0 hits → 降级到 RAG（与 #1 智能路由衔接）；(c) hop_limit=2 实测不爆 chunks 数（≤ 30 chunks 上限）；(d) `concept_embedding` 缺失 → 走 fallback 用节点名 embed（lazy 计算）；(e) extra=forbid 验证 ChatResponse 不破契约。
+
+R4-5. ☐ **Backend backend 切换 chip：codex GPT-5.4 / Qwen2.5-7B-RAFT**
+   - **背景**：`reference_autodl_nlp_server.md` 里那台 AutoDL 服务器有自训 Qwen2.5-7B-RAFT（已 merge 全权重 + Gradio 监听 0.0.0.0:6006）。Round 4 加可选 backend chip，用户能切到自家微调模型作为"演示卖点"。
+   - **修法**：
+     - 后端：`nano_notebooklm/ai/router.py`（或 `openai_backend.py`）抽象 `complete()`/`complete_stream()` 接口；新增 `qwen_raft_backend.py` 实现，HTTP POST 到 `https://<autodl-host>:6006/api/predict`（Gradio /api/predict 标准接口）。环境变量 `QWEN_RAFT_URL` + `QWEN_RAFT_TOKEN`（可选 basic auth）。**不替换 codex 主路径**，作为可选项。
+     - `/api/chat` `ChatRequest` 增加 `backend: Literal["codex", "qwen_raft"] | None = None`，端点入口按 backend 路由 router 实例。`/api/status` 暴露当前可用 backends list。
+     - 前端：topbar 加 "🤖 GPT-5.4 / 🎓 Qwen-RAFT" 切换 chip；选 Qwen 时如果 `/api/status` 显示 backend unavailable（Qwen URL 未配置或健康检查失败）则灰掉 chip + tooltip。
+   - mini：`test_chat_routes_to_qwen_when_backend_qwen_raft`（monkeypatch qwen backend → 收到 ChatRequest backend="qwen_raft" → qwen.complete 被调用，codex.complete 不被调用）；`test_status_endpoint_lists_qwen_when_url_configured`（设 QWEN_RAFT_URL → /api/status backends 含 qwen_raft）。
+   - corner：(a) backend="qwen_raft" 但 URL 未配置 → 422 + "qwen_raft backend not configured"；(b) Qwen 后端超时（>30s）→ graceful 降级到 codex + 响应注明 "qwen 不可用，已用 GPT-5.4 兜底"（path 增加 `backend_fallback` flag 或在响应里 surface）；(c) 健康检查 endpoint `/api/status` 不会因为 Qwen 不可用就返 5xx，正常 200 + degraded flag。
+
 ## Priority
 
 **P0 — 没这些 Round 2 就不算完成**
@@ -159,6 +207,14 @@ R3-3. ☐ **思维导图：学习顺序角标 + 节点深探（agent stream）**
 - R3-1 Quiz/Skills/History 滚动修复（5 分钟 quick win，单文件单测试）
 - R3-2 用户语言偏好（中/英）首次选择 + 全链路注入
 - R3-3 思维导图：学习顺序角标 + 节点深探（agent stream）
+
+**Round 4 P0 — 用户 2026-05-10 方向调整：KG 驱动的 upload-only 重构**
+
+- R4-1 数据切换：隐藏预置课 + UI 改"我的上传"空态（轻 UI/contract 改动）
+- R4-2 upload-only 全链路 + Processing 实进度（NDJSON streaming）
+- R4-3 思维导图换成知识图谱视图（force-directed + relation labels）
+- R4-4 GraphRAG retriever 接进 /api/chat（path="graphrag"）— **本轮最重要**
+- R4-5 Backend backend 切换 chip：codex GPT-5.4 / Qwen2.5-7B-RAFT
 
 **P2 — 锦上添花（先放着）**
 

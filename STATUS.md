@@ -199,6 +199,97 @@
 - **H1 `..` 全端点 422**：v3 #H1 给 chat/notes/quiz/report/agent 加了 dotdot 拒绝；v4 parametrize 测试覆盖 6 个 body 端点（`/api/notes` / `/api/quiz` / `/api/report` / `/api/agent/stream` / `/api/exam-analysis` / `/api/ingest`），全部 422。
 - **H3 `findTextRangeInRoot` phantom block separator**：R6 的 highlight reapply 路径在跨 heading + paragraph 时 `sel.toString()` 给的字符串含隐式 `\n\n` 但 walker 拼出的 combined 没有，导致 highlight 失败找不到。修：在 walker 经过 `h1,h2,h3,p,li,blockquote,pre` 等 block element 边界时主动 `combined += "\n\n"`，与 selection toString 一致。
 
+## Round 4 P0（用户 2026-05-10 方向调整 — KG 驱动的 upload-only 重构）
+
+> **方向调整背景**：用户实测后认定 (a) 现有 8 门预置课的 retrieve 效果不稳，根因是 BM25/向量本身的精度而非路由；(b) 思维导图底层数据已经是 KG（part-of/prerequisite_of 关系全在），换 force-directed 视图是数据零改动的渲染替换。本轮拆 5 个独立 P0：数据切换 → upload-only 跑通 → KG 视图 → GraphRAG 检索 → backend chip。
+>
+> **依赖**：R4-1 / R4-2 是 R4-4 GraphRAG 的前置（没数据没 KG 没法测 GraphRAG）。R4-3 视觉换装独立。R4-5 是收尾。
+>
+> **预置课暂保留物理文件**（不删 `artifacts/courses/{15-213,CS182,...}`），UI 默认隐藏，等 R4-4 验收过了再决定清理。回滚点：URL `?show_preset=1` 切回 mode=all 看到全部。
+
+### #R4-1 数据切换：隐藏预置课 + UI 改"我的上传"空态 — [ ]
+
+- **goal ref**: GOAL.md Round 4 #R4-1
+- **status**: [ ]
+- **owner**:
+- **claimed_at**:
+- **files (planned)**:
+  - `nano_notebooklm/config.py`：新增常量 `PRESET_COURSE_IDS = frozenset({"15-213","CS182","CS231N","CS285","CSE 234","机器人导论","计算机组成原理","模式识别"})`
+  - `api/server.py`：`/api/courses` 加 `mode: Literal["all","user"] | None = None`（默认 user）；`mode=user` 时过滤 PRESET_COURSE_IDS
+  - `frontend/app.jsx`：课程下拉默认调 mode=user；空列表渲染上传 CTA 空态卡；URL `?show_preset=1` → mode=all
+  - **新增** `tests/test_user_mode_courses.py`
+- **mini-test**: `test_courses_endpoint_user_mode_excludes_presets` / `test_app_jsx_empty_state_grep`
+- **corner-test**: `test_courses_endpoint_mode_all_includes_presets` / `test_courses_endpoint_invalid_mode_returns_422` / `test_courses_user_mode_with_real_uploads_keeps_them`
+- **conflict notes**: 单文件后端改动 + 单文件前端改动，无并发 lock 风险。
+
+### #R4-2 upload-only 全链路 + Processing 实进度（NDJSON streaming）— [ ]
+
+- **goal ref**: GOAL.md Round 4 #R4-2
+- **status**: [ ]
+- **owner**:
+- **claimed_at**:
+- **files (planned)**:
+  - `api/server.py`：`/api/upload/{cid}` 改成 NDJSON streaming（沿用 v4 #A6/A7 的 `asyncio.to_thread` off-load）；事件 schema `{type:"stage", stage:"chunking|embedding|kg_stage_a|kg_stage_b", progress:0-100, detail?}` + `done` / `error`
+  - `nano_notebooklm/ingest/`：现有 chunker / embedder 加 progress callback；`nano_notebooklm/kg/extractor.py` 在 Stage A / Stage B 之间发 callback
+  - `frontend/processing.jsx`：接 NDJSON，渲染 4 段进度条 + 当前阶段文案 + retry 按钮
+  - `frontend/api.js`：新增 `streamUpload(courseId, file, onEvent)` 帮手
+  - **新增** `tests/test_upload_stream.py`
+- **mini-test**: `test_upload_stream_emits_four_stages` / `test_processing_jsx_renders_stage_progress_grep` / `test_api_js_stream_upload_helper_exists`
+- **corner-test**: `test_upload_stream_pdf_corrupt_emits_error_no_partial` / `test_upload_stream_kg_stage_a_timeout_preserves_chunks` / `test_upload_stream_concurrent_same_course_serializes`
+- **conflict notes**: 端点签名变更（从 form-data POST 返 JSON 改成 NDJSON stream），需在 `frontend/api.js` 旧 `uploadFile` 入口 deprecate 并在 `library.jsx` 调用面切换。R4-1 的 `/api/courses` 改动与本项不冲突（不同端点）。
+
+### #R4-3 思维导图换成知识图谱视图（force-directed + relation labels）— [ ]
+
+- **goal ref**: GOAL.md Round 4 #R4-3
+- **status**: [ ]
+- **owner**:
+- **claimed_at**:
+- **files (planned)**:
+  - `frontend/index.html`：CDN script 加 d3-force（`<script src="https://cdn.jsdelivr.net/npm/d3-force@3"></script>`）
+  - `frontend/study-state.js`：保留 `prepareMindmap` 重命名为 `prepareMindmapTree`（向后兼容 + R3-3 测试）；新增 `prepareMindmapForce(graph)` 返回 `{nodes, links}` 喂 d3
+  - `frontend/mindmap.jsx`：layout 部分改用 d3.forceSimulation；保留 R3-3 全部编辑 affordance（dblclick / N / Del / shift-drag / alt-click NodeDeepDivePanel）；toolbar 加 relation filter checkbox
+  - `frontend/styles.css`：新增 `.kg-edge-part-of` / `.kg-edge-prereq` / `.kg-edge-depends` 边样式
+  - **新增** `tests/test_mindmap_force_layout.py`
+- **mini-test**: `test_mindmap_jsx_uses_force_layout_grep` / `test_prepare_mindmap_force_returns_node_link_shape` / `test_relation_filter_chip_grep`
+- **corner-test**: `test_prepare_mindmap_force_handles_100_nodes` / `test_relation_filter_zero_edges_renders_isolated_nodes` / `test_r3_3_edit_affordances_still_grepable`（dblclick / N / Del / shift+drag 在新 layout 下仍能触发 commitOps）
+- **conflict notes**: 与 R4-1（app.jsx）共享 `study-state.js`，但 R4-1 只动 courses dropdown 段，R4-3 只动 prepareMindmap 段（文件中段），无重叠。
+
+### #R4-4 GraphRAG retriever 接进 /api/chat（path="graphrag"）— **本轮最重要** — [ ]
+
+- **goal ref**: GOAL.md Round 4 #R4-4
+- **status**: [ ]
+- **owner**:
+- **claimed_at**:
+- **blocked_by**: R4-1 + R4-2（需要 KG + chunks 都 upload-only 跑通才能端到端测）。可以与 R4-1/R4-2 并行写后端代码 + 单元测（用 fixture KG），只在 PR 之前等前置 land。
+- **files (planned)**:
+  - **新增** `nano_notebooklm/kb/graph_search.py`：`graph_search(query, course_id, top_k_concepts=5, hop_limit=2) -> List[Chunk]`；BFS 沿边扩展 + dedup + weight sort + chunks 上限 30
+  - `nano_notebooklm/kg/extractor.py`：Stage A/B extract 时给每个 concept node 算并缓存 `concept_embedding: List[float]`（一次性，写进 `knowledge_graph.json`）
+  - `nano_notebooklm/skills/qa_skill.py`：入口加 graphrag 分支；`knowledge_graph.json` 存在 + graph_search ≥2 hits → `path="graphrag"`；否则降级到现有 RAG / general
+  - `nano_notebooklm/orchestrator/router_intent.py`：classify_input 增加 graphrag 优先级（在 rag 之前）
+  - `api/server.py`：`ChatResponse.path` Literal 加 `"graphrag"`
+  - `frontend/assistant.jsx`：path chip 加绿色"图检索"样式
+  - **新增** `tests/test_graph_search.py`
+- **mini-test**: `test_graph_search_returns_chunks_from_neighbor_nodes`（A-part_of-B-prereq_of-C, D 独立；query→A 取 A/B/C 不取 D） / `test_chat_uses_graphrag_path_when_kg_present`
+- **corner-test**: `test_graph_search_falls_back_to_rag_when_kg_missing` / `test_graph_search_zero_hits_falls_back_to_rag` / `test_graph_search_hop_limit_2_caps_chunks_at_30` / `test_concept_embedding_lazy_when_missing` / `test_chat_response_path_literal_includes_graphrag`
+- **conflict notes**: graph_search 是新文件不冲突；qa_skill.py / router_intent.py / api/server.py 改动需在 R4-1（server.py courses 改动）合入后再 rebase 一次。
+
+### #R4-5 Backend backend 切换 chip：codex GPT-5.4 / Qwen2.5-7B-RAFT — [ ]
+
+- **goal ref**: GOAL.md Round 4 #R4-5
+- **status**: [ ]
+- **owner**:
+- **claimed_at**:
+- **files (planned)**:
+  - **新增** `nano_notebooklm/ai/qwen_raft_backend.py`：HTTP client 到 AutoDL Gradio `:6006/api/predict`；env `QWEN_RAFT_URL` + 可选 `QWEN_RAFT_TOKEN`
+  - `nano_notebooklm/ai/router.py`（或 `openai_backend.py`）：抽象 `complete()`/`complete_stream()` 接口，按 `backend` 参数 dispatch
+  - `api/server.py`：`ChatRequest.backend: Literal["codex","qwen_raft"] | None = None`；`/api/status` 暴露 backends list + 健康状态
+  - `frontend/app.jsx`：topbar 加 backend chip "🤖 GPT-5.4 / 🎓 Qwen-RAFT"，根据 /api/status 灰掉不可用项
+  - **新增** `tests/test_qwen_backend.py`
+- **mini-test**: `test_chat_routes_to_qwen_when_backend_qwen_raft` / `test_status_endpoint_lists_qwen_when_url_configured`
+- **corner-test**: `test_chat_qwen_url_unconfigured_returns_422` / `test_chat_qwen_timeout_falls_back_to_codex_with_flag` / `test_status_endpoint_returns_200_when_qwen_unavailable`
+- **conflict notes**: 跟 R4-1/R4-4 都改 `api/server.py`，需要在前置 land 后接 rebase；新建 backend 文件本身无冲突。
+
+## Round 2 P0
 
 ### #2-8 eval 概念抽取改用 jieba — [codex]
 
