@@ -76,6 +76,16 @@ _agent_executor = ThreadPoolExecutor(
     thread_name_prefix="nlm-agent",
 )
 
+# fix-all v4 #B5: cap concurrent cancel-watcher threads. Each request
+# previously span an unbounded daemon thread; with no auth + no rate
+# limit, an attacker could open thousands of concurrent agent streams
+# and exhaust the OS thread limit. When the cap is reached new requests
+# fall back to producer-side cancel polling (slightly slower cancel,
+# never a thread-leak).
+_CANCEL_WATCHER_LIMIT = threading.BoundedSemaphore(
+    value=_read_int_env("AGENT_CANCEL_WATCHER_LIMIT", 64, 1, 1024),
+)
+
 
 SYSTEM_PROMPT_BASE = """You are nano-NOTEBOOKLM's study assistant agent. You help students understand their course materials.
 
@@ -295,6 +305,8 @@ def make_chat_completions_stream(backend: OpenAIBackend) -> LLMStream:
         # token wait would pin one of the dedicated 2-worker agent slots
         # for the full HTTP timeout — only when the loop reached the
         # `for event in stream` body could it observe the cancel.
+        # fix-all v4 #B5: gated by _CANCEL_WATCHER_LIMIT so an attacker
+        # opening thousands of streams can't spawn unbounded threads.
         def cancel_watcher():
             cancel_event.wait(timeout=180.0)
             obj = active_stream.get("obj")
@@ -303,8 +315,15 @@ def make_chat_completions_stream(backend: OpenAIBackend) -> LLMStream:
                     obj.close()
                 except Exception:
                     pass
-        threading.Thread(target=cancel_watcher, daemon=True,
-                         name="nlm-agent-cancel-watcher").start()
+
+        if _CANCEL_WATCHER_LIMIT.acquire(blocking=False):
+            def _wrapped_watcher():
+                try:
+                    cancel_watcher()
+                finally:
+                    _CANCEL_WATCHER_LIMIT.release()
+            threading.Thread(target=_wrapped_watcher, daemon=True,
+                             name="nlm-agent-cancel-watcher").start()
 
         def producer():
             try:

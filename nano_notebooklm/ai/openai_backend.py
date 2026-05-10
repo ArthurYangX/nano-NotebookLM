@@ -19,6 +19,13 @@ from nano_notebooklm.types import LLMResponse
 
 _executor = ThreadPoolExecutor(max_workers=4)
 
+# fix-all v4 #B5: same cap discipline as agent_loop._CANCEL_WATCHER_LIMIT.
+# Stream endpoints (notes / report) reach this code path; without a cap
+# every concurrent stream span an unbounded watcher thread.
+_CANCEL_WATCHER_LIMIT = threading.BoundedSemaphore(
+    value=int(os.getenv("OPENAI_CANCEL_WATCHER_LIMIT", "64")),
+)
+
 # Per-request HTTP timeout for the underlying httpx client. Without this the
 # sync client blocks indefinitely on a stalled provider; combined with the
 # `asyncio.wait_for` wrapper in qa_skill (translate path), an unset timeout
@@ -166,8 +173,14 @@ class OpenAIBackend(LLMBackend):
                 except Exception:
                     pass
 
-        threading.Thread(target=_cancel_watcher, daemon=True,
-                         name="nlm-stream-cancel-watcher").start()
+        if _CANCEL_WATCHER_LIMIT.acquire(blocking=False):
+            def _wrapped_watcher():
+                try:
+                    _cancel_watcher()
+                finally:
+                    _CANCEL_WATCHER_LIMIT.release()
+            threading.Thread(target=_wrapped_watcher, daemon=True,
+                             name="nlm-stream-cancel-watcher").start()
 
         def _producer():
             try:

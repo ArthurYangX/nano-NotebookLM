@@ -34,6 +34,11 @@ function MindMap({ data, layout, courseId, highlightedId, onNodeClick, onSourceC
   // F8: surface POST /edit failures + skipped ops to the user. Cleared
   // when a subsequent commit succeeds with no skipped ops.
   const [syncError, setSyncError] = useStateM(null);
+  // fix-all v4 #B7: coalesce rapid resync requests so a sequence of
+  // skipped/failed commitOps doesn't fan out to multiple GET
+  // /api/mindmap calls that pile up behind the per-course generation
+  // lock on the server side.
+  const resyncRef = useRefM({ inflight: false, queued: false });
   // R3-3: alt+click on a node opens a side panel that streams a 5-line
   // explanation + 3 mini-quiz from /api/mindmap/{cid}/explain-node.
   // `null` = closed. Opening with a new nodeId resets the buffer and
@@ -99,18 +104,29 @@ function MindMap({ data, layout, courseId, highlightedId, onNodeClick, onSourceC
     const merged = Object.assign({}, graphData, next);
     onDataChange && onDataChange(merged);
     if (courseId && API && typeof API.editMindmap === "function") {
-      // fix-all v3 #H13: when the server reports skipped ops or the POST
-      // outright fails, resync the local KG to the server-truth so the
-      // optimistic state can't drift (e.g. the next commit referencing a
-      // node the server refused to add).
+      // fix-all v3 #H13 + v4 #B7: when the server reports skipped ops or
+      // the POST outright fails, resync the local KG to server-truth.
+      // Coalesce rapid bursts (e.g. 5 quick edits all rejected) so we
+      // never have more than one inflight GET /api/mindmap; a queued
+      // marker triggers exactly one follow-up after the inflight returns.
       function _resyncFromServer() {
-        if (typeof API.getMindmap === "function") {
-          API.getMindmap(courseId).then(server => {
-            if (server && (server.nodes || server.edges)) {
-              onDataChange && onDataChange(server);
-            }
-          }).catch(() => { /* best-effort */ });
+        if (typeof API.getMindmap !== "function") return;
+        if (resyncRef.current.inflight) {
+          resyncRef.current.queued = true;
+          return;
         }
+        resyncRef.current.inflight = true;
+        API.getMindmap(courseId).then(server => {
+          if (server && (server.nodes || server.edges)) {
+            onDataChange && onDataChange(server);
+          }
+        }).catch(() => { /* best-effort */ }).then(() => {
+          resyncRef.current.inflight = false;
+          if (resyncRef.current.queued) {
+            resyncRef.current.queued = false;
+            _resyncFromServer();
+          }
+        });
       }
       API.editMindmap(courseId, ops).then(resp => {
         const skipped = (resp && Array.isArray(resp.op_results))

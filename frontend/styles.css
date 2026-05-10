@@ -1749,7 +1749,7 @@ mark.hl-flash { animation: hl-flash 0.9s ease-out; }
 .chunk-block .chunk-target {
   border-left-color: var(--accent);
   background: var(--accent-soft);
-  color: var(--ink-1);
+  color: var(--ink);
   font-weight: 500;
 }
 .chunk-marker {
@@ -2455,8 +2455,11 @@ mark.hl-flash { animation: hl-flash 0.9s ease-out; }
   z-index: 1000;
 }
 .lang-modal {
-  background: var(--paper-1);
-  color: var(--ink-1);
+  /* fix: design system has no `--paper-1` / `--ink-1`; previous version
+     resolved both to invalid → transparent background + canvas-default
+     text, so the choice cards floated illegibly on the dim overlay. */
+  background: var(--paper);
+  color: var(--ink);
   border: 1px solid var(--paper-3);
   border-radius: 10px;
   padding: 28px 32px 22px;
@@ -2489,8 +2492,8 @@ mark.hl-flash { animation: hl-flash 0.9s ease-out; }
   text-align: left;
   transition: border-color 0.12s ease, background 0.12s ease;
 }
-.lang-modal-choice:hover { border-color: var(--ink-4); background: var(--paper-1); }
-.lang-modal-choice.active { border-color: var(--accent); background: var(--paper-1); }
+.lang-modal-choice:hover { border-color: var(--ink-4); background: var(--paper-3); }
+.lang-modal-choice.active { border-color: var(--accent); background: var(--paper-3); }
 .lang-modal-choice-label {
   font-size: 16px;
   font-weight: 600;

@@ -423,6 +423,10 @@
       const reader = resp.body && resp.body.getReader && resp.body.getReader();
       if (!reader) throw new Error("explain-node: streaming body not supported");
       const decoder = new TextDecoder();
+      // fix-all v4 #A5: hard cap so a missing newline can't OOM the
+      // browser tab (mirrors the cap in frontend/api.js#_stream — the
+      // sister parser already had this guard but this one didn't).
+      const MAX_LINE_BYTES = 1024 * 1024;
       let buf = "";
       function pump() {
         return reader.read().then(({ value, done }) => {
@@ -434,6 +438,12 @@
             return;
           }
           buf += decoder.decode(value, { stream: true });
+          if (buf.length > MAX_LINE_BYTES) {
+            if (typeof console !== "undefined") {
+              console.warn("explain-node NDJSON buffer over " + MAX_LINE_BYTES + "B without newline; dropping");
+            }
+            buf = "";
+          }
           let nl;
           while ((nl = buf.indexOf("\n")) !== -1) {
             const line = buf.slice(0, nl).trim();
@@ -535,13 +545,38 @@
     return Object.assign({}, state, { status: "streaming", partial: (state.partial || "") + chunk });
   }
 
+  // Map stable error codes the backend emits in NDJSON `error` events to
+  // user-facing text. fix-all v3 #M1 + v4 #A3 deliberately stripped vendor
+  // exception strings (URLs / model ids / API-key shapes) and replaced
+  // them with stable codes; the UI then has to translate them so users
+  // don't see the raw "stream_failed" token.
+  const STREAM_ERROR_MESSAGES = {
+    stream_failed:        "生成失败，请稍后重试 / Generation failed; please retry.",
+    upstream_error:       "上游服务异常 / Upstream service error.",
+    endpoint_error:       "服务端错误 / Server endpoint error.",
+    agent_error:          "Agent 出错 / Agent error.",
+    no_assistant_message: "Agent 未返回任何内容 / Agent returned no message.",
+    tool_execution_failed:"工具执行失败 / Tool execution failed.",
+    quiz_generation_failed:"题目生成失败 / Quiz generation failed.",
+  };
+
+  function formatStreamErrorMessage(code, fallback) {
+    if (!code) return String(fallback || "Generation failed");
+    const friendly = STREAM_ERROR_MESSAGES[String(code)];
+    if (friendly) return friendly;
+    return String(fallback || code);
+  }
+
   function recordGenerationFailure(state, err, count) {
     const failures = count || (Number(state.failures || 0) + 1);
+    const raw = (err && err.message) || err || "generation failed";
+    const friendly = formatStreamErrorMessage(String(raw), raw);
     return Object.assign({}, state, {
       status: failures >= 3 ? "failed" : "error",
       failures,
       retryable: failures < 3,
-      errorDetail: String((err && err.message) || err || "generation failed"),
+      errorDetail: String(friendly),
+      errorCode: String(raw),
     });
   }
 
@@ -794,6 +829,8 @@
     recordPartialGeneration,
     recordGenerationFailure,
     retryGeneration,
+    formatStreamErrorMessage,
+    STREAM_ERROR_MESSAGES,
     formatStatusBar,
     loadHighlights,
     saveHighlights,

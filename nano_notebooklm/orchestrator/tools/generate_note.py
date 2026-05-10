@@ -36,13 +36,24 @@ PARAMETERS = {
 }
 
 
-def build_generate_note(orchestrator) -> Tool:
+def build_generate_note(orchestrator, lock_course_id: str | None = None) -> Tool:
+    """When ``lock_course_id`` is set, refuse generation for any other
+    course — otherwise an agent locked to course A could write a note
+    file into course B's folder (file-write side effect + content leak).
+    fix-all v4 #A4.
+    """
     async def handler(args: dict):
         clean_course, err = validate_course_id(args.get("course_id"), orchestrator)
         if err is not None:
             return {"error": err}
         if not clean_course:
             return {"error": "course_id is required"}
+        if lock_course_id and clean_course != lock_course_id:
+            return {
+                "error": "cross_course_denied",
+                "active_course": lock_course_id,
+                "requested_course": clean_course,
+            }
         params = {
             "course_id": clean_course,
             "topic": args.get("topic"),

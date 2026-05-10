@@ -329,6 +329,16 @@ class KBStore:
         # Legacy .pkl files (pre fix-all v3 #C6) are intentionally not loaded
         # — pickle.load was the RCE risk; on a fresh build a .json sibling
         # appears next to it and supersedes the legacy file.
+        # fix-all v4 #B8: visible breadcrumb so an operator who just pulled
+        # this commit and sees `total_chunks=0` understands they need to
+        # rebuild rather than thinking the corpus is gone.
+        legacy_pkl = index_dir / "bm25" / f"{suffix}.pkl"
+        if legacy_pkl.exists() and not bm25_path.exists():
+            logger.warning(
+                "Found legacy BM25 pickle at %s; pickle loading is disabled "
+                "(fix-all v3 #C6). Rerun scripts/ingest_all.py or any "
+                "/api/upload to rebuild the .json index.", legacy_pkl,
+            )
 
         if faiss_dir.exists() and bm25_path.exists():
             self._vector_index = VectorIndex(self.embed_fn)

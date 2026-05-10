@@ -285,14 +285,22 @@ def _validate_course_id_path(value: str) -> str:
 
 # Reusable Annotated types so every body model that carries `course_id`
 # inherits the same shape + traversal guard. fix-all v3 #H1.
+# fix-all v4 #B10: the AfterValidator's `..` / leading-dot / trailing-dot
+# rejection cannot be expressed in the JSON-schema regex (pydantic-core's
+# Rust regex engine has no lookahead). Surface the extra constraint via
+# the field description so generated OpenAPI clients see the real shape.
+_COURSE_ID_DESC = (
+    "Course identifier. Allowed: alphanumeric, space, dot, dash, underscore, CJK; "
+    "1-128 chars. Must not contain '..' or start/end with '.'"
+)
 OptCourseId = Annotated[
     str | None,
-    Field(max_length=128, pattern=COURSE_ID_PATTERN),
+    Field(max_length=128, pattern=COURSE_ID_PATTERN, description=_COURSE_ID_DESC),
     AfterValidator(_ensure_safe_course_id),
 ]
 ReqCourseId = Annotated[
     str,
-    Field(min_length=1, max_length=128, pattern=COURSE_ID_PATTERN),
+    Field(min_length=1, max_length=128, pattern=COURSE_ID_PATTERN, description=_COURSE_ID_DESC),
     AfterValidator(_ensure_safe_course_id),
 ]
 
@@ -437,11 +445,35 @@ class MemoryUpdate(BaseModel):
     def _bound_value(cls, v):
         try:
             payload = json.dumps(v)
+        # fix-all v4 #B4: deeply nested dicts blow Python's recursion
+        # limit inside json.dumps; without RecursionError catch every
+        # such request becomes a 5xx that the unhandled-exception
+        # handler swallows. Treat as a validation error instead.
+        except RecursionError:
+            raise ValueError("value too deeply nested") from None
         except (TypeError, ValueError) as exc:
             raise ValueError(f"value must be JSON-serializable: {exc}") from None
         if len(payload) > 200_000:
             raise ValueError("value exceeds 200KB cap")
         return v
+
+
+def _validate_memory_payload(payload: dict) -> dict:
+    """fix-all v4 #A2: gatekeeper for PUT /api/memory. Previously the
+    endpoint took a raw ``dict``, bypassing MemoryUpdate's 200KB cap
+    (#M4); an unauthenticated CORS-allowed page could write a multi-MB
+    blob and stuff a prompt-injection payload into ``learning_goals``
+    (consumed by every system prompt via ``get_context_prompt``).
+    """
+    try:
+        encoded = json.dumps(payload)
+    except RecursionError:
+        raise HTTPException(400, "memory payload too deeply nested")
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(400, f"memory payload must be JSON-serialisable: {exc}")
+    if len(encoded) > 200_000:
+        raise HTTPException(413, "memory payload exceeds 200KB cap")
+    return payload
 
 
 class SubagentRequest(BaseModel):
@@ -760,18 +792,32 @@ async def get_mindmap(course_id: str):
     course_id = _validate_course_id_path(course_id)
     kg_path = config.ARTIFACTS_DIR / "courses" / course_id / "knowledge_graph.json"
 
-    # review-swarm fix-all v3 #H8: a per-course lock so two concurrent
-    # first-time requests can't both run extract_from_chunks and double-
-    # write `knowledge_graph.json`. Reuses the same lock the edit endpoint
-    # holds, so the two cannot interleave either.
+    # fix-all v4 #A8: the cached path serves the existing
+    # knowledge_graph.json without holding a lock. Previously the entire
+    # body sat inside `_edit_lock_for(course_id)`, so a peer's first-
+    # time generation (~30-90 s) blocked every concurrent GET as well as
+    # every concurrent /edit. Now only the actual extract_from_chunks
+    # call serialises (#H8 still satisfied — two concurrent first-time
+    # requests cannot both write knowledge_graph.json).
+    if kg_path.exists():
+        try:
+            data = json.loads(kg_path.read_text())
+            data = _overlay_user_edits(data, course_id)
+            return _kg_to_mindmap(data, course_id)
+        except json.JSONDecodeError:
+            logger.warning("Corrupt knowledge_graph.json for %s, regenerating", course_id)
+
     async with _edit_lock_for(course_id):
+        # Re-check inside the lock — a peer may have generated while we
+        # were queued, in which case we just serve the freshly-written
+        # cache instead of duplicating extraction work.
         if kg_path.exists():
             try:
                 data = json.loads(kg_path.read_text())
                 data = _overlay_user_edits(data, course_id)
                 return _kg_to_mindmap(data, course_id)
             except json.JSONDecodeError:
-                logger.warning("Corrupt knowledge_graph.json for %s, regenerating", course_id)
+                logger.warning("Corrupt knowledge_graph.json for %s after race, regenerating", course_id)
 
         from nano_notebooklm.kg.extractor import extract_from_chunks
         from nano_notebooklm.kg.graph import KnowledgeGraph
@@ -818,6 +864,7 @@ class MindmapEditOp(BaseModel):
 
 
 class MindmapEditRequest(BaseModel):
+    model_config = {"extra": "forbid"}
     ops: list[MindmapEditOp] = Field(..., min_length=1, max_length=50)
 
 
@@ -1153,6 +1200,7 @@ async def edit_mindmap(course_id: str, req: MindmapEditRequest):
 # identical to /api/agent/stream so the frontend can reuse the renderer.
 
 class NodeExplainRequest(BaseModel):
+    model_config = {"extra": "forbid"}
     node_id: str = Field(..., min_length=1, max_length=200)
 
 
@@ -1160,20 +1208,24 @@ _EXPLAIN_NODE_MAX_TURNS = 4
 _EXPLAIN_NODE_TOOL_WHITELIST = ("search_kb", "read_chunk")
 
 
-def _build_explain_node_registry():
+def _build_explain_node_registry(course_id: str | None = None):
     """Subset registry — strict 2-tool whitelist for explain-node.
 
     Hand-built rather than `build_default_registry` minus filter so a
     future tool added to the default registry can't silently leak into
     explain-node and let the agent write notes / list other courses
     while pretending to be a 'just explain' affordance.
+
+    fix-all v4 #A1: forward ``course_id`` as ``lock_course_id`` so the
+    explain-node agent can't read or search chunks from sibling courses.
+    The path-param scope is the only thing the user actually authorised.
     """
     from nano_notebooklm.orchestrator.agent_tools import ToolRegistry
     from nano_notebooklm.orchestrator.tools.search_kb import build_search_kb
     from nano_notebooklm.orchestrator.tools.read_chunk import build_read_chunk
     reg = ToolRegistry()
-    reg.register(build_search_kb(kb, orchestrator))
-    reg.register(build_read_chunk(kb))
+    reg.register(build_search_kb(kb, orchestrator, lock_course_id=course_id))
+    reg.register(build_read_chunk(kb, lock_course_id=course_id))
     return reg
 
 
@@ -1222,7 +1274,7 @@ async def explain_mindmap_node(course_id: str, req: NodeExplainRequest, request:
         )
     )
 
-    explain_registry = _build_explain_node_registry()
+    explain_registry = _build_explain_node_registry(course_id=course_id)
     course_names = orchestrator.list_courses()
     llm_stream = _agent_llm_stream_factory(backend)
     rid = getattr(request.state, "request_id", "?")
@@ -1278,12 +1330,22 @@ async def ingest_course(req: IngestRequest):
     course_dir = _validate_ingest_dir(req.course_dir)
 
     cid = req.course_id or course_dir.name
+    # fix-all v4 #B3: when course_id is omitted we fall back to the
+    # resolved directory's basename. That basename comes from the
+    # filesystem (whatever the operator has under ALLOWED_INGEST_ROOTS)
+    # and was previously written verbatim into artifacts/courses/<cid>/
+    # and into LLM system prompts via META_COURSE_ADDENDUM. Validate it
+    # with the same regex + traversal guard the body-field uses.
+    cid = _validate_course_id_path(cid)
     # Clear lang cache both before and after build so any chat request that
     # arrives during the rebuild window sees a freshly recomputed fingerprint
     # rather than a stale one from the previous corpus.
     router_intent.clear_lang_cache(cid)
-    course = kb.ingest_course(str(course_dir), cid)
-    kb.build_index(cid)
+    # fix-all v4 #A6 + #A7: same off-loop pattern as /api/upload — heavy
+    # CPU and disk I/O on a worker thread so the asyncio loop stays free.
+    import asyncio as _asyncio
+    course = await _asyncio.to_thread(kb.ingest_course, str(course_dir), cid)
+    await _asyncio.to_thread(kb.build_index, cid)
     router_intent.clear_lang_cache(cid)
     chunks = kb.get_chunks(cid)
     return {
@@ -1321,8 +1383,14 @@ async def upload_files(course_id: str, files: Annotated[list[UploadFile], File(.
         # worker before the 50MB limit ever ran.
         chunk_size = 64 * 1024
         written = 0
+        # fix-all v4 #A7: keep `await f.read(chunk_size)` (already async,
+        # off-loop) but push the synchronous file write to a worker
+        # thread so 800 sync writes for a 50MB upload don't block the
+        # asyncio loop and starve concurrent endpoints.
+        import asyncio as _asyncio
         try:
-            with open(dest, "wb") as out:
+            out = open(dest, "wb")
+            try:
                 while True:
                     chunk = await f.read(chunk_size)
                     if not chunk:
@@ -1336,7 +1404,10 @@ async def upload_files(course_id: str, files: Annotated[list[UploadFile], File(.
                             413,
                             f"File '{safe_name}' exceeds limit of {MAX_UPLOAD_SIZE_MB}MB",
                         )
-                    out.write(chunk)
+                    await _asyncio.to_thread(out.write, chunk)
+            finally:
+                if not out.closed:
+                    out.close()
         except HTTPException:
             raise
         except Exception:
@@ -1353,8 +1424,13 @@ async def upload_files(course_id: str, files: Annotated[list[UploadFile], File(.
         raise HTTPException(400, "No valid files saved")
 
     router_intent.clear_lang_cache(course_id)
-    course = kb.ingest_course(str(upload_dir), course_id)
-    kb.build_index(course_id)
+    # fix-all v4 #A6 + #A7: ingest + build_index can take minutes for the
+    # full corpus (PDF parse loop + sentence-transformers embedding +
+    # FAISS/BM25 build). Run on a worker thread so the asyncio loop
+    # doesn't stall and other requests stay responsive.
+    import asyncio as _asyncio
+    course = await _asyncio.to_thread(kb.ingest_course, str(upload_dir), course_id)
+    await _asyncio.to_thread(kb.build_index, course_id)
     router_intent.clear_lang_cache(course_id)
     chunks = kb.get_chunks(course_id)
     return {
@@ -1509,7 +1585,11 @@ async def set_memory(req: MemoryUpdate):
 
 @app.put("/api/memory", tags=["memory"], summary="Replace entire memory")
 async def replace_memory(data: dict):
-    save_memory(data)
+    # fix-all v4 #A2: re-uses MemoryUpdate's 200KB cap discipline. Body
+    # is still a free-form dict (FastAPI auto-parses JSON body into a
+    # dict for `data: dict`) but now goes through the size + recursion
+    # validator before save_memory writes to disk.
+    save_memory(_validate_memory_payload(data))
     return {"ok": True}
 
 
@@ -1561,10 +1641,14 @@ def _stream_response(skill_name: str, params: dict, course_id: str, kind: str) -
                                {"kind": kind, "streamed": True, "real": True})
             yield json.dumps({"type": "done", "content": content},
                              ensure_ascii=False) + "\n"
-        except Exception as exc:
+        except Exception:
+            # fix-all v4 #A3: don't ship str(exc) to the client. Same
+            # discipline as the global 5xx handler — log the trace, return
+            # a stable code. Preserves partial buffer for the retry UX.
+            logger.exception("real_stream_events kind=%s failed", kind)
             yield json.dumps({
                 "type": "error",
-                "error": str(exc),
+                "error": "stream_failed",
                 "partial": partial,
                 "retryable": True,
             }, ensure_ascii=False) + "\n"
@@ -1585,10 +1669,11 @@ def _stream_response(skill_name: str, params: dict, course_id: str, kind: str) -
             session_log.append(course_id, "generation", {"kind": kind, "streamed": True})
             yield json.dumps({"type": "done", "content": content},
                              ensure_ascii=False) + "\n"
-        except Exception as exc:
+        except Exception:
+            logger.exception("pseudo_stream_events kind=%s failed", kind)
             yield json.dumps({
                 "type": "error",
-                "error": str(exc),
+                "error": "stream_failed",
                 "partial": partial,
                 "retryable": True,
             }, ensure_ascii=False) + "\n"

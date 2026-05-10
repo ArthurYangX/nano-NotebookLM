@@ -741,13 +741,28 @@ function markdownToHtml(content) {
 function findTextRangeInRoot(root, text, before, after) {
   // Walk text nodes; concatenate to find `text` (preferring positions whose
   // surrounding chars best match before/after). Returns a Range or null.
+  // fix: insert a phantom "\n\n" into `combined` whenever we cross a
+  // block-level ancestor boundary, so the concatenated string aligns with
+  // what `sel.toString()` and `range.toString()` produce in modern
+  // browsers (which inject newline between block elements). Without this,
+  // any selection that spans a heading + paragraph fails to re-apply
+  // because the saved text contains "\n\n" but the walker produces a
+  // glued string. The phantom characters do NOT enter `nodes`, so
+  // start/end offsets resolved via `locate()` always land on real text.
+  const BLOCK_SEL = "h1,h2,h3,h4,h5,h6,p,li,blockquote,pre,div";
   if (!root || !text) return null;
   const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null);
   const nodes = [];
   let combined = "";
+  let lastBlockEl = null;
   while (walker.nextNode()) {
     const n = walker.currentNode;
     if (n.parentElement && n.parentElement.closest(".sel-menu, .hl-popover")) continue;
+    const blockEl = n.parentElement && n.parentElement.closest(BLOCK_SEL);
+    if (blockEl && lastBlockEl && blockEl !== lastBlockEl) {
+      combined += "\n\n";
+    }
+    lastBlockEl = blockEl || lastBlockEl;
     nodes.push({ node: n, start: combined.length, end: combined.length + n.nodeValue.length });
     combined += n.nodeValue;
   }

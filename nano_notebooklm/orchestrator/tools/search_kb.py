@@ -38,7 +38,13 @@ PARAMETERS = {
 }
 
 
-def build_search_kb(kb, orchestrator) -> Tool:
+def build_search_kb(kb, orchestrator, lock_course_id: str | None = None) -> Tool:
+    """When ``lock_course_id`` is set, this tool refuses queries that try to
+    target a different course. Without this guard a prompt-injected agent
+    locked to course A could call ``search_kb(course_id="B")`` and harvest
+    1200-char snippets from course B (read_chunk is locked but the search
+    summary itself is enough exfil). fix-all v4 #A4.
+    """
     async def handler(args: dict):
         query = (args.get("query") or "").strip()
         if not query:
@@ -46,6 +52,17 @@ def build_search_kb(kb, orchestrator) -> Tool:
         clean_course, err = validate_course_id(args.get("course_id"), orchestrator)
         if err is not None:
             return {"error": err}
+        if lock_course_id:
+            if clean_course is None:
+                # Force the active course rather than letting the agent
+                # silently search across all courses.
+                clean_course = lock_course_id
+            elif clean_course != lock_course_id:
+                return {
+                    "error": "cross_course_denied",
+                    "active_course": lock_course_id,
+                    "requested_course": clean_course,
+                }
         try:
             top_k = int(args.get("top_k", 5))
         except (TypeError, ValueError):

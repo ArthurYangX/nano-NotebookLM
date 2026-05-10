@@ -81,9 +81,12 @@ class QuizGeneratorSkill(Skill):
                 system=system,
                 temperature=0.7,
             )
-        except Exception as e:
-            logger.error(f"Quiz generation failed: {e}")
-            return SkillResult(success=False, error=str(e))
+        except Exception:
+            # fix-all v4 #A3: full trace to logs, stable code to caller —
+            # raw e routinely carries provider URL / model id / api-key
+            # shape (codex AuthenticationError → leaks sk-...).
+            logger.exception("Quiz generation failed")
+            return SkillResult(success=False, error="quiz_generation_failed")
 
         # Handle both list and dict responses
         if isinstance(quiz_data, list):

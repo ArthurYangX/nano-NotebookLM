@@ -235,6 +235,36 @@ def test_retry_generation_happy():
     assert run_node(script).strip() == "ok"
 
 
+def test_recordGenerationFailure_translates_known_stable_codes():
+    """fix-all v4 follow-up: stable backend codes (`stream_failed`,
+    `upstream_error`, ...) must be translated into a user-facing string —
+    we don't want users seeing the raw token in `errorDetail`. Unknown
+    codes pass through verbatim so legacy err.message strings still work."""
+    script = textwrap.dedent(
+        """
+        const h = require('./frontend/study-state.js');
+        let s1 = h.createGenerationState();
+        s1 = h.recordGenerationFailure(s1, new Error('stream_failed'), 1);
+        if (!s1.errorDetail.includes('生成失败') && !s1.errorDetail.includes('Generation failed')) {
+          throw new Error('stream_failed not translated: ' + s1.errorDetail);
+        }
+        if (s1.errorDetail === 'stream_failed') {
+          throw new Error('raw stable code leaked into errorDetail');
+        }
+        if (s1.errorCode !== 'stream_failed') {
+          throw new Error('errorCode missing or wrong: ' + s1.errorCode);
+        }
+        let s2 = h.createGenerationState();
+        s2 = h.recordGenerationFailure(s2, new Error('totally_unknown_code'), 1);
+        if (!s2.errorDetail.includes('totally_unknown_code')) {
+          throw new Error('unknown code should pass through, got ' + s2.errorDetail);
+        }
+        console.log('ok');
+        """
+    )
+    assert run_node(script).strip() == "ok"
+
+
 def test_retry_generation_timeout():
     script = textwrap.dedent(
         """

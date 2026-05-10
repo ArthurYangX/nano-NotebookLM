@@ -2,7 +2,7 @@
 
 > **Codex 是 implementer。Claude 是 reviewer。** 用户（人）协调任务分配。
 > 一切合约定义在 `GOAL.md`，不要在这改 GOAL；这里只追踪执行状态。
-> 最后更新：2026-05-07（Round 3 起步）。
+> 最后更新：2026-05-10（Round 3 P0 land + review-swarm fix-all v4 收尾）。
 
 ## How this works
 
@@ -161,7 +161,44 @@
   6. **lock 隔离自检**：本项**未碰** R3-2 lock 内（study-state.js 文件末 user-lang 区 / styles.css 末 lang-modal 段 / server.py ChatRequest+NoteRequest+QuizRequest+ReportRequest+AgentRequest 模型）；prompt_templates.py append 在 EXAM_ANALYSIS_PROMPT 后、文件末，section header 划清边界；server.py 编辑只在 `_normalize_kg_nodes`（学习顺序透传）+ `edit_mindmap` 之后插新端点（不动既存 Pydantic 模型）。
 - **conflict notes**: 与 #R3-2 共享 `frontend/study-state.js` / `frontend/styles.css` / `api/server.py`。本项 lock 期间 **不许触碰** user-lang section（study-state.js 文件末尾的 user-lang 区、styles.css 末尾的 lang-modal 段、server.py 的 ChatRequest/NoteRequest/QuizRequest/ReportRequest/AgentRequest 模型）。`_validate_course_id_path` 已存在（#R5 fix-all v1#1），直接复用。新端点 path 不与 `/edit` 冲突（不同 suffix）。R3-3 提交时 R3-2 仍 `[ ]` 未 claim — 文件末尾追加区当前空闲，下一个 R3-2 owner 直接在我的 prompt_templates.py / study-state.js / styles.css 现有内容之后追加即可。
 
-## Round 2 P0
+### Round 3 review-swarm fix-all v4（2026-05-10）
+
+> Round 3 P0 land 之后（commit 4c79261），用户对刚铺好的新表面再跑一轮 review-swarm，4 路 reviewer（intent / security / perf / contracts）汇出 ~20 条 finding，按 fix-now（A 系）/ fix-soon（B 系）/ optional（C 系）/ hardening（H/M 系）四批落地。**不引入新 P0 item，作为 Round 3 P0（#R3-1/R3-2/R3-3）+ #R5 surfaces 的延伸 hardening**。
+>
+> **status**: [review]
+> **owner**: claude
+> **submitted_at**: 2026-05-10
+> **files touched**: `api/server.py` `frontend/app.jsx` `frontend/mindmap.jsx` `frontend/study-state.js` `frontend/styles.css` `nano_notebooklm/ai/openai_backend.py` `nano_notebooklm/kb/store.py` `nano_notebooklm/orchestrator/agent_loop.py` `nano_notebooklm/orchestrator/agent_tools.py` `nano_notebooklm/orchestrator/memory.py` `nano_notebooklm/orchestrator/tools/{__init__,search_kb,generate_note}.py` `nano_notebooklm/skills/quiz_generator.py` `tests/test_frontend_helpers.py` + 新增 `tests/test_fix_all_v4.py`（475 行 / 36 条新增回归测试）
+>
+> **pytest**: **580 passed in 343.18s**（v3 sweep 是 544 passed in 300.28s — 新增 36 条 v4 回归全过，零 regression；2026-05-10 main session 一次过）
+
+**A 批 fix-now（8 项 — 安全/正确性闸）**：
+
+- **A1+A4 跨课工具锁定**：`build_search_kb` / `build_generate_note` / explain-node 的 `_build_explain_node_registry` 都接受 `lock_course_id` kwarg。锁定时 LLM 给出不匹配 course_id 立刻返 `{error: "cross_course_denied", active_course, requested_course}`，不进 search/skill；省略 course_id 时强制用锁定值。**关闭 R3-3 explain-node 端点跨课泄漏 + agent stream 通过越权 course_id 抓别课内容**两个 surface。
+- **A2 PUT /api/memory 200KB 闸 + RecursionError 守护**：v3 已经给 POST 加了 `MemoryUpdate` 的 200KB 校验和 `value must be JSON-serializable`，但 PUT `/api/memory` 走 raw `dict` 绕过。新增 `_validate_memory_payload(payload)` 在 PUT handler 头部 gate 200KB（`HTTPException(413)`）+ 深度嵌套（`HTTPException(400, "memory payload too deeply nested")`）。`MemoryUpdate.value` validator 也补 `RecursionError → ValueError("value too deeply nested")`，避免 5xx 兜底。
+- **A3 stream 错误不再泄漏厂商消息**：notes/report/quiz 真流的 NDJSON `error` 事件原本把 upstream 异常字符串原样吐出（含 `AuthenticationError https://codex.ysaikeji.cn/v1 sk-secret...`）。改成稳定 `{type: "error", error: "stream_failed"}`，详细原因走 server log 不进响应。新增 `test_real_stream_error_event_carries_stable_code` 钉死 `sk-` / `ysaikeji` 不出现在响应体。
+- **A5 `requestNodeDeepDive` NDJSON 解析 buffer 闸**：前端 explain-node 流式 reader 累 `buf` 拼整行；恶意/错乱上游不停吐无 `\n` 数据会无限 grow buffer。加 `MAX_LINE_BYTES`（256KB），超限即 `buf = ""` 丢弃当前行 + warn，stream 继续。
+- **A6+A7 上传 + ingest 走 `asyncio.to_thread`**：`upload_files` 原来同步写盘 + 同步 `kb.ingest_course` 都跑在 event loop 上，大文件期间阻塞所有别的请求。改为 `await asyncio.to_thread(...)` 把磁盘 IO + 重 ingest 都 off-load，event loop 立刻让出。
+- **A8 缓存版 mindmap GET 不再持有 edit lock**：v3 #H8 给 mindmap GET 套了 `_edit_lock_for(course_id)` 防止两个首次请求并发跑 extract。但缓存命中（`knowledge_graph.json` 已存在）也走 lock 内，导致首次生成（30-90s）期间所有并发 GET 都阻塞。改为：先在 lock **外**判 `kg_path.exists()` 命中即直接返回；只有需要 `extract_from_chunks` 时才进 lock。`test_cached_mindmap_get_serves_outside_edit_lock` 用 source-position 钉死。
+
+**B 批 fix-soon（11 项 — 防御深度 / OpenAPI / 性能）**：
+
+- **B1 zip 安全三路拒绝**（pptx / docx 上传）：`_check_zip_safety` 拒 (a) entries 数 > `ZIP_MAX_ENTRIES` → 413 + 文件 unlink；(b) 解压总字节 > `ZIP_MAX_UNCOMPRESSED_BYTES` → 413；(c) 压缩比 > `ZIP_MAX_RATIO` → 413（zip-bomb 经典）；(d) 不是合法 zip → 400。
+- **B2 `extra=forbid` 给两个新模型**：`MindmapEditRequest`（R3-3 already had it）+ `NodeExplainRequest` 都标 `model_config = {"extra": "forbid"}`，未识别字段直接 422。
+- **B3 ingest fallback course_id 验证**：`/api/ingest` 在 `course_id` 省略时之前 fallback 到 `Path(course_dir).name`，可绕开 `COURSE_ID_PATTERN` 写到 `artifacts/courses/<bad>/`。改为 fallback 后**立刻**走 validator，违规即 400/403/422。
+- **B4 deeply-nested dict → 400 not 5xx**：Python 的 `json.dumps` 对 ~1000 层嵌套会抛 `RecursionError`；之前未捕获，全局 exception handler 把它变 5xx。`MemoryUpdate.value` validator 和 `_validate_memory_payload` 都加 `except RecursionError: raise ValueError("value too deeply nested")` / `HTTPException(400)`。
+- **B5 cancel-watcher pool 上限**：`agent_loop.run_agent_stream` 和 `openai_backend.complete_stream` 在 cancel-event 上阻塞等待时各起一个 daemon thread；高并发请求堆积时这些 thread 无限增长。改为 module-level `_CANCEL_WATCHER_LIMIT = threading.BoundedSemaphore(64)`，`acquire(blocking=False)` 失败即降级（不起 watcher，stream 仍然能正常完成，只是 cancel 体验稍差）。
+- **B7 mindmap `_resyncFromServer` 合流**：用户连续点 5 个会被服务器拒绝的 op，每个失败 commit 都会触发一次 `GET /api/mindmap`，5 个并发 GET 排到 server-side per-course generation lock 后面慢慢消化。`mindmap.jsx` 加 `resyncRef = { inflight, queued }`：inflight 期间任意第 N 次只置 queued=true；inflight 结束后看到 queued 再起一次 follow-up。**最多 1 inflight + 1 queued**。
+- **B10 `course_id` description 写进 OpenAPI 字段**：`COURSE_ID_PATTERN` 的 regex 能进 OpenAPI schema，但 `..`/leading-dot/trailing-dot 这些 `AfterValidator` 拒绝（pydantic-core Rust regex 引擎无 lookahead）只在 runtime 拦。新增 `_COURSE_ID_DESC` 常量挂到 `OptCourseId` / `ReqCourseId` 的 `Field(description=...)`，让生成的 client SDK 看到完整契约。
+- **B11 secret scrub 模式扩展**：`agent_tools._scrub` 原来只 redact OpenAI key；扩展 5 类 — `AKIA[0-9A-Z]{16}` → `[aws-access-key]`、`ghp_[A-Za-z0-9]{36}` → `[github-token]`、JWT 三段 base64 → `[jwt]`、`-----BEGIN [A-Z ]+PRIVATE KEY-----...` 块 → `[private-key]`、`Authorization: ...` header value 撞 `[redacted-auth]`。tool_result 进入 LLM context 前先洗。
+
+**C/H/M 批（前端 XSS + 渲染层 hardening）**：
+
+- **C3+C4 `markdownToHtml` escape-before-regex**：app.jsx 的 `markdownToHtml` 原本顺序是 markdown regex（`**` → `<strong>$1</strong>`）→ 再 escape；恶意 chunk 里写 `**<script>` 在第一步就被吃成 `<strong><script></strong>`，XSS。改为 `escapeHtmlSafe(text)` 必须在所有 markdown regex **之前**跑；citation chip inner 也走 `escapeHtmlSafe(inner)`。`test_markdownToHtml_escapes_before_regex` 用 source position 钉死。
+- **C5+M8 NDJSON 解析 try/catch + buffer cap**：`api.js` 的 `_stream` 原本 `JSON.parse(line)` 失败整个 stream 崩；现在每行 try/catch + `MAX_LINE_BYTES` 防 buffer 无限 grow。
+- **H1 `..` 全端点 422**：v3 #H1 给 chat/notes/quiz/report/agent 加了 dotdot 拒绝；v4 parametrize 测试覆盖 6 个 body 端点（`/api/notes` / `/api/quiz` / `/api/report` / `/api/agent/stream` / `/api/exam-analysis` / `/api/ingest`），全部 422。
+- **H3 `findTextRangeInRoot` phantom block separator**：R6 的 highlight reapply 路径在跨 heading + paragraph 时 `sel.toString()` 给的字符串含隐式 `\n\n` 但 walker 拼出的 combined 没有，导致 highlight 失败找不到。修：在 walker 经过 `h1,h2,h3,p,li,blockquote,pre` 等 block element 边界时主动 `combined += "\n\n"`，与 selection toString 一致。
+
 
 ### #2-8 eval 概念抽取改用 jieba — [codex]
 

@@ -18,14 +18,15 @@ from nano_notebooklm.orchestrator.tools.search_kb import build_search_kb
 
 def build_default_registry(kb, orchestrator, lock_course_id: str | None = None) -> ToolRegistry:
     """Build the four-tool MVP registry. Pass ``lock_course_id`` so that
-    ``read_chunk`` refuses to leak chunks from sibling courses when a
-    request is scoped to a specific course (fix-all v3 #H4).
+    every tool that touches course-scoped data (search_kb, read_chunk,
+    generate_note) refuses to leak across courses when a request is
+    scoped to a specific course (fix-all v3 #H4 + v4 #A4).
     """
     reg = ToolRegistry()
-    reg.register(build_search_kb(kb, orchestrator))
+    reg.register(build_search_kb(kb, orchestrator, lock_course_id=lock_course_id))
     reg.register(build_read_chunk(kb, lock_course_id=lock_course_id))
     reg.register(build_list_courses(orchestrator, kb))
-    reg.register(build_generate_note(orchestrator))
+    reg.register(build_generate_note(orchestrator, lock_course_id=lock_course_id))
     return reg
 
 

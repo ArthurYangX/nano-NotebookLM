@@ -42,27 +42,22 @@ def load_memory() -> dict:
 
 
 def save_memory(memory: dict):
-    """Atomic + durable write of user memory."""
+    """Atomic write of user memory.
+
+    fix-all v4 #B6: dropped per-write fsync. ``add_interaction`` is on the
+    chat hot path; fsync + dir-fsync added 10-30 ms to every reply for a
+    file where losing the most recent N entries on power-loss is
+    acceptable. Atomic-replace still guarantees crash-consistency for
+    what's already on disk — we just no longer force the kernel to flush
+    immediately on every interaction.
+    """
     memory["last_updated"] = datetime.now().isoformat()
     MEMORY_PATH.parent.mkdir(parents=True, exist_ok=True)
     payload = json.dumps(memory, ensure_ascii=False, indent=2).encode("utf-8")
     with _MEMORY_LOCK:
         tmp = MEMORY_PATH.with_suffix(".json.tmp")
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
-        try:
-            os.write(fd, payload)
-            os.fsync(fd)
-        finally:
-            os.close(fd)
+        tmp.write_bytes(payload)
         os.replace(tmp, MEMORY_PATH)
-        try:
-            dir_fd = os.open(str(MEMORY_PATH.parent), os.O_RDONLY)
-            try:
-                os.fsync(dir_fd)
-            finally:
-                os.close(dir_fd)
-        except OSError:
-            pass  # parent fsync unsupported on some FS
 
 
 def update_memory(key: str, value):

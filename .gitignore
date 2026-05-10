@@ -17,3 +17,10 @@ artifacts/
 
 # OS / editor noise
 .DS_Store
+
+# Playwright MCP tool residue
+.playwright-mcp/
+
+# Unrelated sibling projects (kept here only locally)
+previous-agent/
+

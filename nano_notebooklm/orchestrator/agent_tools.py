@@ -168,6 +168,13 @@ _LEAK_PATTERNS = [
     (re.compile(r"/[A-Za-z0-9_./-]{4,}"), "[path]"),
     (re.compile(r"sk-[A-Za-z0-9]{20,}"), "[apikey]"),
     (re.compile(r"\bBearer\s+\S+", re.IGNORECASE), "Bearer [redacted]"),
+    # fix-all v4 #B11: extend to common credential shapes the v3 set missed.
+    (re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "[aws-access-key]"),
+    (re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b"), "[github-token]"),
+    (re.compile(r"\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"), "[jwt]"),
+    (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]+?-----END [A-Z ]*PRIVATE KEY-----"),
+     "[private-key]"),
+    (re.compile(r"\bAuthorization\s*[:=]\s*\S+", re.IGNORECASE), "Authorization: [redacted]"),
 ]
 
 
