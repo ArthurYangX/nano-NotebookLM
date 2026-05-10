@@ -41,6 +41,22 @@ RRF_K = 60  # Reciprocal Rank Fusion constant
 CHECKPOINT_MODE = os.getenv("CHECKPOINT_MODE", "interactive")
 MAX_PARALLEL_WORKERS = 4
 
+# ── Round 4 #R4-1 ────────────────────────────────────────────────────
+# 8 门预置课是 Round 1 ingest 的产物。Round 4 改成 upload-only，UI 默认
+# 调 /api/courses?mode=user 把这 8 门过滤掉，留作回滚点（?show_preset=1）。
+# 物理文件保留在 artifacts/courses/<id>/ 直到 R4-4 GraphRAG 验收过。
+PRESET_COURSE_IDS: frozenset[str] = frozenset({
+    "15-213",
+    "CS182",
+    "CS231N",
+    "CS285",
+    "CSE 234",
+    "机器人导论",
+    "计算机组成原理",
+    "模式识别",
+})
+
+
 # ── Task → model routing ────────────────────────────────────────────
 TASK_ROUTES: dict[str, str] = {
     "concept_extraction": "claude",

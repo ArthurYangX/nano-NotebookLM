@@ -2517,3 +2517,64 @@ mark.hl-flash { animation: hl-flash 0.9s ease-out; }
   cursor: pointer;
 }
 .lang-modal-close:hover { color: var(--ink-2); }
+
+/* ── R4-1: empty-courses CTA card (upload-only flow first run) ── */
+.empty-courses-cta {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  width: 100%;
+  padding: 40px;
+}
+.empty-courses-card {
+  max-width: 520px;
+  text-align: center;
+  background: var(--paper-2);
+  border: 1px dashed var(--rule-strong);
+  border-radius: 12px;
+  padding: 40px 32px;
+}
+.empty-courses-glyph {
+  font-size: 40px;
+  margin-bottom: 12px;
+}
+.empty-courses-card h2 {
+  font-family: var(--serif);
+  font-size: 22px;
+  font-weight: 600;
+  margin: 0 0 12px;
+  color: var(--ink);
+}
+.empty-courses-card p {
+  font-size: 14px;
+  line-height: 1.6;
+  color: var(--ink-2);
+  margin: 0 0 18px;
+}
+.empty-courses-card .btn-primary {
+  background: var(--accent);
+  color: var(--paper);
+  border: none;
+  border-radius: 8px;
+  padding: 10px 22px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.12s ease;
+}
+.empty-courses-card .btn-primary:hover { background: var(--accent-ink); }
+.empty-courses-card .hint {
+  font-size: 11px;
+  color: var(--ink-4);
+  margin-top: 16px;
+  letter-spacing: 0.02em;
+}
+.empty-courses-card .hint code {
+  background: var(--paper-3);
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--ink-2);
+}

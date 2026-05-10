@@ -30,8 +30,11 @@ function _post(path, payload, opts = {}) {
 }
 
 const API = {
-  async getCourses() {
-    return _request("/courses");
+  // R4-1: mode="user" (default) hides preset courses; "all" returns everything.
+  // Frontend reads URL `?show_preset=1` to opt back into the all-courses view.
+  async getCourses(mode = "user") {
+    const qs = mode && mode !== "user" ? `?mode=${encodeURIComponent(mode)}` : "?mode=user";
+    return _request(`/courses${qs}`);
   },
 
   async getSources(courseId) {

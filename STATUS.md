@@ -207,19 +207,25 @@
 >
 > **预置课暂保留物理文件**（不删 `artifacts/courses/{15-213,CS182,...}`），UI 默认隐藏，等 R4-4 验收过了再决定清理。回滚点：URL `?show_preset=1` 切回 mode=all 看到全部。
 
-### #R4-1 数据切换：隐藏预置课 + UI 改"我的上传"空态 — [claude]
+### #R4-1 数据切换：隐藏预置课 + UI 改"我的上传"空态 — [review]
 
 - **goal ref**: GOAL.md Round 4 #R4-1
-- **status**: [claude]
+- **status**: [review]
 - **owner**: claude
 - **claimed_at**: 2026-05-10 23:00
-- **files (planned)**:
-  - `nano_notebooklm/config.py`：新增常量 `PRESET_COURSE_IDS = frozenset({"15-213","CS182","CS231N","CS285","CSE 234","机器人导论","计算机组成原理","模式识别"})`
-  - `api/server.py`：`/api/courses` 加 `mode: Literal["all","user"] | None = None`（默认 user）；`mode=user` 时过滤 PRESET_COURSE_IDS
-  - `frontend/app.jsx`：课程下拉默认调 mode=user；空列表渲染上传 CTA 空态卡；URL `?show_preset=1` → mode=all
-  - **新增** `tests/test_user_mode_courses.py`
-- **mini-test**: `test_courses_endpoint_user_mode_excludes_presets` / `test_app_jsx_empty_state_grep`
-- **corner-test**: `test_courses_endpoint_mode_all_includes_presets` / `test_courses_endpoint_invalid_mode_returns_422` / `test_courses_user_mode_with_real_uploads_keeps_them`
+- **submitted_at**: 2026-05-10 23:15
+- **files**:
+  - `nano_notebooklm/config.py`（+15 行：新增 `PRESET_COURSE_IDS: frozenset[str]` 8 个 id 常量）
+  - `api/server.py`（+2 行 import Query；`/api/courses` 加 `mode: Annotated[Literal["all","user"], Query(...)] = "user"` + 过滤分支）
+  - `frontend/api.js`（getCourses 接 mode 默认 "user"；强制带 `?mode=` 进 URL）
+  - `frontend/app.jsx`（+10 行：URL 读 `?show_preset=1` 写到 `courseModeRef`；空列表 → empty-courses-cta CTA card；upload 后 refetch 也带 mode）
+  - `frontend/styles.css`（+58 行末尾追加：`.empty-courses-cta`/`.empty-courses-card`/`.btn-primary` 样式）
+  - **新增** `tests/test_user_mode_courses.py`（132 行，4 mini + 4 corner）
+- **mini-test**: `test_courses_endpoint_user_mode_excludes_presets` / `test_courses_endpoint_user_mode_explicit` / `test_app_jsx_empty_state_grep` / `test_api_js_get_courses_passes_mode`
+- **corner-test**: `test_courses_endpoint_mode_all_includes_presets`（rollback hatch） / `test_courses_endpoint_invalid_mode_returns_422`（mode=garbage） / `test_preset_course_ids_constant_shape`（防 PRESET_COURSE_IDS 漂移） / `test_app_jsx_show_preset_url_param_grep`（escape hatch 不被悄悄删）
+- **pytest**: **588 passed in 369s**（v4 baseline 580 + R4-1 新增 8 条全过；零 regression）
+- **self-check**: ☑ mini  ☑ corner（5 类全覆盖：边界（空 courses 列表）/ 数据缺失（preset 物理保留但 UI 隐藏）/ 非法格式（mode=garbage→422）/ 兼容（mode=all rollback）/ 前端契约（4 grep）） ☑ no regression  ☑ offline  ☐ 浏览器实测：reviewer 在 `?show_preset=1` 与去掉 query 两种 URL 下分别访问，验证 dropdown 和空态切换。
+- **review_notes**: 预置 8 门课**物理文件保留**（artifacts/courses/{15-213,...}），仅 UI 默认隐藏，等 R4-4 GraphRAG 验收过后再决定是否物理删除。`courseModeRef` 用 `useRef` 而非 `useState`：URL 在 mount 时一次确定，整个 session 不变；用 ref 避免无意义 re-render。getCourses 强制带 `?mode=user`（即使是默认值）让请求一眼能在 access log 里区分 R4 模式。`PRESET_COURSE_IDS` 在 conftest 没新增 fixture — 直接 monkeypatch ARTIFACTS_DIR + reload server 模仿 v4 fix-all 模式。无新依赖。
 - **conflict notes**: 单文件后端改动 + 单文件前端改动，无并发 lock 风险。
 
 ### #R4-2 upload-only 全链路 + Processing 实进度（NDJSON streaming）— [claude]

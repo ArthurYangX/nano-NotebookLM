@@ -79,9 +79,18 @@ function App() {
     } catch {}
   }
 
+  // ── R4-1: course list mode (?show_preset=1 → "all", else "user") ──
+  // Default hides 8 preset courses so the upload-only flow doesn't see stale
+  // ingested chunks. URL flag is the rollback hatch until R4-4 验收 ok.
+  const courseModeRef = useRef(
+    (typeof window !== "undefined" && new URLSearchParams(window.location.search).get("show_preset") === "1")
+      ? "all"
+      : "user"
+  );
+
   // ── Load courses on mount ──
   useEffect(() => {
-    API.getCourses().then(data => {
+    API.getCourses(courseModeRef.current).then(data => {
       const crs = data.courses || [];
       setCourses(crs);
       if (crs.length > 0) setActiveCourse(crs[0].id);
@@ -329,7 +338,7 @@ function App() {
         clearInterval(iv);
         setUploading(null);
         setProcessing({ file: files[0].name, step: 0 });
-        const data = await API.getCourses();
+        const data = await API.getCourses(courseModeRef.current);
         setCourses(data.courses || []);
         setActiveCourse(courseName);
       } catch (err) {
@@ -442,6 +451,17 @@ function App() {
           <button className="tool mono" style={{ fontSize: 11 }}>{activeSources.length}/{sources.length} sources</button>
         </div>
         <div className="workspace">
+          {(!uploading && !processing && courses.length === 0) && (
+            <div className="empty-courses-cta" data-testid="empty-courses">
+              <div className="empty-courses-card">
+                <div className="empty-courses-glyph">📂</div>
+                <h2>上传文档开始</h2>
+                <p>nano-NOTEBOOKLM 现在是 upload-only 模式。先上传一份 PDF / PPTX / DOCX / Markdown，系统会自动抽取章节、构建知识图谱，再驱动问答与笔记。</p>
+                <button className="btn-primary" onClick={onStartUpload}>上传第一个文档</button>
+                <p className="hint mono">回滚到旧课程：在 URL 末尾加 <code>?show_preset=1</code></p>
+              </div>
+            </div>
+          )}
           {effectiveMode === "reader" && (
             <Reader
               sources={sources}

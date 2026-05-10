@@ -10,7 +10,7 @@ import uuid
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
-from fastapi import FastAPI, File, UploadFile, HTTPException, Request, status
+from fastapi import FastAPI, File, UploadFile, HTTPException, Query, Request, status
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -511,8 +511,15 @@ def _strip_nonempty(value: str, field_name: str) -> str:
 
 # ── Course endpoints ─────────────────────────────────────────────────
 @app.get("/api/courses", tags=["courses"], summary="List courses with chunk counts")
-async def list_courses():
+async def list_courses(
+    mode: Annotated[
+        Literal["all", "user"],
+        Query(description="'user' (default) hides preset courses; 'all' returns everything."),
+    ] = "user",
+):
     courses = orchestrator.list_courses()
+    if mode == "user":
+        courses = [c for c in courses if c not in config.PRESET_COURSE_IDS]
     result = []
     for cid in courses:
         chunks = kb.get_chunks(cid)
