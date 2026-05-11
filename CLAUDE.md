@@ -121,9 +121,15 @@ nano_notebooklm/   Python backend modules
   Hiragino Sans GB / Noto Sans SC; long Chinese filenames in citation chips
   ellipsis-clip with hover-to-expand title.
 - P0/P1 learning UX: frontend now exposes all six skills, clickable citations
-  route to Reader highlights, notes are editable with Markdown/PDF export,
-  quiz answers persist with stale detection and wrong-only review, mastery can
+  route to Reader highlights, notes are editable with **LaTeX** + .tex / PDF
+  export (Markdown export was removed in R4-6; the toolbar still has
+  legacy `buildMarkdownExport`/`buildPdfPrintHtml` for backwards-compat
+  but the Note path renders LaTeX via `frontend/latex-to-html.js`), quiz
+  answers persist with stale detection and wrong-only review, mastery can
   launch targeted quiz practice, and session history is logged daily.
+  **The mindmap tab is labelled "Knowledge Graph" in the UI** (R4-6
+  rename) — internal endpoint `/api/mindmap/{id}` and the React component
+  file `mindmap.jsx` keep their names.
 - Generation reliability: notes / quiz / report have NDJSON streaming endpoints,
   partial output retention, retry state helpers, and formatter cleanup; web
   research and formatter subagents are stateless and offline-testable.
@@ -370,6 +376,81 @@ nano_notebooklm/   Python backend modules
   status_endpoint grep uses a sentinel slice instead of a magic char
   count (robust against future status_endpoint growth). Round 4 P0
   (R4-1 ~ R4-5 + 1 R4-5 fix-all v1) is now production-grade.
+- **Round 4 R4-6 LaTeX Notes + incremental per-file cache (2026-05-11):**
+  Notes are now LaTeX-only. The `/api/notes/full-course/stream` endpoint
+  partitions per-source-file LLM calls (concurrency=4 default, capped at
+  8; global `_FULL_COURSE_SEMAPHORE`=2 caps concurrent generations
+  across the process) and emits NDJSON: `plan → file_start → (file_done
+  | file_error | file_cached)* → merging → reviewing → review_chunk* →
+  done | error`. `plan` carries `cached_count` / `fresh_count` / `force`
+  + per-file `cached: bool`. `force: true` request body bypasses the
+  cache entirely (UI: 🔄 button with `window.confirm` guard). The
+  Reviewed pass always runs even when every file is cached, so new files
+  fold into existing cross-refs.
+  **Cache file** at `artifacts/courses/<id>/notes/per_file_cache.json`,
+  shape `{"version": 1, "prompt_version": "<sha1[:8]>", "entries":
+  {<source_file>: {chunk_hash, content, generated_at, model,
+  prompt_version}}}`. Invalidation: SHA256 over `chunk_id + text` per
+  capped chunk (catches re-upload + content drift) **and** sha1[:8] of
+  `NOTE_FORMAT_LATEX + NOTE_GENERATION_PROMPT + NOTE_MERGE_REVIEW_PROMPT`
+  concatenated (catches prompt-template edits — `_NOTE_PROMPT_VERSION`
+  is computed at module import in `nano_notebooklm/skills/notes_full_course.py`).
+  **Concurrency**: per-course `asyncio.Lock` keyed by `(loop_id,
+  course_id)` around `write_cache_entry`'s load→mutate→save so two
+  workers on the same course don't last-writer-wins each other's
+  entries. **Security**: `plan_for_course` re-runs `latex_sanitizer.check()`
+  on `entry["content"]` before serving — a tampered cache file can't
+  ship `\write18`/`\input{}` to the client or tectonic. `load_cache`
+  reads either v0 (bare dict) or v1 envelope; `save_cache` always
+  writes v1.
+  **Frontend rendering**: `frontend/latex-to-html.js` is a ~280-LOC
+  whitelist shim covering exactly the macros `NOTE_FORMAT_LATEX`
+  permits (`\section/\subsection/\textbf/\emph/\texttt/\cite` +
+  `theorem/lemma/definition/example/remark/proof/itemize/enumerate/
+  equation/align`). Stage 3 env stash uses **recursive descent** so
+  nested envs (e.g. `\begin{proof}` inside `\begin{theorem}`) survive
+  into envBuf with consistent ENV_n indices; Stage 8 loop expands until
+  no placeholder remains. `renderInnerFragment` is inline-only (escape
+  + inline macros + soft line breaks) — placeholders pass through to
+  the outer Stage 9 / 10 / 11 sweep. `extractTOC` strips inline macros
+  (`\texttt{X}` → `X`). Cite chip normalises `file:loc` → `file, loc`
+  in the data-cite payload so `resolveCitationNavigation`'s split-on-
+  `,` parser routes correctly.
+  **Editor**: CodeMirror 6 via esm.sh ES modules with `stex` (LaTeX)
+  syntax highlighting; gracefully falls back to `<textarea>` when CDN
+  unreachable. Selection anchor preserved across remote-value updates
+  unless editor has focus.
+  **Export**: 3-way — `.tex` blob download, browser-print PDF (renders
+  via KaTeX in a popped-out window), tectonic-compile PDF (`POST
+  /api/notes/export/pdf` → `subprocess.run(["tectonic", ...])` inside
+  `asyncio.to_thread` + global `Semaphore(2)` cap, configurable via
+  `NANO_NLM_MAX_TECTONIC_CONCURRENCY`). PDF endpoint 503s when tectonic
+  is absent; `/api/status` reports `tectonic_available: bool` so the
+  frontend disables the button accordingly. PDF preamble uses
+  `\providecommand{\cite}` (not `\renewcommand`) + `\IfFontExistsTF`
+  fallback chain (PingFang SC → Noto Sans CJK SC → Source Han Sans SC)
+  for cross-platform CJK compile. `latex_sanitizer.py` blacklists 19
+  TeX primitives (`\input`/`\write18`/`\catcode`/`\def` etc) with 80KB
+  cap; `check_unbounded()` variant for the merge/review pass body that
+  legitimately exceeds 80KB.
+  **localStorage key migration**: `notes:draft` → `notes-latex:draft`,
+  legacy markdown drafts silently discarded on first read with a
+  per-course one-time `console.info`. `nano-nlm:v1:backend` (no course
+  segment) holds the global codex/qwen_raft backend chip preference.
+- **Known LOW backlog (R4-6, NOT yet fixed):**
+  - `concat_draft` + frontend `rebuildDraftFromFiles` both wrap each
+    per-file body with `\section{<file>}` — if the LLM accidentally
+    emits a leading `\section{}` of its own, the merged mid-stream
+    draft has two stacked H2 lines. The review pass usually folds
+    these out before `done`, so users rarely see it. Fix when polish
+    needed: strip a leading `\section{...}` from per-file content
+    before wrapping, or harden the per-file prompt.
+  - `force=true` on `/api/notes/full-course/stream` is unauthenticated
+    and burns ~$0.20-1.50 per call. Mitigated by `_FULL_COURSE_SEMAPHORE
+    `=2 global cap + default CORS allow-list (`localhost` only) so
+    externally-driven attacks are blocked, but local users + a future
+    deployment surface need per-IP/per-user rate limit. Accepted in
+    pre-user phase; add rate limit when auth lands.
 - Still missing for production: auth / multi-tenant, request rate limits,
   background-task ingestion, OpenAPI client codegen, structured metrics
   (Prometheus). Mastery is still read-only (KG editing landed in M3).
