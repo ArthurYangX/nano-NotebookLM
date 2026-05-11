@@ -989,6 +989,48 @@ body::before {
 .mindmap-legend .row { display: flex; align-items: center; gap: 8px; }
 .mindmap-legend .sw { width: 10px; height: 10px; border: 1px solid; }
 
+/* 2026-05-11: legend hide-toggle. The legend can occlude graph content
+   in the bottom-right corner; a small × dismisses it and the collapsed
+   ▤ pill in the same anchor brings it back. Persisted in localStorage
+   so it survives reloads. */
+.mindmap-legend-close {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  background: transparent;
+  border: none;
+  color: var(--ink-3);
+  font-size: 14px;
+  line-height: 1;
+  padding: 2px 5px;
+  cursor: pointer;
+  border-radius: 3px;
+}
+.mindmap-legend-close:hover {
+  background: var(--paper-2);
+  color: var(--ink);
+}
+.mindmap-legend-toggle {
+  position: absolute;
+  right: 16px;
+  bottom: 16px;
+  z-index: 5;
+  background: var(--paper);
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+  padding: 4px 8px;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--ink-3);
+  cursor: pointer;
+  line-height: 1;
+}
+.mindmap-legend-toggle:hover {
+  background: var(--paper-2);
+  color: var(--ink);
+  border-color: var(--ink-4);
+}
+
 .mindmap-detail {
   position: absolute;
   right: 16px;

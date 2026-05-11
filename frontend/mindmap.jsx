@@ -28,6 +28,24 @@ function MindMap({ data, layout, courseId, highlightedId, onNodeClick, onSourceC
   const [pan, setPan] = useStateM({ x: 0, y: 0 });
   const [zoom, setZoom] = useStateM(1);
   const [collapsed, setCollapsed] = useStateM(new Set());
+  // 2026-05-11: ref on the wrap div + a persisted hide flag for the
+  // bottom-right legend. Trackpad pinch fires `wheel` with `ctrlKey:
+  // true` on macOS; we hook a non-passive wheel listener so we can
+  // preventDefault() and zoom/pan around the cursor instead of letting
+  // the browser scroll the page.
+  const wrapRef = useRefM(null);
+  const [legendHidden, setLegendHidden] = useStateM(() => {
+    try { return window.localStorage.getItem("nano-nlm:v1:kg-legend-hidden") === "1"; }
+    catch (e) { return false; }
+  });
+  function toggleLegend() {
+    setLegendHidden(prev => {
+      const next = !prev;
+      try { window.localStorage.setItem("nano-nlm:v1:kg-legend-hidden", next ? "1" : "0"); }
+      catch (e) {}
+      return next;
+    });
+  }
   // user-applied per-node offsets: { [id]: {dx, dy} }
   const [offsets, setOffsets] = useStateM({});
   // in-progress drag state
@@ -397,6 +415,59 @@ function MindMap({ data, layout, courseId, highlightedId, onNodeClick, onSourceC
     return () => window.removeEventListener("keydown", onKey);
   }, [selectedId, editingId, nodes, courseId]);
 
+  // ---- Trackpad wheel: pinch → zoom around cursor; two-finger swipe → pan.
+  //
+  // React's synthetic `onWheel` is passive by default in modern React,
+  // which forbids preventDefault. Attach a native non-passive listener
+  // on the wrap div so we can suppress the page scroll/zoom.
+  //
+  // macOS reports trackpad pinch as a `wheel` event with `ctrlKey: true`
+  // (the OS synthesizes this — the user is NOT actually holding ctrl).
+  // Other platforms vary, but ctrlKey is the de-facto detection.
+  //
+  // Zoom anchors at the cursor: the point under the cursor stays under
+  // the cursor across the zoom. Math: if `cx/cy` is the cursor position
+  // relative to the transform origin (the wrap center), then after
+  // scaling by `ratio = newZoom / prevZoom`, the same world point is
+  // now at `(cx * ratio, cy * ratio)` in screen-space — shift `pan` by
+  // the delta to keep it under the cursor.
+  useEffectM(() => {
+    const el = wrapRef.current;
+    if (!el) return;
+    function onWheel(e) {
+      if (e.ctrlKey) {
+        e.preventDefault();
+        const rect = el.getBoundingClientRect();
+        const cx = e.clientX - rect.left - rect.width / 2;
+        const cy = e.clientY - rect.top - rect.height / 2;
+        // Smooth scale: deltaY ≈ -53 for one notch of pinch-out on macOS;
+        // exp keeps the feel exponential like browser native zoom.
+        const scaleFactor = Math.exp(-e.deltaY * 0.01);
+        setZoom(prevZoom => {
+          const nextZoom = Math.max(0.3, Math.min(3, prevZoom * scaleFactor));
+          if (nextZoom === prevZoom) return prevZoom;
+          const ratio = nextZoom / prevZoom;
+          setPan(prevPan => ({
+            x: cx - (cx - prevPan.x) * ratio,
+            y: cy - (cy - prevPan.y) * ratio,
+          }));
+          return nextZoom;
+        });
+      } else if (Math.abs(e.deltaX) > 0 || Math.abs(e.deltaY) > 0) {
+        // Two-finger trackpad swipe (or wheel) → pan the canvas. We
+        // preventDefault to stop the surrounding page from scrolling
+        // when the cursor is over the graph.
+        e.preventDefault();
+        setPan(prevPan => ({
+          x: prevPan.x - e.deltaX,
+          y: prevPan.y - e.deltaY,
+        }));
+      }
+    }
+    el.addEventListener("wheel", onWheel, { passive: false });
+    return () => el.removeEventListener("wheel", onWheel);
+  }, []);
+
   // ---- Dragging: window-level listeners so drag doesn't die if cursor leaves a node
   useEffectM(() => {
     function onMove(e) {
@@ -613,6 +684,7 @@ function MindMap({ data, layout, courseId, highlightedId, onNodeClick, onSourceC
 
   return (
     <div className="mindmap-wrap"
+      ref={wrapRef}
       data-screen-label="Knowledge Graph"
       onMouseDown={startCanvasPan}
     >
@@ -861,17 +933,33 @@ function MindMap({ data, layout, courseId, highlightedId, onNodeClick, onSourceC
         </div>
       )}
 
-      <div className="mindmap-legend">
-        <div className="row"><div className="sw" style={{ background: "var(--ink)", borderColor: "var(--ink)" }}></div>Course root</div>
-        <div className="row"><div className="sw" style={{ background: "var(--accent-soft)", borderColor: "var(--accent)" }}></div>Topic · {visNodes.filter(n => n.kind === "branch").length}</div>
-        <div className="row"><div className="sw" style={{ background: "var(--paper)", borderColor: "var(--rule-strong)" }}></div>Concept · {visNodes.filter(n => n.kind === "leaf").length}</div>
-        <div className="row"><div className="sw" style={{ background: "transparent", borderColor: "var(--rule-strong)" }}></div>Relations · {visEdges.length}/{edges.length}</div>
-        <div className="row" style={{ marginTop: 4, paddingTop: 4, borderTop: "1px dashed var(--rule)" }}>
-          <span style={{fontSize: 10, lineHeight: 1.4}}>
-            click select · dblclick edit · <b>N</b> add child · <b>Del</b> delete · <b>shift+drag</b> connect · <b>alt+click</b> deep dive
-          </span>
+      {legendHidden ? (
+        <button
+          type="button"
+          className="mindmap-legend-toggle"
+          title="Show legend"
+          onClick={toggleLegend}
+        >▤</button>
+      ) : (
+        <div className="mindmap-legend">
+          <button
+            type="button"
+            className="mindmap-legend-close"
+            title="Hide legend"
+            onClick={toggleLegend}
+            aria-label="Hide legend"
+          >×</button>
+          <div className="row"><div className="sw" style={{ background: "var(--ink)", borderColor: "var(--ink)" }}></div>Course root</div>
+          <div className="row"><div className="sw" style={{ background: "var(--accent-soft)", borderColor: "var(--accent)" }}></div>Topic · {visNodes.filter(n => n.kind === "branch").length}</div>
+          <div className="row"><div className="sw" style={{ background: "var(--paper)", borderColor: "var(--rule-strong)" }}></div>Concept · {visNodes.filter(n => n.kind === "leaf").length}</div>
+          <div className="row"><div className="sw" style={{ background: "transparent", borderColor: "var(--rule-strong)" }}></div>Relations · {visEdges.length}/{edges.length}</div>
+          <div className="row" style={{ marginTop: 4, paddingTop: 4, borderTop: "1px dashed var(--rule)" }}>
+            <span style={{fontSize: 10, lineHeight: 1.4}}>
+              click select · dblclick edit · <b>N</b> add child · <b>Del</b> delete · <b>shift+drag</b> connect · <b>alt+click</b> deep dive
+            </span>
+          </div>
         </div>
-      </div>
+      )}
 
       {/* M3: relation picker after a successful connect-drag */}
       {pendingEdge && (() => {
