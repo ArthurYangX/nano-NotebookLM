@@ -47,6 +47,22 @@ function App() {
   // shows the current value and re-opens the modal so the choice is reversible.
   const [userLang, setUserLangState] = useState(() => StudyState.loadUserLang(window.localStorage));
   const [showLangModal, setShowLangModal] = useState(false);
+  // ── R4-5 part 2: backend chip (codex GPT-5.4 / Qwen-RAFT) ──
+  // Default = codex (the production main path). Qwen is opt-in and the
+  // topbar chip greys out when /api/status reports the AutoDL host is
+  // unreachable. Persist across reloads in localStorage so the
+  // selection survives a tab refresh.
+  const [backend, setBackend] = useState(() => {
+    try {
+      const v = window.localStorage.getItem("nano-nlm:v1:backend");
+      return v === "qwen_raft" ? "qwen_raft" : "codex";
+    } catch (e) { return "codex"; }
+  });
+  function commitBackend(value) {
+    setBackend(value);
+    try { window.localStorage.setItem("nano-nlm:v1:backend", value); }
+    catch (e) {}
+  }
   function commitUserLang(code) {
     if (StudyState.saveUserLang(window.localStorage, code)) {
       setUserLangState(code);
@@ -556,6 +572,27 @@ function App() {
           >
             {userLang === "zh" ? "中" : userLang === "en" ? "EN" : "?"}
           </button>
+          {/* R4-5 part 2: backend chip — toggles codex / qwen_raft. Greys
+              out when /api/status reports Qwen unavailable or unconfigured. */}
+          <button
+            className={"backend-chip mono backend-" + (backend === "qwen_raft" ? "qwen" : "codex")}
+            title={
+              !backendStatus
+                ? "Loading backend status..."
+                : !backendStatus.qwen_raft_configured
+                ? "Qwen-RAFT 未配置 (设置 QWEN_RAFT_URL 启用)"
+                : !backendStatus.qwen_raft_available
+                ? "Qwen-RAFT 不可用，自动使用 codex GPT-5.4"
+                : "当前后端: " + (backend === "qwen_raft" ? "Qwen2.5-7B-RAFT" : "codex GPT-5.4") + " (点击切换)"
+            }
+            onClick={() => {
+              const next = backend === "qwen_raft" ? "codex" : "qwen_raft";
+              commitBackend(next);
+            }}
+            disabled={streaming || !backendStatus || !backendStatus.qwen_raft_configured || !backendStatus.qwen_raft_available}
+          >
+            {backend === "qwen_raft" ? "🎓 Qwen" : "🤖 GPT-5.4"}
+          </button>
           <button className="icon-btn" title="Generate Notes" onClick={handleGenerateNotes} disabled={streaming}>📝</button>
           <button className="icon-btn" title="Generate Quiz" onClick={handleGenerateQuiz} disabled={streaming}>❓</button>
           <button className="icon-btn" title="Build Knowledge Graph" onClick={handleGenerateMindmap} disabled={streaming}>🧠</button>
@@ -728,6 +765,7 @@ function App() {
         onCitation={handleCitation}
         checkedFiles={getCheckedSourceFiles()}
         userLang={userLang}
+        backend={backend}
       />
 
       {/* ========= Status bar ========= */}

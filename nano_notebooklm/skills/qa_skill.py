@@ -41,6 +41,14 @@ TRANSLATION_TIMEOUT_SECONDS = 5.0
 # leaving headroom for legacy KGs that pay the per-node batch on first use.
 GRAPHRAG_TIMEOUT_SECONDS = 10.0
 
+# R4-5 part 2: bound an explicit `backend="qwen_raft"` LLM call. AutoDL
+# Qwen2.5-7B-RAFT inference is typically 3-15s on warm GPU; 30s catches
+# a hung HTTP connection / cold-start anomaly while leaving runway for
+# legitimate slow responses. On timeout the chat path silently degrades
+# to codex and the response carries `backend_fallback=True` so the
+# frontend can chip-flag the degradation.
+QWEN_BACKEND_TIMEOUT_SECONDS = 30.0
+
 # fix-all v1 #A3 / #B6 (R4-4 review-swarm): graphrag admission gate. Plain
 # cosine ranking against the KG concept embeddings yields api_scores roughly
 # in the [-1, 1] cosine range; 0.15 puts "moderate semantic overlap" as the
@@ -153,6 +161,12 @@ class QASkill(Skill):
         top_k = params.get("top_k", 5)
         checked_files = params.get("checked_files")
         user_lang = params.get("user_lang")
+        # R4-5 part 2: optional per-request backend override
+        # ("codex" / "qwen_raft" / None). Threaded through _answer_rag /
+        # _answer_general; auxiliary calls (translate, cross-course
+        # routing) stay on the codex main path so the demo chip only
+        # affects the answer generation step, not retrieval helpers.
+        backend = params.get("backend")
 
         if not question:
             return SkillResult(success=False, error="No question provided")
@@ -168,6 +182,7 @@ class QASkill(Skill):
                 reason=f"input classified as general ({decision.reason})",
                 route_reason=decision.reason,
                 user_lang=user_lang,
+                backend=backend,
             )
 
         # ── R4-4 Path graphrag: KG-driven retrieve fires *before* the
@@ -216,6 +231,7 @@ class QASkill(Skill):
                     question, course_filter, graphrag_results,
                     path="graphrag",
                     user_lang=user_lang,
+                    backend=backend,
                 )
 
         # ── Path A (rag): retrieve, gate, fall back if low-quality ──
@@ -286,6 +302,7 @@ class QASkill(Skill):
             return await self._answer_rag(
                 question, course_filter, results, path="rag",
                 user_lang=user_lang,
+                backend=backend,
             )
 
         # ── Translation retry (#2): zh query on en course (or vice versa) ──
@@ -304,6 +321,7 @@ class QASkill(Skill):
                 original_query=question,
                 translated_query=translated_query,
                 user_lang=user_lang,
+                backend=backend,
             )
 
         # ── Cross-course fallback (#3): own course + translation both 0 → ──
@@ -321,6 +339,7 @@ class QASkill(Skill):
             return await self._answer_rag(
                 question, course_filter, cross_results,
                 path="cross-course",
+                backend=backend,
                 cross_course_origin=origin,
                 user_lang=user_lang,
             )
@@ -332,6 +351,7 @@ class QASkill(Skill):
             question, course_filter,
             reason="RAG score gate failed and translation retry did not help",
             user_lang=user_lang,
+            backend=backend,
         )
 
     # ── Helpers ────────────────────────────────────────────────────────
@@ -500,6 +520,65 @@ class QASkill(Skill):
             return None
         return translated, results
 
+    async def _complete_with_backend_fallback(
+        self,
+        prompt: str,
+        task_type: str,
+        system: str,
+        temperature: float,
+        max_tokens: int = 4096,
+        backend: str | None = None,
+    ) -> tuple[LLMResponse, bool]:
+        """R4-5 part 2: wrap router.complete with qwen_raft → codex
+        fallback semantics.
+
+        When `backend="qwen_raft"`, the call is bounded by
+        `QWEN_BACKEND_TIMEOUT_SECONDS` and any failure (timeout, HTTP
+        error, malformed response) silently degrades to codex. Returns
+        (response, fell_back) so the caller can surface
+        `backend_fallback=True` to the client.
+
+        When `backend` is None or "codex", the call follows the normal
+        router path with no extra timeout — router.complete already has
+        its own retry-with-fallback chain.
+        """
+        if backend == "qwen_raft":
+            try:
+                resp = await asyncio.wait_for(
+                    self.router.complete(
+                        prompt, task_type=task_type, system=system,
+                        temperature=temperature, max_tokens=max_tokens,
+                        backend="qwen_raft",
+                    ),
+                    timeout=QWEN_BACKEND_TIMEOUT_SECONDS,
+                )
+                return resp, False
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "qwen_raft backend timed out (>%ss); falling back to codex",
+                    QWEN_BACKEND_TIMEOUT_SECONDS,
+                )
+            except Exception as exc:  # noqa: BLE001 — explicit fallback
+                logger.warning(
+                    "qwen_raft backend failed (%s: %s); falling back to codex",
+                    type(exc).__name__, exc,
+                )
+            # Fallback to codex. Use an explicit backend kwarg so the
+            # router doesn't try its own auto-fallback chain on top.
+            resp = await self.router.complete(
+                prompt, task_type=task_type, system=system,
+                temperature=temperature, max_tokens=max_tokens,
+                backend="codex",
+            )
+            return resp, True
+
+        # No qwen override → default task-type routing (current behaviour).
+        resp = await self.router.complete(
+            prompt, task_type=task_type, system=system,
+            temperature=temperature, max_tokens=max_tokens,
+        )
+        return resp, False
+
     async def _answer_rag(
         self,
         question: str,
@@ -510,6 +589,7 @@ class QASkill(Skill):
         translated_query: str | None = None,
         cross_course_origin: str | None = None,
         user_lang: str | None = None,
+        backend: str | None = None,
     ) -> SkillResult:
         context = "\n\n---\n\n".join(
             f"[Source: {r.source_file}, {r.location}]\n{r.text}" for r in results
@@ -523,8 +603,9 @@ class QASkill(Skill):
             system += f"\n\n{binding}"
 
         prompt = prompts.QA_PROMPT.format(context=context, question=question)
-        resp = await self.router.complete(
+        resp, fell_back = await self._complete_with_backend_fallback(
             prompt, task_type="qa_answer", system=system, temperature=0.3,
+            backend=backend,
         )
 
         answer = resp.content
@@ -561,6 +642,11 @@ class QASkill(Skill):
             data["translated_query"] = translated_query
         if cross_course_origin is not None:
             data["cross_course_origin"] = cross_course_origin
+        # R4-5 part 2: surface qwen→codex fallback so the frontend chip
+        # can flag the degradation. Only set when fell_back is True;
+        # ChatResponse model treats False as no-fallback.
+        if fell_back:
+            data["backend_fallback"] = True
         return SkillResult(success=True, data=data)
 
     async def _answer_general(
@@ -570,6 +656,7 @@ class QASkill(Skill):
         reason: str,
         route_reason: str | None = None,
         user_lang: str | None = None,
+        backend: str | None = None,
     ) -> SkillResult:
         memory_context = get_context_prompt(course_filter)
         system = prompts.GENERAL_QA_SYSTEM
@@ -601,13 +688,15 @@ class QASkill(Skill):
                     "question that matches their language."
                 )
 
+        fell_back = False
         try:
-            resp: LLMResponse = await self.router.complete(
+            resp, fell_back = await self._complete_with_backend_fallback(
                 prompt,
                 task_type="qa_general",
                 system=system,
                 temperature=0.7,
                 max_tokens=1024,
+                backend=backend,
             )
             content = resp.content
             model = resp.model
@@ -623,14 +712,15 @@ class QASkill(Skill):
             question=question,
             summary=content[:200],
         )
-        return SkillResult(
-            success=True,
-            data={
-                "answer": content,
-                "sources": [],
-                "model": model,
-                "tokens_used": tokens,
-                "path": "general",
-                "general_reason": reason,
-            },
-        )
+        data = {
+            "answer": content,
+            "sources": [],
+            "model": model,
+            "tokens_used": tokens,
+            "path": "general",
+            "general_reason": reason,
+        }
+        # R4-5 part 2: surface qwen→codex fallback flag (general path).
+        if fell_back:
+            data["backend_fallback"] = True
+        return SkillResult(success=True, data=data)

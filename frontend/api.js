@@ -41,11 +41,14 @@ const API = {
     return _request(`/sources/${encodeURIComponent(courseId)}`);
   },
 
-  async chat(question, courseId = null, topK = 5, checkedFiles = null, { signal } = {}, { userLang = null } = {}) {
+  async chat(question, courseId = null, topK = 5, checkedFiles = null, { signal } = {}, { userLang = null, backend = null } = {}) {
     const body = {
       question, course_id: courseId, top_k: topK, checked_files: checkedFiles,
     };
     if (userLang) body.user_lang = userLang;
+    // R4-5 part 2: thread the backend chip selection through to ChatRequest.
+    // Server-side Pydantic Literal rejects anything other than "codex"/"qwen_raft".
+    if (backend === "codex" || backend === "qwen_raft") body.backend = backend;
     return _post("/chat", body, { signal });
   },
 

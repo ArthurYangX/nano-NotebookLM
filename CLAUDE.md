@@ -306,7 +306,37 @@ nano_notebooklm/   Python backend modules
   764276d (R4-4 fix-all v1) + abce190 (v2), so `git blame` doesn't
   silently misattribute the design intent to R4-6's e60bca3.
   Adds 11 regression tests in tests/test_r4_4_fix_all_v3.py.
+- Round 4 R4-5 Qwen-RAFT backend chip part 2 (2026-05-11): AutoDL
+  Qwen2.5-7B-RAFT is now wired into /api/chat as a per-request optional
+  second backend, alongside the codex GPT-5.4 main path. Part 1
+  (commit d4e8b90) landed the `QwenRaftBackend(LLMBackend)` HTTP client
+  + 19 unit tests; part 2 finishes the integration. Wiring:
+  `ModelRouter._init_backends` now registers `qwen_raft` when
+  `QWEN_RAFT_URL` is set; `_resolve_backend(task_type, backend_override)`
+  maps the user-facing alias `"codex"` to the internal `"openai"`
+  backend key. `ChatRequest` gains `backend: Literal["codex","qwen_raft"]
+  | None = None`; `ChatResponse` gains `backend_fallback: bool | None =
+  None` (extra=forbid preserved). `/api/chat` 422s when
+  `backend="qwen_raft"` but `QWEN_RAFT_URL` is unset (a stale chip
+  selection no longer silently degrades). qa_skill's new
+  `_complete_with_backend_fallback` helper wraps `router.complete` in
+  `asyncio.wait_for(timeout=QWEN_BACKEND_TIMEOUT_SECONDS=30s)` and
+  silently degrades qwen→codex on timeout/exception, setting
+  `data["backend_fallback"]=True` so the response can flag the
+  degradation to the frontend. `/api/status` adds `qwen_raft_configured`
+  + `qwen_raft_available` (health_check wrapped in 2s wait_for; broad
+  except → status never 500s even when AutoDL host is flaky). Frontend
+  topbar gets a `.backend-chip` next to the language chip — two
+  variants (`.backend-codex` blue / `.backend-qwen` purple via oklch),
+  disabled state ties to `/api/status` health, localStorage persists
+  the selection across reloads. `Assistant` threads the `backend` prop
+  into `API.chat(..., { userLang, backend })`. 9 new integration tests
+  in tests/test_qwen_backend.py (28 total: 19 part 1 + 9 part 2) cover
+  routing, 422 envelope, timeout fallback flag, status surface in both
+  healthy and unavailable states, Literal rejection, schema contract,
+  and the default-None routing case so the chip can't accidentally
+  force every request through qwen. **Round 4 P0 (R4-1..R4-5) is now
+  complete.**
 - Still missing for production: auth / multi-tenant, request rate limits,
   background-task ingestion, OpenAPI client codegen, structured metrics
   (Prometheus). Mastery is still read-only (KG editing landed in M3).
-  R4-5 (Qwen-RAFT backend chip) is the only outstanding Round 4 P0.

@@ -449,6 +449,13 @@ class ChatRequest(BaseModel):
     # rejected at the Pydantic layer so a stale localStorage value can't
     # smuggle a bogus instruction into the prompt.
     user_lang: Literal["zh", "en"] | None = None
+    # R4-5 part 2: optional backend override. "codex" routes the chat
+    # through the OpenAI-compatible proxy (GPT-5.4 etc.); "qwen_raft"
+    # routes through the AutoDL Qwen2.5-7B-RAFT HTTP backend. None =
+    # default task routing (codex stays the main path). The chat endpoint
+    # 422s when backend="qwen_raft" but QWEN_RAFT_URL is unset, so a stale
+    # localStorage chip selection doesn't silently fall through.
+    backend: Literal["codex", "qwen_raft"] | None = None
 
     @field_validator("question")
     @classmethod
@@ -516,6 +523,12 @@ class ChatResponse(BaseModel):
     filter_empty: bool | None = None
     filter_low_quality: bool | None = None
     cross_course_origin: str | None = None
+    # R4-5 part 2: True when an explicit backend="qwen_raft" request fell
+    # back to codex inside qa_skill (qwen timeout / upstream error).
+    # `QWEN_RAFT_URL` unset would have 422'd at the endpoint earlier, so
+    # this flag specifically signals a runtime degradation, not a config
+    # miss. None when no fallback occurred.
+    backend_fallback: bool | None = None
     model_config = {"extra": "forbid"}
 
 
@@ -2591,6 +2604,24 @@ async def status_endpoint():
     total_chunks = sum(len(kb.get_chunks(c)) for c in courses)
     usage = router.get_usage_summary()
     total_cost = usage.get("total_cost_usd", usage.get("total_cost", 0.0))
+
+    # R4-5 part 2: surface qwen_raft health to the frontend so the backend
+    # chip can grey out when the AutoDL host is unreachable. Two facts:
+    #   - qwen_raft_configured = env var is set (operator opted in)
+    #   - qwen_raft_available  = health_check returned ok within 2s
+    # The health probe is wrapped in wait_for + broad except so this
+    # endpoint never 500s on a flaky AutoDL backend.
+    qwen_configured = bool(config.QWEN_RAFT_URL)
+    qwen_available = False
+    if qwen_configured and "qwen_raft" in router.backends:
+        try:
+            qwen_health = await asyncio.wait_for(
+                router.backends["qwen_raft"].health_check(), timeout=2.0,
+            )
+            qwen_available = bool(qwen_health.get("ok"))
+        except Exception:  # noqa: BLE001 — status must never 500
+            qwen_available = False
+
     return {
         "backends": list(router.backends.keys()),
         "courses": len(courses),
@@ -2609,6 +2640,10 @@ async def status_endpoint():
         # degraded backend without grepping logs. None = warm-up still
         # in flight (fire-and-forget hasn't resolved yet); False = failed.
         "embed_warm_ok": getattr(app.state, "embed_warm_ok", None),
+        # R4-5 part 2: qwen_raft backend chip uses these to decide
+        # disabled state + tooltip wording.
+        "qwen_raft_configured": qwen_configured,
+        "qwen_raft_available": qwen_available,
         "version": app.version,
     }
 

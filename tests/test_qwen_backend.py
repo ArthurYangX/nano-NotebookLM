@@ -299,3 +299,264 @@ async def test_complete_stream_yields_full_content_as_one_chunk(monkeypatch):
     async for delta in b.complete_stream("hi"):
         chunks.append(delta)
     assert chunks == ["streamed once"]
+
+
+# ══════════════════════════════════════════════════════════════════════
+# R4-5 part 2 integration tests — wire QwenRaftBackend into /api/chat,
+# /api/status, ChatRequest Literal, and the qwen→codex fallback chain.
+# All use the FastAPI TestClient + monkeypatch router.backends so no
+# real HTTP or LLM is touched.
+# ══════════════════════════════════════════════════════════════════════
+
+
+import importlib
+import re as _re
+from pathlib import Path
+from fastapi.testclient import TestClient
+from nano_notebooklm.types import LLMResponse
+
+
+def _build_chat_client(monkeypatch, tmp_path, *, qwen_url="https://qwen.example",
+                      fake_embed_fn=None):
+    """Stand up /api/chat against an isolated artifacts dir with both
+    backends configured. Returns (TestClient, server_mod). Callers can
+    further monkeypatch server_mod.router.backends to inject canned
+    LLMResponses or exceptions."""
+    art = tmp_path / "artifacts"
+    (art / "courses").mkdir(parents=True)
+
+    monkeypatch.setenv("ARTIFACTS_DIR", str(art))
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-stub-codex")  # so OpenAIBackend registers
+    monkeypatch.setenv("QWEN_RAFT_URL", qwen_url)
+    monkeypatch.setenv("NANO_NLM_DISABLE_EMBED_WARMUP", "1")
+    monkeypatch.setenv("RAG_SCORE_GATE_TOP1", "0.0")
+
+    from nano_notebooklm import config as cfg
+    monkeypatch.setattr(cfg, "ARTIFACTS_DIR", art)
+    monkeypatch.setattr(cfg, "OPENAI_API_KEY", "sk-stub-codex")
+    monkeypatch.setattr(cfg, "QWEN_RAFT_URL", qwen_url)
+
+    if fake_embed_fn is not None:
+        from nano_notebooklm.kb import store as kb_store
+        monkeypatch.setattr(kb_store, "_get_default_embed_fn", lambda: fake_embed_fn)
+
+    import api.server as server_mod
+    importlib.reload(server_mod)
+
+    from nano_notebooklm.orchestrator import router_intent as ri
+    ri._LANG_CACHE.clear()
+    return TestClient(server_mod.app), server_mod
+
+
+def _make_stub_backend(name, *, complete_fn=None, complete_resp=None,
+                      health_fn=None, health_resp=None):
+    """Build a minimal LLMBackend-shaped stub for router.backends injection."""
+    class _Stub:
+        def __init__(self):
+            self.name = name
+            self.complete_calls = []
+            self.complete_structured_calls = []
+            self.health_calls = []
+
+        async def complete(self, prompt, system="", temperature=0.7, max_tokens=4096):
+            self.complete_calls.append({"prompt": prompt, "system": system})
+            if complete_fn is not None:
+                return await complete_fn(prompt, system, temperature, max_tokens)
+            return complete_resp or LLMResponse(
+                content=f"{name}-answer", model=f"{name}-model",
+                input_tokens=1, output_tokens=1, latency_ms=1.0,
+            )
+
+        async def complete_structured(self, prompt, system="", temperature=0.3, max_tokens=4096):
+            self.complete_structured_calls.append({"prompt": prompt})
+            return {}
+
+        async def complete_stream(self, prompt, system="", temperature=0.7, max_tokens=4096):
+            resp = await self.complete(prompt, system, temperature, max_tokens)
+            yield resp.content
+
+        async def health_check(self):
+            self.health_calls.append(True)
+            if health_fn is not None:
+                return await health_fn()
+            return health_resp or {"ok": True}
+
+    return _Stub()
+
+
+# ── Mini 1: chat routes to qwen when backend="qwen_raft" ─────────────
+
+
+def test_chat_routes_to_qwen_when_backend_qwen_raft(monkeypatch, tmp_path):
+    client, server_mod = _build_chat_client(monkeypatch, tmp_path)
+    qwen_stub = _make_stub_backend("qwen_raft")
+    openai_stub = _make_stub_backend("openai")
+    server_mod.router.backends["qwen_raft"] = qwen_stub
+    server_mod.router.backends["openai"] = openai_stub
+
+    r = client.post("/api/chat", json={
+        "question": "hello",
+        "backend": "qwen_raft",
+    })
+    assert r.status_code == 200, r.text
+    assert len(qwen_stub.complete_calls) == 1
+    assert len(openai_stub.complete_calls) == 0
+
+
+# ── Mini 2: status endpoint lists qwen when URL configured ───────────
+
+
+def test_status_endpoint_lists_qwen_when_url_configured(monkeypatch, tmp_path):
+    client, server_mod = _build_chat_client(monkeypatch, tmp_path)
+    server_mod.router.backends["qwen_raft"] = _make_stub_backend(
+        "qwen_raft", health_resp={"ok": True, "status": 200},
+    )
+
+    r = client.get("/api/status")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["qwen_raft_configured"] is True
+    assert body["qwen_raft_available"] is True
+    assert "qwen_raft" in body["backends"]
+
+
+# ── Corner 1: URL unconfigured + backend=qwen_raft → 422 ─────────────
+
+
+def test_chat_qwen_url_unconfigured_returns_422(monkeypatch, tmp_path):
+    # Pass qwen_url="" so QwenRaftBackend isn't even registered.
+    client, server_mod = _build_chat_client(monkeypatch, tmp_path, qwen_url="")
+    r = client.post("/api/chat", json={
+        "question": "hello",
+        "backend": "qwen_raft",
+    })
+    assert r.status_code == 422, r.text
+    body = r.json()
+    # Standard error envelope: {error, request_id, detail}.
+    assert "error" in body
+    assert "request_id" in body
+    assert "not configured" in str(body.get("detail", ""))
+
+
+# ── Corner 2: qwen timeout falls back to codex + flag ────────────────
+
+
+def test_chat_qwen_timeout_falls_back_to_codex_with_flag(monkeypatch, tmp_path):
+    # Patch QWEN_BACKEND_TIMEOUT_SECONDS to a tiny value so the test
+    # doesn't actually wait 30s.
+    from nano_notebooklm.skills import qa_skill
+    monkeypatch.setattr(qa_skill, "QWEN_BACKEND_TIMEOUT_SECONDS", 0.05)
+
+    client, server_mod = _build_chat_client(monkeypatch, tmp_path)
+
+    async def hang(*a, **kw):
+        await asyncio.sleep(2.0)  # well past the 0.05s patched timeout
+        raise RuntimeError("should never get here")
+
+    qwen_stub = _make_stub_backend("qwen_raft", complete_fn=hang)
+    openai_stub = _make_stub_backend(
+        "openai",
+        complete_resp=LLMResponse(content="codex-fallback-answer",
+                                  model="codex", input_tokens=1,
+                                  output_tokens=1, latency_ms=1.0),
+    )
+    server_mod.router.backends["qwen_raft"] = qwen_stub
+    server_mod.router.backends["openai"] = openai_stub
+
+    r = client.post("/api/chat", json={
+        "question": "hello",
+        "backend": "qwen_raft",
+    })
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body.get("backend_fallback") is True
+    assert "codex-fallback-answer" in body.get("answer", "")
+    # Both backends were exercised: qwen attempted, codex completed.
+    assert len(qwen_stub.complete_calls) >= 1
+    assert len(openai_stub.complete_calls) == 1
+
+
+# ── Corner 3: status 200 when qwen unavailable ───────────────────────
+
+
+def test_status_endpoint_returns_200_when_qwen_unavailable(monkeypatch, tmp_path):
+    client, server_mod = _build_chat_client(monkeypatch, tmp_path)
+
+    async def boom():
+        raise ConnectionError("autodl unreachable")
+
+    server_mod.router.backends["qwen_raft"] = _make_stub_backend(
+        "qwen_raft", health_fn=boom,
+    )
+
+    r = client.get("/api/status")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["qwen_raft_configured"] is True
+    assert body["qwen_raft_available"] is False
+
+
+# ── Corner 4: ChatRequest Literal rejects unknown backend ───────────
+
+
+def test_chat_request_rejects_unknown_backend_value(monkeypatch, tmp_path):
+    client, _ = _build_chat_client(monkeypatch, tmp_path)
+    r = client.post("/api/chat", json={
+        "question": "hello",
+        "backend": "bogus-backend",
+    })
+    assert r.status_code == 422, r.text
+
+
+# ── Corner 5: ChatResponse extra=forbid + backend_fallback grep ─────
+
+
+def test_chat_response_schema_includes_backend_fallback():
+    """Source-pin: ChatResponse must list backend_fallback so future
+    skills can surface it without ResponseValidationError. extra='forbid'
+    is enforced on the model — the field must be explicit."""
+    src = Path("api/server.py").read_text(encoding="utf-8")
+    m = _re.search(r"class ChatResponse\b[\s\S]+?model_config\s*=\s*\{[\s\S]+?\}", src)
+    assert m, "ChatResponse class block not found"
+    block = m.group(0)
+    assert "backend_fallback" in block
+    assert 'extra": "forbid"' in block or "extra=\"forbid\"" in block
+
+
+# ── Corner 6: router._resolve_backend rejects unconfigured override ──
+
+
+def test_router_resolve_backend_rejects_missing_backend():
+    """Defensive: if a future code path bypasses the chat() 422 guard,
+    router._resolve_backend should still RuntimeError rather than
+    silently picking a different backend."""
+    from nano_notebooklm.ai.router import ModelRouter
+    r = ModelRouter()
+    # Drop qwen if it happened to register from env.
+    r.backends.pop("qwen_raft", None)
+    with pytest.raises(RuntimeError, match="qwen_raft"):
+        r._resolve_backend("qa_answer", "qwen_raft")
+    # codex alias must resolve to "openai" backend key when present.
+    if "openai" in r.backends:
+        assert r._resolve_backend("qa_answer", "codex").name in ("openai", "codex")
+
+
+# ── Corner 7: empty backend value (None) leaves task routing intact ──
+
+
+def test_chat_with_no_backend_uses_default_routing(monkeypatch, tmp_path):
+    """backend=None / omitted should preserve the existing task-type
+    routing (codex stays the main path). Verifies our wiring doesn't
+    accidentally force every request through the qwen branch."""
+    client, server_mod = _build_chat_client(monkeypatch, tmp_path)
+    qwen_stub = _make_stub_backend("qwen_raft")
+    openai_stub = _make_stub_backend("openai")
+    server_mod.router.backends["qwen_raft"] = qwen_stub
+    server_mod.router.backends["openai"] = openai_stub
+
+    r = client.post("/api/chat", json={"question": "hello"})
+    assert r.status_code == 200, r.text
+    # qwen must NOT be called when backend kwarg is absent.
+    assert len(qwen_stub.complete_calls) == 0
+    # backend_fallback should be absent (no qwen attempt → no fallback).
+    assert r.json().get("backend_fallback") is None

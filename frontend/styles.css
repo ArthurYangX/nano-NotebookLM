@@ -1760,6 +1760,77 @@ mark.hl-flash { animation: hl-flash 0.9s ease-out; }
   opacity: 0.7;
   margin-bottom: 4px;
 }
+
+/* ─── Reader R5: document-browse mode ─── */
+.doc-text-body {
+  margin: 20px 0;
+}
+.doc-page {
+  padding: 14px 0 18px;
+  border-top: 1px dashed var(--rule);
+  scroll-margin-top: 80px;
+}
+.doc-page:first-child { border-top: none; }
+.doc-page.active .doc-page-marker {
+  color: var(--accent);
+}
+.doc-page.active {
+  background: linear-gradient(90deg, var(--accent-soft), transparent 60%);
+}
+.doc-page-marker {
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  opacity: 0.7;
+  margin: 0 0 10px;
+}
+.doc-page-chunks {
+  margin-left: 6px;
+  opacity: 0.6;
+  text-transform: none;
+  letter-spacing: 0;
+}
+.doc-chunk {
+  font-family: var(--serif);
+  font-size: 14.5px;
+  line-height: 1.75;
+  color: var(--ink-2);
+  padding: 6px 10px;
+  margin: 4px 0;
+  border-left: 2px solid transparent;
+  border-radius: 2px;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+.doc-chunk:hover {
+  border-left-color: var(--rule);
+  background: var(--accent-soft);
+}
+.doc-chunk.hot {
+  border-left-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--ink);
+}
+.doc-pdf-frame {
+  display: block;
+  width: 100%;
+  height: calc(100vh - 240px);
+  min-height: 560px;
+  border: 1px solid var(--rule);
+  border-radius: 4px;
+  margin: 16px 0;
+  background: var(--ink-0, #fafaf7);
+}
+.page.pdf-mode .ornament {
+  display: none;
+}
+/* PDF mode breaks out of the 680px prose cap so the embedded viewer has
+   room to render real PDF pages. Text/intro modes keep the narrow column. */
+.page.pdf-mode {
+  max-width: none;
+  padding: 32px 36px 60px;
+}
+
 .skill-grid {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -2822,4 +2893,34 @@ mark.hl-flash { animation: hl-flash 0.9s ease-out; }
   border: 1px dashed var(--ink-7);
   border-radius: var(--radius);
   background: oklch(0.985 0 0);
+}
+
+/* R4-5 part 2: backend chip — topbar toggle for codex GPT-5.4 / Qwen-RAFT.
+   Visual baseline matches `.lang-chip` (same mono font, padding, border
+   radius, hover, disabled). Two state variants change the border + text
+   tint so the operator sees which backend is active at a glance. */
+.backend-chip {
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  background: transparent;
+  color: var(--ink-2);
+  border: 1px solid var(--paper-3);
+  border-radius: 6px;
+  padding: 4px 9px;
+  cursor: pointer;
+  transition: background 0.12s ease, border-color 0.12s ease;
+  margin-left: 4px;
+}
+.backend-chip:hover { background: var(--paper-2); border-color: var(--ink-4); }
+.backend-chip:disabled { opacity: 0.45; cursor: not-allowed; }
+.backend-chip.backend-codex {
+  border-color: oklch(0.80 0.04 235);
+  color: oklch(0.40 0.12 235);
+}
+.backend-chip.backend-qwen {
+  border-color: oklch(0.78 0.10 305);
+  color: oklch(0.38 0.18 305);
+  background: oklch(0.97 0.04 305);
 }
