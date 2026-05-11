@@ -220,8 +220,41 @@ def test_generate_file_returns_empty_marker_on_blank_response():
 
 
 def test_generate_file_respects_semaphore_concurrency():
-    """With Semaphore(2) and 6 parallel calls, max in-flight must never exceed 2."""
-    router = _FakeRouter(lambda p: r"\textbf{ok}")
+    """With Semaphore(2) and 6 parallel calls, exactly 2 workers must be
+    in-flight simultaneously at the peak. Earlier `max_in_flight >= 1`
+    was a tautology. We use a barrier-style fake router: each call
+    increments `in_flight`, waits until either (a) `in_flight == 2`
+    (peak reached, release the barrier) OR (b) a short timeout, then
+    proceeds. This forces actual parallel execution rather than relying
+    on `asyncio.sleep(0.01)` happening to overlap.
+    """
+    barrier = asyncio.Event()
+
+    class _BarrierRouter:
+        def __init__(self):
+            self.in_flight = 0
+            self.max_in_flight = 0
+
+        async def complete(self, prompt, task_type="", system="",
+                           temperature=0.7, max_tokens=4096):
+            self.in_flight += 1
+            self.max_in_flight = max(self.max_in_flight, self.in_flight)
+            if self.in_flight >= 2:
+                barrier.set()
+            try:
+                # Wait until the peak is hit (or a generous timeout —
+                # if the semaphore doesn't actually parallelise, the
+                # barrier never sets and we time out, then the test
+                # fails on the strict `== 2` assertion below).
+                try:
+                    await asyncio.wait_for(barrier.wait(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    pass
+                return _FakeResponse(r"\textbf{ok}")
+            finally:
+                self.in_flight -= 1
+
+    router = _BarrierRouter()
     sem = asyncio.Semaphore(2)
     plans = [_make_plan(idx=i, source_file=f"f{i}.pdf") for i in range(6)]
 
@@ -230,8 +263,10 @@ def test_generate_file_respects_semaphore_concurrency():
 
     results = asyncio.run(run_all())
     assert all(r.error is None for r in results)
-    assert router.max_in_flight <= 2
-    assert router.max_in_flight >= 1  # something actually ran in parallel
+    assert router.max_in_flight == 2, (
+        f"semaphore cap not enforced: max_in_flight={router.max_in_flight}, "
+        f"expected exactly 2"
+    )
 
 
 # ── Endpoint tests (TestClient + monkeypatched router) ─────────────────
@@ -350,6 +385,41 @@ def test_endpoint_emits_file_error_for_unsafe_latex(fc_client, monkeypatch):
     assert final["files_failed"] == 1
 
 
+def test_endpoint_emits_latex_unsafe_when_review_stream_returns_forbidden(fc_client, monkeypatch):
+    """review-swarm fix-all v1 #16: the terminal `check_unbounded`
+    branch on the review stream was previously dead-code from a test
+    perspective. Inject a forbidden command into the review stream and
+    assert a terminal `{type: "error", error: "latex_unsafe"}` event."""
+    client, server_mod = fc_client
+
+    async def fake_complete(prompt, task_type="", system="",
+                            temperature=0.7, max_tokens=4096):
+        return _FakeResponse(r"\textbf{ok}")
+
+    async def fake_complete_stream(prompt, task_type="", system="",
+                                   temperature=0.7, max_tokens=4096):
+        yield r"\section{Polished}"
+        yield "\n"
+        yield r"\input{/etc/passwd}"
+        yield "\n"
+        yield r"\textbf{trailing}"
+
+    monkeypatch.setattr(server_mod.router, "complete", fake_complete)
+    monkeypatch.setattr(server_mod.router, "complete_stream", fake_complete_stream)
+
+    response = client.post("/api/notes/full-course/stream",
+                           json={"course_id": "testcourse"})
+    events = _read_events(response)
+    # File phase succeeds, review phase runs, then sanitiser catches \input
+    assert any(e["type"] == "reviewing" for e in events)
+    assert any(e["type"] == "review_chunk" for e in events)
+    final = events[-1]
+    assert final["type"] == "error"
+    assert final["error"] == "latex_unsafe"
+    # Sanitiser reason should mention the offending command
+    assert "\\input" in final.get("detail", "")
+
+
 def test_endpoint_rejects_empty_course(fc_client, monkeypatch):
     client, server_mod = fc_client
     # Empty out the course — replace get_chunks with a stub
@@ -385,7 +455,72 @@ def test_endpoint_handles_all_files_failed(fc_client, monkeypatch):
     assert events[-1]["error"] == "all_files_failed"
 
 
-def test_endpoint_rejects_invalid_concurrency(fc_client):
+def test_endpoint_cancels_outstanding_tasks_on_disconnect(fc_client, monkeypatch):
+    """review-swarm fix-all v1 #17: when the client closes the response
+    mid-stream, the `finally` block must cancel outstanding per-file
+    tasks so we don't keep burning tokens on a closed connection.
+
+    Strategy: replace router.complete with a fake that increments a
+    started-counter immediately and then sleeps 30s — long enough that
+    only the first few workers ever enter the LLM call before the test
+    aborts. Then drive the events() generator directly, consume a couple
+    of events, and aclose() it to trigger the cancellation path. Assert
+    that the started-counter is strictly less than the total plan size.
+    """
+    import asyncio as _aio
+
+    client, server_mod = fc_client
+
+    started = 0
+    started_lock = _aio.Lock()
+
+    async def slow_complete(prompt, task_type="", system="",
+                            temperature=0.7, max_tokens=4096):
+        nonlocal started
+        async with started_lock:
+            started += 1
+        await _aio.sleep(30)
+        return _FakeResponse(r"\textbf{never reached}")
+
+    monkeypatch.setattr(server_mod.router, "complete", slow_complete)
+
+    # Drive the underlying StreamingResponse generator directly rather than
+    # through TestClient — TestClient buffers the full response before
+    # returning. We mimic what Starlette does on disconnect: aclose() the
+    # generator after consuming a couple of events.
+    async def run():
+        from types import SimpleNamespace
+        req = server_mod.NoteFullCourseRequest(
+            course_id="testcourse", concurrency=2,
+        )
+        # fix-all v1 #20: handler now takes (req, request) so it can log
+        # the request_id on stream-failed exceptions. Mock the Request
+        # interface — only .state.request_id is read.
+        fake_request = SimpleNamespace(state=SimpleNamespace(request_id="test-rid"))
+        streaming_response = await server_mod.stream_full_course_notes(req, fake_request)
+        body_iter = streaming_response.body_iterator
+        consumed = []
+        # Consume the plan event + give time for the first 2 workers to
+        # enter slow_complete. Each iteration awaits the next yielded
+        # event from the generator.
+        async for chunk in body_iter:
+            consumed.append(chunk)
+            if len(consumed) >= 3:  # plan + (up to 2) file_start events
+                break
+        # Simulate disconnect: aclose the generator.
+        await body_iter.aclose()
+        # Give the event loop a tick to process the cancellation.
+        await _aio.sleep(0.05)
+        return consumed
+
+    consumed = asyncio.run(run())
+    # Body iterator may yield str or bytes depending on Starlette version —
+    # normalise to str.
+    decoded = [c.decode() if isinstance(c, (bytes, bytearray)) else c for c in consumed]
+    assert any('"plan"' in c for c in decoded)
+    # Only a couple of workers should have entered the LLM call before
+    # cancellation — definitely fewer than the 5 plans.
+    assert started < 5, f"cancellation failed: {started} workers ran past sleep"
     client, _ = fc_client
     # concurrency=0 is below the ge=1 floor → 422 from Pydantic
     response = client.post("/api/notes/full-course/stream",

@@ -208,10 +208,29 @@ function App() {
     setStreamProgress(0);
     setGenerationState(StudyState.createGenerationState());
     const fileSections = [];
+    // fix-all v1 #19: mirror backend's _escape_latex_title (in
+    // nano_notebooklm/skills/notes_full_course.py) — strip directory
+    // components and escape the LaTeX-special set. Earlier code only
+    // escaped `[{}\\]`, which let a filename like `chapter_3.pdf` slip
+    // into the mid-stream draft with a raw underscore; if the user hit
+    // PDF compile before the review pass overwrote the draft, tectonic
+    // would choke on the unescaped `_`.
+    function escapeLatexTitle(name) {
+      const base = String(name || "untitled").split("/").pop() || "untitled";
+      let out = "";
+      for (const ch of base) {
+        if ("&%$#_{}".includes(ch)) out += "\\" + ch;
+        else if (ch === "\\") out += "\\textbackslash{}";
+        else if (ch === "~") out += "\\textasciitilde{}";
+        else if (ch === "^") out += "\\textasciicircum{}";
+        else out += ch;
+      }
+      return out;
+    }
     function rebuildDraftFromFiles() {
       return fileSections
         .filter(f => f && f.status === "done" && f.content)
-        .map(f => `\\section{${(f.source_file || "untitled").replace(/[{}\\]/g, c => "\\" + c)}}\n${f.content}`)
+        .map(f => `\\section{${escapeLatexTitle(f.source_file)}}\n${f.content}`)
         .join("\n\n");
     }
     let reviewPartial = "";
@@ -254,7 +273,9 @@ function App() {
           inReview = true;
           reviewPartial = "";
         } else if (event.type === "review_chunk") {
-          reviewPartial = event.partial || (reviewPartial + (event.delta || ""));
+          // Backend ships `delta` only — review_chunk would otherwise be
+          // O(N²) on the wire. Accumulate locally.
+          reviewPartial = reviewPartial + (event.delta || "");
           setRealNotes(reviewPartial);
           setGenerationState(s => StudyState.recordPartialGeneration(s, event.delta || ""));
         } else if (event.type === "error") {
@@ -270,7 +291,10 @@ function App() {
       setRealNotes(content);
       saveCached(activeCourse, "notes", content);
       StudyState.saveNoteDraft(localStorage, activeCourse, content);
-      await API.appendSessionLog(activeCourse, "generation", { kind: "notes" }).catch(() => {});
+      // fix-all v1 #18: backend's /api/notes/full-course/stream writes
+      // its own session-log row (kind="notes-full-course"); previously
+      // this followed up with a second row (kind="notes") on every
+      // success, double-counting in any future kind aggregation.
     } catch (e) {
       const msg = "Error: " + e.message;
       setRealNotes(prev => prev || rebuildDraftFromFiles() || msg);

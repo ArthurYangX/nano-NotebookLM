@@ -6,6 +6,7 @@ import pytest
 
 from nano_notebooklm.skills.latex_sanitizer import (
     check,
+    check_unbounded,
     LaTeXUnsafeError,
     MAX_LATEX_BYTES,
 )
@@ -167,3 +168,87 @@ def test_command_in_comment_is_still_caught():
     with pytest.raises(LaTeXUnsafeError):
         check("\\section{Hi}\n% \\write18 example\nbody")
 
+
+# ── check_unbounded — review-swarm fix-all v1 #15 ────────────────────
+
+
+def test_check_unbounded_happy_path():
+    """The same allowed-macro body that passes check() must also pass
+    check_unbounded() — they share the forbidden-command list."""
+    body = (
+        r"\section{Intro}" "\n"
+        r"\textbf{Key term}: a definition." "\n"
+        r"\begin{theorem}$a^2+b^2=c^2$\end{theorem}" "\n"
+    )
+    assert check_unbounded(body) == body
+
+
+def test_check_unbounded_rejects_empty():
+    with pytest.raises(LaTeXUnsafeError):
+        check_unbounded("")
+    with pytest.raises(LaTeXUnsafeError):
+        check_unbounded("   \n  \t")
+
+
+def test_check_unbounded_rejects_non_string():
+    with pytest.raises(LaTeXUnsafeError):
+        check_unbounded(None)  # type: ignore[arg-type]
+    with pytest.raises(LaTeXUnsafeError):
+        check_unbounded(123)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("payload,fragment", [
+    (r"\input{/etc/passwd}", "\\input"),
+    (r"\write18{rm -rf /}", "\\write18"),
+    (r"\immediate\write{/tmp/x}{data}", "\\immediate"),
+    (r"\openout5=/tmp/out", "\\openout"),
+    (r"\def\evil{x}", "\\def"),
+    (r"\let\foo=\bar", "\\let"),
+    (r"\newcommand\foo{x}", "\\newcommand"),
+    (r"\catcode`\\=12", "\\catcode"),
+    (r"\csname evil\endcsname", "\\csname"),
+    (r"\loop\foo\repeat", "\\loop"),
+])
+def test_check_unbounded_rejects_forbidden_commands(payload, fragment):
+    body = r"\section{Hi}" + "\n" + payload + "\nbody"
+    with pytest.raises(LaTeXUnsafeError) as exc:
+        check_unbounded(body)
+    # The same reason set as check() — the implementations share regex.
+    assert exc.value.reason
+
+
+def test_check_unbounded_bypasses_size_cap():
+    """A body larger than MAX_LATEX_BYTES must pass check_unbounded
+    (provided it contains no forbidden commands), but fail check()."""
+    # Build a ~200 KB body of safe LaTeX. xeCJK chars are 3 bytes each so
+    # ~70k characters is enough to clear 80 KB; we'll just repeat ASCII.
+    big = r"\section{Big}" + "\n" + ("safe body text " * 15000)
+    assert len(big.encode("utf-8")) > MAX_LATEX_BYTES
+
+    # check_unbounded accepts the size
+    out = check_unbounded(big)
+    assert out.startswith(r"\section{Big}")
+    # check() (with cap) rejects the same body
+    with pytest.raises(LaTeXUnsafeError):
+        check(big)
+
+
+def test_check_unbounded_huge_body_with_forbidden_command_still_caught():
+    """The cap-bypass must NOT bypass the forbidden-command scan — a 200KB
+    body that hides a single \\input still has to be rejected."""
+    head = r"\section{Big}" + "\n" + ("safe body text " * 8000)
+    tail = " more body " * 8000
+    payload = head + r"\input{/etc/passwd}" + tail
+    assert len(payload.encode("utf-8")) > MAX_LATEX_BYTES
+    with pytest.raises(LaTeXUnsafeError) as exc:
+        check_unbounded(payload)
+    assert "\\input" in exc.value.reason
+
+
+def test_check_unbounded_strips_tex_magic_comments():
+    """check_unbounded must apply the same _strip_shell_escape_comments
+    pass as check()."""
+    body = "%! TEX shellesc=1\n\\section{Hi}\nbody\n"
+    out = check_unbounded(body)
+    assert "%! TEX shellesc" not in out
+    assert r"\section{Hi}" in out
