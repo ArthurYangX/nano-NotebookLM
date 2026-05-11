@@ -270,17 +270,30 @@ function App() {
   useEffect(() => {
     API.getCourses(courseModeRef.current).then(data => {
       const crs = data.courses || [];
-      setCourses(crs);
-      // Pick the first VISIBLE course as the initial selection so we
-      // don't auto-select a hidden one (which the dropdown wouldn't
-      // even render). Falls back to All Courses (null) if every course
-      // is hidden.
+      // R5-2 fix-all v2 #1: in default mode, the backend hides the 8
+      // preset courses. If the user previously worked on one in
+      // ?show_preset=1 mode and saved notes/highlights/KG/quiz to
+      // localStorage, that data is orphaned — the dropdown doesn't
+      // list the course, so they can't navigate to it. Detect cached
+      // preset courses and surface them with an `auto_resurfaced: true`
+      // flag so the dropdown re-adds them. We still respect
+      // hiddenCourseIds (a per-browser opt-out) so the user can
+      // explicitly hide a resurfaced preset.
+      let merged = crs;
+      if (courseModeRef.current !== "all") {
+        try {
+          const cachedIds = StudyState.findCoursesWithCache(localStorage);
+          const known = new Set(crs.map(c => c.id));
+          const extras = cachedIds
+            .filter(cid => !known.has(cid))
+            .map(cid => ({ id: cid, name: cid, auto_resurfaced: true }));
+          if (extras.length) merged = crs.concat(extras);
+        } catch { /* localStorage flaky → no resurface, dropdown reflects backend only */ }
+      }
+      setCourses(merged);
       const hidden = new Set(StudyState.loadHiddenCourses(localStorage));
-      const firstVisible = crs.find(c => !hidden.has(c.id));
+      const firstVisible = merged.find(c => !hidden.has(c.id));
       if (firstVisible) setActiveCourse(firstVisible.id);
-      // SAMPLE_COLLECTIONS now updated by a separate effect that watches
-      // hiddenCourseIds so Library's "Collections" sidebar follows the
-      // dropdown's visible scope when the user toggles hide/unhide.
     }).catch(() => {});
     API.getStatus().then(setBackendStatus).catch(() => {});
   }, []);
@@ -893,7 +906,23 @@ function App() {
         // the user could never reach them.
         try {
           const data = await API.getCourses(courseModeRef.current);
-          setCourses(data.courses || []);
+          // Apply the same resurfacing as the mount-time courses load so
+          // the post-upload refresh keeps any cached-preset entries
+          // visible. Without this, an upload would re-fetch courses and
+          // drop the resurfaced rows from the dropdown.
+          const crs = data.courses || [];
+          let merged = crs;
+          if (courseModeRef.current !== "all") {
+            try {
+              const cachedIds = StudyState.findCoursesWithCache(localStorage);
+              const known = new Set(crs.map(c => c.id));
+              const extras = cachedIds
+                .filter(cid => !known.has(cid))
+                .map(cid => ({ id: cid, name: cid, auto_resurfaced: true }));
+              if (extras.length) merged = crs.concat(extras);
+            } catch { /* same fallback as mount */ }
+          }
+          setCourses(merged);
           if (!final || final.type !== "error") {
             setActiveCourse(courseName);
           }
@@ -969,9 +998,17 @@ function App() {
             <option value="">🌐 All Courses ({totalChunks} chunks)</option>
             {visibleCourses.map(c => {
               const flag = c.lang === "zh" ? "🇨🇳" : c.lang === "mixed" ? "🌐" : "🇺🇸";
+              // R5-2 fix-all v2 #1: surface auto-resurfaced preset courses
+              // visually so the user knows the row is reaching beyond the
+              // current backend filter. Label appended in parens since the
+              // chunks count is unknown (not returned by the backend in
+              // default mode).
+              const suffix = c.auto_resurfaced
+                ? " · (cached, preset)"
+                : ` (${c.chunks || 0} chunks)`;
               return (
                 <option key={c.id} value={c.id}>
-                  {flag} {c.name} ({c.chunks} chunks)
+                  {flag} {c.name}{suffix}
                 </option>
               );
             })}

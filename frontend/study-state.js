@@ -9,12 +9,17 @@
 
   function createMemoryStorage(seed) {
     const data = Object.assign({}, seed || {});
-    return {
-      getItem: key => Object.prototype.hasOwnProperty.call(data, key) ? data[key] : null,
-      setItem: (key, value) => { data[key] = String(value); },
-      removeItem: key => { delete data[key]; },
+    // Match the production Storage interface so tests can exercise
+    // helpers like findCoursesWithCache that iterate via length + key(i).
+    const store = {
+      getItem: k => Object.prototype.hasOwnProperty.call(data, k) ? data[k] : null,
+      setItem: (k, value) => { data[k] = String(value); },
+      removeItem: k => { delete data[k]; },
+      key: i => Object.keys(data)[i] ?? null,
       dump: () => Object.assign({}, data),
     };
+    Object.defineProperty(store, "length", { get: () => Object.keys(data).length });
+    return store;
   }
 
   function key(courseId, kind) {
@@ -1164,6 +1169,61 @@
     }
   }
 
+  // R5-2 fix-all v2 #1: in default mode (?show_preset NOT set), the
+  // backend hides preset courses, so any localStorage data the user built
+  // up in `?show_preset=1` mode (notes, highlights, KG cache, exam bank,
+  // ...) becomes unreachable through the UI — the dropdown doesn't list
+  // those courses. Scan storage for content-cache markers so the caller
+  // can resurface "preset courses with real work in them" while still
+  // hiding untouched preset slots. We deliberately do NOT count config-
+  // only keys (notes-toc-collapsed, notes-scroll-y) as a signal — those
+  // get written by reading even a preset course once, and would defeat
+  // the hide-by-default intent.
+  //
+  // Keys we treat as "user-generated content present":
+  //   `${PREFIX}:<courseId>:notes`               (full LaTeX body)
+  //   `${PREFIX}:<courseId>:notes:highlights`   (any highlight created)
+  //   `${PREFIX}:<courseId>:mindmap`             (force-graph payload)
+  //   `${PREFIX}:<courseId>:quiz`                (cached quiz)
+  //   `${PREFIX}:<courseId>:notes-latex:draft`   (user-edited LaTeX)
+  //   `${PREFIX}:<courseId>:exam-prep:*`         (future-proof; not yet
+  //                                              written but reserved)
+  const CONTENT_CACHE_KINDS = [
+    "notes", "notes:highlights", "mindmap", "quiz", "notes-latex:draft",
+  ];
+
+  function findCoursesWithCache(storage) {
+    const found = new Set();
+    if (!storage || typeof storage.length !== "number" || typeof storage.key !== "function") {
+      return [];
+    }
+    const prefix = PREFIX + ":";
+    // Iterate snapshot of keys; localStorage is unordered but small
+    // enough to scan in O(N). Cap defensively to avoid pathological state.
+    const MAX_SCAN = 20000;
+    const limit = Math.min(storage.length, MAX_SCAN);
+    for (let i = 0; i < limit; i++) {
+      const k = storage.key(i);
+      if (!k || !k.startsWith(prefix)) continue;
+      const tail = k.slice(prefix.length);
+      // Skip global keys (no course segment): tail is just "<kind>" with
+      // no leading colon-delimited course. The two known globals are
+      // `hidden-courses` / `backend` / `kg-legend-hidden`.
+      const firstColon = tail.indexOf(":");
+      if (firstColon < 0) continue;
+      const courseId = tail.slice(0, firstColon);
+      const kind = tail.slice(firstColon + 1);
+      if (!courseId || courseId === "_all_") continue;
+      // Must match one of the content-cache kinds. Use endsWith so a
+      // future per-course/per-file leaf (e.g. `mindmap_edits` if ever
+      // moved to localStorage) is opt-in via this list, not implicit.
+      if (CONTENT_CACHE_KINDS.includes(kind)) {
+        found.add(courseId);
+      }
+    }
+    return Array.from(found).sort();
+  }
+
   // ── Notes scroll-position cache (per-course) ────────────────────────
   // Preserves the user's scroll spot in the Notes preview across tab
   // switches (Notes → Reader → back to Notes). Per-course so a switch to
@@ -1338,6 +1398,7 @@
     USER_LANG_KEY,
     DEFAULT_LANG_CHOICES,
     loadHiddenCourses,
+    findCoursesWithCache,
     saveHiddenCourses,
     isCourseHidden,
     setCourseHidden,

@@ -326,6 +326,56 @@ def test_wrong_only_filter_uses_letter_for_multi_choice():
     assert run_node(script).strip() == "ok"
 
 
+def test_find_courses_with_cache_resurfaces_preset_work():
+    """R5-2 fix-all v2 #1: in default mode (?show_preset NOT set) the
+    backend hides preset courses, so localStorage cache the user built up
+    in ?show_preset=1 mode becomes invisible — they can't even navigate to
+    the course in the dropdown. `findCoursesWithCache` scans storage for
+    content-cache keys (notes/highlights/mindmap/quiz/latex-draft) so the
+    UI can resurface those preset courses with a "(cached)" label."""
+    script = textwrap.dedent(
+        """
+        const h = require('./frontend/study-state.js');
+        const s = h.createMemoryStorage();
+        // Simulate work the user did in ?show_preset=1 mode on preset courses
+        s.setItem('nano-nlm:v1:CS231N:notes', '\\\\section{Backprop}');
+        s.setItem('nano-nlm:v1:CS231N:notes:highlights', '[]');
+        s.setItem('nano-nlm:v1:15-213:mindmap', '{"nodes":[]}');
+        s.setItem('nano-nlm:v1:uploaded-foo:quiz', '[]');
+        // Config-only keys MUST NOT count as "real work" — otherwise just
+        // visiting a preset course resurfaces it forever.
+        s.setItem('nano-nlm:v1:noise-only:notes-toc-collapsed', '[]');
+        s.setItem('nano-nlm:v1:noise-only:notes-scroll-y', '100');
+        // Global keys (no course segment) MUST be skipped.
+        s.setItem('nano-nlm:v1:hidden-courses', '[]');
+        s.setItem('nano-nlm:v1:backend', 'codex');
+        // Pseudo "_all_" sentinel from null-course paths MUST be skipped.
+        s.setItem('nano-nlm:v1:_all_:notes', 'whatever');
+
+        const found = h.findCoursesWithCache(s);
+        const want = ['15-213', 'CS231N', 'uploaded-foo'];
+        if (JSON.stringify(found) !== JSON.stringify(want)) {
+          throw new Error('expected ' + JSON.stringify(want) + ' got ' + JSON.stringify(found));
+        }
+        console.log('ok');
+        """
+    )
+    assert run_node(script).strip() == "ok"
+
+
+def test_find_courses_with_cache_handles_missing_storage():
+    script = textwrap.dedent(
+        """
+        const h = require('./frontend/study-state.js');
+        // No `.length` / no `.key` → empty result, no throw.
+        if (JSON.stringify(h.findCoursesWithCache(null)) !== '[]') throw new Error('null storage');
+        if (JSON.stringify(h.findCoursesWithCache({})) !== '[]') throw new Error('bare {} storage');
+        console.log('ok');
+        """
+    )
+    assert run_node(script).strip() == "ok"
+
+
 def test_quiz_persistence_invalid():
     script = textwrap.dedent(
         """
