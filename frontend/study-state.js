@@ -531,18 +531,51 @@
     });
   }
 
+  // LaTeX-refactor: notes now persist as LaTeX source under a new storage
+  // key. The old `notes:draft` key holds markdown — rendering it through
+  // latex-to-html would show literal `##` / `**`, so we silently discard
+  // on first read. A one-time console.info is emitted (gated by a flag)
+  // for debuggability. The project is pre-user (CLAUDE.md) so this
+  // breaking change carries no real cost.
+  const NOTES_DRAFT_KIND = "notes-latex:draft";
+  const LEGACY_NOTES_DRAFT_KIND = "notes:draft";
+  const LEGACY_DISCARD_FLAG = `${PREFIX}:_:notes-migration-logged`;
+
+  function _migrateLegacyNoteDraft(storage, courseId) {
+    if (!storage) return;
+    try {
+      const legacy = storage.getItem(key(courseId, LEGACY_NOTES_DRAFT_KIND));
+      if (legacy === null || legacy === "") return;
+      storage.removeItem(key(courseId, LEGACY_NOTES_DRAFT_KIND));
+      if (typeof console !== "undefined" && !storage.getItem(LEGACY_DISCARD_FLAG)) {
+        console.info(
+          "[nano-nlm] discarded legacy markdown note draft (course=%s) — " +
+          "the Note format switched to LaTeX. This log only fires once.",
+          courseId
+        );
+        try { storage.setItem(LEGACY_DISCARD_FLAG, "1"); } catch (e) {}
+      }
+    } catch (e) {
+      /* legacy migration is best-effort */
+    }
+  }
+
   function saveNoteDraft(storage, courseId, content) {
     try {
-      storage.setItem(key(courseId, "notes:draft"), String(content || ""));
+      storage.setItem(key(courseId, NOTES_DRAFT_KIND), String(content || ""));
     } catch (e) {
       if (typeof console !== "undefined") console.warn("notes draft save failed", e);
     }
   }
 
   function loadNoteDraft(storage, courseId) {
-    return storage.getItem(key(courseId, "notes:draft")) || "";
+    _migrateLegacyNoteDraft(storage, courseId);
+    return storage.getItem(key(courseId, NOTES_DRAFT_KIND)) || "";
   }
 
+  // Legacy markdown export — retained for backwards-compat with the
+  // test suite (tests/test_frontend_helpers.py exercises this helper).
+  // The Note path itself uses buildLatexExport now.
   function buildMarkdownExport(courseId, content) {
     const safeCourse = String(courseId || "course").replace(/[^\w.-]+/g, "-");
     return {
@@ -552,9 +585,80 @@
     };
   }
 
+  // LaTeX-refactor: download the raw .tex source. Mime type is `text/x-tex`
+  // (the most widely recognised LaTeX mime); browsers offer Save As… for it.
+  function buildLatexExport(courseId, content) {
+    const safeCourse = String(courseId || "course").replace(/[^\w.-]+/g, "-");
+    return {
+      filename: `${safeCourse}-notes.tex`,
+      mime: "text/x-tex;charset=utf-8",
+      content: String(content || ""),
+    };
+  }
+
+  // Legacy raw-text print helper. Retained so anything calling this gets
+  // the old behaviour rather than a crash; the Note path now uses
+  // buildPrintHtml below which wraps already-rendered HTML.
   function buildPdfPrintHtml(courseId, content) {
     const escaped = String(content || "").replace(/[&<>]/g, ch => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[ch]));
     return `<!doctype html><title>${courseId} notes</title><pre>${escaped}</pre>`;
+  }
+
+  // LaTeX-refactor: print-friendly HTML wrapper. Takes already-rendered
+  // HTML (output of NanoLatex.latexToHtml) and emits a self-contained page
+  // with KaTeX styles + auto-render so math + theorem boxes survive the
+  // browser-print path. Used by the Notes "PDF (print)" button.
+  function buildPrintHtml(courseId, renderedHtml) {
+    const safeTitle = String(courseId || "course").replace(/[<>]/g, "");
+    // KaTeX assets — same versions as index.html (0.16.11).
+    return [
+      `<!doctype html>`,
+      `<html lang="en"><head><meta charset="utf-8"/>`,
+      `<title>${safeTitle} notes</title>`,
+      `<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">`,
+      `<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>`,
+      `<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js"></script>`,
+      `<style>`,
+      `  body { font-family: "Source Serif 4", "PingFang SC", "Microsoft YaHei", serif; `,
+      `         max-width: 760px; margin: 32px auto; padding: 0 24px; color: #1a1a1a; line-height: 1.7; }`,
+      `  h2, h3, h4 { font-weight: 600; margin-top: 1.4em; }`,
+      `  .thm-box { border-left: 3px solid #888; background: #f6f6f4; padding: 10px 14px; `,
+      `             margin: 10px 0; border-radius: 4px; }`,
+      `  .thm-theorem { border-color: #5b8def; background: #eef3fd; }`,
+      `  .thm-lemma { border-color: #4a90a4; background: #ecf3f5; }`,
+      `  .thm-definition { border-color: #b8860b; background: #fbf3df; }`,
+      `  .thm-example { border-color: #5fa052; background: #eef5ec; }`,
+      `  .thm-remark { border-color: #a86432; background: #f5ece3; }`,
+      `  .thm-proof { border-color: #888; background: #fafafa; }`,
+      `  .thm-label { display: inline; font-weight: 600; }`,
+      `  .qed { float: right; font-size: 110%; }`,
+      `  .ref-chip { display: inline-block; background: #eee; border-radius: 3px; `,
+      `              padding: 1px 6px; font-family: ui-monospace, monospace; `,
+      `              font-size: 88%; color: #444; border: none; }`,
+      `  .latex-unknown { background: #fff7e5; border: 1px solid #f0c873; `,
+      `                   padding: 8px; border-radius: 4px; font-family: ui-monospace, monospace; `,
+      `                   white-space: pre-wrap; font-size: 90%; }`,
+      `  .math-display { margin: 12px 0; }`,
+      `  @media print { body { max-width: none; margin: 0; padding: 0 1cm; } }`,
+      `</style>`,
+      `</head><body>`,
+      `<h1>${safeTitle}</h1>`,
+      String(renderedHtml || ""),
+      `<script>document.addEventListener("DOMContentLoaded", function () {`,
+      `  if (typeof renderMathInElement === "function") {`,
+      `    renderMathInElement(document.body, {`,
+      `      delimiters: [`,
+      `        { left: "$$", right: "$$", display: true },`,
+      `        { left: "$", right: "$", display: false },`,
+      `        { left: "\\\\[", right: "\\\\]", display: true },`,
+      `        { left: "\\\\(", right: "\\\\)", display: false },`,
+      `      ],`,
+      `      throwOnError: false,`,
+      `    });`,
+      `  }`,
+      `});</script>`,
+      `</body></html>`,
+    ].join("\n");
   }
 
   function quizSignature(quiz) {
@@ -894,6 +998,8 @@
     loadNoteDraft,
     buildMarkdownExport,
     buildPdfPrintHtml,
+    buildLatexExport,
+    buildPrintHtml,
     saveQuizAnswers,
     loadQuizAnswers,
     filterWrongQuestions,

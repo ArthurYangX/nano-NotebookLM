@@ -28,6 +28,34 @@
   <script src="https://cdn.jsdelivr.net/npm/d3-timer@3.0.1" crossorigin="anonymous"></script>
   <script src="https://cdn.jsdelivr.net/npm/d3-force@3.0.0" crossorigin="anonymous"></script>
   <script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" crossorigin="anonymous"></script>
+
+  <!-- LaTeX-refactor: CodeMirror 6 as ES modules from esm.sh for the Notes
+       editor (stex / LaTeX syntax highlighting). type="module" runs in a
+       separate scope from babel-standalone's text/babel — they don't fight.
+       On failure (esm.sh down / offline), window.__CM6 never sets and the
+       Notes editor falls back to a plain <textarea>. -->
+  <script type="module">
+    try {
+      const cmCore = await import("https://esm.sh/codemirror@6.0.1");
+      const cmState = await import("https://esm.sh/@codemirror/state@6.4.1");
+      const cmView  = await import("https://esm.sh/@codemirror/view@6.26.3");
+      const cmLang  = await import("https://esm.sh/@codemirror/language@6.10.2");
+      const stexMod = await import("https://esm.sh/@codemirror/legacy-modes@6.4.0/mode/stex");
+      window.__CM6 = {
+        ready: true,
+        EditorView: cmView.EditorView,
+        EditorState: cmState.EditorState,
+        basicSetup: cmCore.basicSetup,
+        StreamLanguage: cmLang.StreamLanguage,
+        stex: stexMod.stex,
+      };
+      window.dispatchEvent(new CustomEvent("cm6-ready"));
+    } catch (err) {
+      console.warn("CodeMirror 6 failed to load — Notes editor will fall back to <textarea>", err);
+      window.__CM6 = { ready: false, error: err };
+      window.dispatchEvent(new CustomEvent("cm6-failed"));
+    }
+  </script>
 </head>
 <body>
   <div id="root"></div>
@@ -38,6 +66,10 @@
   <!-- Shared markdown + KaTeX helpers (used by chat bubbles and the Notes
        preview). Plain JS; loads before any Babel-transpiled component. -->
   <script src="/static/markdown.js"></script>
+  <!-- LaTeX-refactor: latex-to-html shim. Used by the Notes preview to render
+       backend-produced LaTeX bodies without a TeX engine. Depends on
+       window.NanoMarkdown for math stashing + HTML escaping. -->
+  <script src="/static/latex-to-html.js"></script>
 
   <!-- React components (Babel-transpiled) -->
   <script type="text/babel" src="/static/tweaks-panel.jsx"></script>

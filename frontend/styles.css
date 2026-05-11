@@ -2727,3 +2727,99 @@ mark.hl-flash { animation: hl-flash 0.9s ease-out; }
   font-size: 11px;
   box-shadow: var(--shadow);
 }
+
+/* ── LaTeX-refactor: Notes preview rendering ─────────────────────────── */
+
+/* Theorem-style environment boxes. Colour family follows the chat /
+   citation chip palette: blue = theorem, amber = definition,
+   green = example, etc. Borders are 3px solid on the left for the
+   "academic textbook" feel; backgrounds are very pale (oklch L > 0.96)
+   so long boxes don't fight with the prose. */
+.notes-preview .thm-box {
+  border-left: 3px solid var(--ink-4);
+  background: oklch(0.985 0.005 100);
+  padding: 10px 14px;
+  margin: 12px 0;
+  border-radius: 4px;
+}
+.notes-preview .thm-theorem {
+  border-color: var(--accent);
+  background: oklch(0.97 0.022 250);
+}
+.notes-preview .thm-lemma {
+  border-color: oklch(0.55 0.08 220);
+  background: oklch(0.965 0.015 220);
+}
+.notes-preview .thm-definition {
+  border-color: var(--amber);
+  background: oklch(0.97 0.038 80);
+}
+.notes-preview .thm-example {
+  border-color: oklch(0.55 0.1 145);
+  background: oklch(0.97 0.025 145);
+}
+.notes-preview .thm-remark {
+  border-color: oklch(0.55 0.08 60);
+  background: oklch(0.97 0.02 60);
+}
+.notes-preview .thm-proof {
+  border-color: var(--ink-4);
+  background: oklch(0.985 0 0);
+}
+.notes-preview .thm-label {
+  display: inline;
+  font-weight: 600;
+  margin-right: 4px;
+}
+.notes-preview .qed {
+  float: right;
+  font-size: 115%;
+  color: var(--ink-4);
+  margin-left: 8px;
+}
+
+/* Unknown LaTeX env / macro: escape hatch so nothing silently disappears.
+   Styled like an inline error chip — visible but not screaming. */
+.notes-preview .latex-unknown {
+  background: oklch(0.97 0.03 80);
+  border: 1px dashed var(--amber);
+  color: oklch(0.42 0.08 70);
+  padding: 6px 10px;
+  margin: 6px 0;
+  border-radius: 4px;
+  font-family: var(--mono);
+  font-size: 12px;
+  white-space: pre-wrap;
+}
+
+/* CodeMirror 6 editor host. The library injects its own .cm-editor inside
+   our wrapper — we constrain max-height + scroll so the editor doesn't
+   blow out the Notes toolbar layout. Loading state mirrors the textarea
+   visual so the swap is invisible after CM6 lands. */
+.notes-editor.cm6-host {
+  border: 1px solid var(--ink-7);
+  border-radius: var(--radius);
+  background: var(--paper);
+  min-height: 320px;
+  max-height: 60vh;
+  overflow: hidden;
+}
+.notes-editor.cm6-host .cm-editor {
+  height: 100%;
+  font-family: var(--mono);
+  font-size: 13px;
+}
+.notes-editor.cm6-host .cm-scroller {
+  overflow: auto;
+}
+.notes-editor.cm6-loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 320px;
+  color: var(--ink-4);
+  font-size: 12px;
+  border: 1px dashed var(--ink-7);
+  border-radius: var(--radius);
+  background: oklch(0.985 0 0);
+}
