@@ -725,6 +725,36 @@ def test_toc_tree_extraction_file_wrappers():
     assert run_node(script).strip() == "ok"
 
 
+def test_toc_tree_zero_child_file_wrapper():
+    """A `\\section{lecture7.pdf}` with no `\\subsection` underneath
+    produces an L1 file root with `children: []`. This is a real shape
+    the LLM emits for slide decks too short to need subsections. The
+    NotesTOC renderer handles 0-child L1s by replacing the triangle
+    with a spacer (no collapse affordance, but the row stays jump-
+    clickable). Pin the shape to catch regressions in the extractor's
+    file-wrapper grouping."""
+    script = textwrap.dedent(
+        r"""
+        const tex = require('./frontend/latex-to-html.js');
+        const src = '\\section{lecture7.pdf}\n' +
+                    '\\section{lecture8.pdf}\n' +
+                    '\\subsection{Intro}\n';
+        const tree = tex.extractTOC(src);
+        if (tree.length !== 2) throw new Error('expected 2 L1 roots, got: ' + tree.length);
+        if (tree[0].text !== 'lecture7.pdf') throw new Error('L1[0] text: ' + tree[0].text);
+        if (!Array.isArray(tree[0].children) || tree[0].children.length !== 0) {
+          throw new Error('L1[0] should have empty children, got: ' + JSON.stringify(tree[0].children));
+        }
+        if (tree[1].text !== 'lecture8.pdf') throw new Error('L1[1] text');
+        if (tree[1].children.length !== 1 || tree[1].children[0].text !== 'Intro') {
+          throw new Error('L1[1] children malformed: ' + JSON.stringify(tree[1].children));
+        }
+        console.log('ok');
+        """
+    )
+    assert run_node(script).strip() == "ok"
+
+
 def test_toc_tree_filename_whitelist_overrides_heuristic():
     """When fileNames is supplied, a title matching it becomes L1 even
     without a recognised extension (handles user uploads named e.g.

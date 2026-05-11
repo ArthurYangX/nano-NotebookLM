@@ -326,13 +326,22 @@
     // LaTeX-output fix-all v3 #3: strip inline macros from TOC titles —
     // the LLM happily emits `\subsection{\texttt{leaq}: ...}` and the
     // sidebar would otherwise show literal `\texttt{leaq}: ...`.
-    return String(raw == null ? "" : raw)
-      .replace(/\\(textbf|textit|emph|texttt|textsf|textrm)\s*\{([^{}]*)\}/g, "$2")
-      .replace(/\\[a-zA-Z]+\s*\{([^{}]*)\}/g, "$1")
-      // Drop the LaTeX-special escape backslashes for display only — the
-      // id is still computed from the cleaned form so anchor lookup
-      // matches the heading's slug (markdownToHtml escapes the same way).
-      .replace(/\\([_&%$#{}])/g, "$1");
+    // review-swarm v2 fix-soon #9: iterate to fixpoint so nested macros
+    // like `\textbf{\texttt{leaq}: ...}` fully reduce (single-pass
+    // would leave residue). Cap at 6 iterations so a pathological input
+    // can't spin.
+    let out = String(raw == null ? "" : raw);
+    for (let pass = 0; pass < 6; pass++) {
+      const next = out
+        .replace(/\\(textbf|textit|emph|texttt|textsf|textrm)\s*\{([^{}]*)\}/g, "$2")
+        .replace(/\\[a-zA-Z]+\s*\{([^{}]*)\}/g, "$1");
+      if (next === out) break;
+      out = next;
+    }
+    // Drop the LaTeX-special escape backslashes for display only — the
+    // id is still computed from the cleaned form so anchor lookup
+    // matches the heading's slug (markdownToHtml escapes the same way).
+    return out.replace(/\\([_&%$#{}])/g, "$1");
   }
 
   // Extract a hierarchical TOC tree from raw LaTeX source. Each node:

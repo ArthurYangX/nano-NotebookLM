@@ -115,6 +115,13 @@ function App() {
   // can't pass a closure through processing state (function identity
   // breaks; React DevTools complains; gc'd on rerender). Use a ref.
   const retryRef = useRef(null);
+  // review-swarm v2 fix-now #2: the sources-load effect now lists
+  // hiddenCourseIds in its dep array (for the All-Courses recompute).
+  // In specific-course mode, hiddenCourseIds-only changes were also
+  // causing a full re-fetch + setActiveId(null), which snapped the
+  // Reader off the user's current source. Track the last specific-
+  // course we fetched for so we can skip the reset on no-op re-runs.
+  const lastFetchedSpecificCourse = useRef(null);
 
   // ── Hidden-course toggle handlers ─────────────────────────────────
   function toggleCourseHidden(courseId) {
@@ -136,13 +143,16 @@ function App() {
     setActiveCourse(next ? next.id : null);
   }, [hiddenCourseIds, courses, activeCourse]);
 
-  // Keep Library's "Collections" sidebar in sync with the visible-course
-  // filter. `window.SAMPLE_COLLECTIONS` is read inside Library's render so
-  // a stale value used to linger here until the next page reload. Now it
-  // re-derives whenever courses load OR the user toggles a hide. App
-  // re-renders on hiddenCourseIds change → Library re-renders → reads the
-  // refreshed global.
-  useEffect(() => {
+  // review-swarm v2 fix-soon #8: collections (Library's "Collections"
+  // sidebar) now lives in React state and is passed as a prop. The old
+  // implementation mutated `window.SAMPLE_COLLECTIONS` after-the-fact
+  // in a useEffect — Library happened to re-render on hide-toggle
+  // (because hiddenCourseIds is App state) and pick up the new global,
+  // but any path that re-rendered Library independently would see
+  // stale data. Lifting to state eliminates the implicit-global
+  // coupling. data.jsx still seeds the initial `window.SAMPLE_COLLECTIONS`
+  // for any code that hasn't migrated yet (none left in frontend/).
+  const collections = React.useMemo(() => {
     const colors = [
       "oklch(0.42 0.08 160)", "oklch(0.48 0.12 25)",
       "oklch(0.45 0.1 255)", "oklch(0.44 0.09 310)",
@@ -151,7 +161,7 @@ function App() {
     ];
     const hidden = new Set(hiddenCourseIds);
     const visible = courses.filter(c => !hidden.has(c.id));
-    window.SAMPLE_COLLECTIONS = visible.map((c, i) => ({
+    return visible.map((c, i) => ({
       id: c.id, name: c.name, count: c.chunks, color: colors[i % colors.length],
     }));
   }, [courses, hiddenCourseIds]);
@@ -220,6 +230,7 @@ function App() {
       // "All Courses" mode — show sources from every VISIBLE course.
       // Hidden courses are excluded so cross-course search and citation
       // resolution match the dropdown's visible scope.
+      lastFetchedSpecificCourse.current = null;
       setSources([]);
       const visible = courses.filter(c => !hiddenCourseIds.includes(c.id));
       Promise.all(visible.map(c => API.getSources(c.id).catch(() => ({ sources: [] }))))
@@ -257,6 +268,20 @@ function App() {
       return;
     }
 
+    // review-swarm v2 fix-now #2: this branch resets activeId + sources
+    // every time the effect re-runs. With hiddenCourseIds in deps, the
+    // effect re-runs on every hide-toggle — even when the user is in
+    // specific-course mode reading lecture 5. That snapped the Reader
+    // back to lecture 1. Now we short-circuit when the active course
+    // hasn't actually changed.
+    if (lastFetchedSpecificCourse.current === activeCourse) {
+      // Cached-content restore + session log re-run is harmless (setState
+      // bail-out on === for identical values); the expensive part is the
+      // API fetch + setActiveId(null) reset, which we skip here.
+      API.getSessionLog().then(data => setSessionDays(data.days || {})).catch(() => {});
+      return;
+    }
+    lastFetchedSpecificCourse.current = activeCourse;
     // Clear activeId + sources synchronously when activeCourse changes.
     // Without this the Reader briefly sees (new course, old course's
     // activeId, old course's sources) — the `activeIdInSources` guard
@@ -329,6 +354,14 @@ function App() {
     }
     setMode("notes");
     setStreaming(true);
+    // review-swarm v2 fix-now #1: drop the saved scroll offset BEFORE
+    // notes streaming begins so the new document mounts at top instead
+    // of restoring an offset into the previous version. Scoped here
+    // (not in a generic `streaming` effect) so quiz/mindmap/report
+    // regenerations don't accidentally wipe the notes scroll cache.
+    if (typeof localStorage !== "undefined") {
+      StudyState.clearNotesScroll(localStorage, activeCourse);
+    }
     setStreamProgress(0);
     setNoteCacheStats(null);
     setGenerationState(StudyState.createGenerationState());
@@ -796,6 +829,7 @@ function App() {
       {/* ========= Library ========= */}
       <Library
         sources={sources}
+        collections={collections}
         activeId={activeId}
         onPick={setActiveId}
         onToggle={(id) => setSources(ss => ss.map(s => s.id === id ? { ...s, checked: !s.checked } : s))}
@@ -1574,6 +1608,16 @@ function RealNotesView({ content, streaming, activeCourse, sources, onContentCha
   const [selMenu, setSelMenu] = React.useState(null); // {x, y, text, before, after}
   const [popover, setPopover] = React.useState(null); // {x, y, hl}
   const previewRef = React.useRef(null);
+  // Outer scrolling container ref. Stays mounted across Edit↔Preview
+  // toggles (the conditional swap happens inside this div), so attaching
+  // the scroll listener here lets us drop `editing` from the listener
+  // effect's dep array and avoid spurious save-on-toggle writes.
+  const rootRef = React.useRef(null);
+  // Mirror `editing` into a ref so the long-lived scroll-save listener
+  // can skip writes while the user is in Edit mode WITHOUT re-attaching
+  // on every editing flip.
+  const editingRef = React.useRef(false);
+  React.useEffect(() => { editingRef.current = editing; }, [editing]);
 
   // Course switch — full reset (clears edit-mode + popovers + restores cached draft).
   React.useEffect(() => {
@@ -1594,6 +1638,18 @@ function RealNotesView({ content, streaming, activeCourse, sources, onContentCha
     if (typeof content === "string") setDraft(content);
   }, [content, streaming, editing]);
 
+  // Stable cache-key for the file-name whitelist passed to extractTOC.
+  // We hash to a string so the TOC effect's identity comparison ignores
+  // unrelated `setSources` updates (checkbox toggle, bulk select, etc.)
+  // that don't change the file names themselves.
+  const fileNamesKey = React.useMemo(() => {
+    if (!Array.isArray(sources)) return "";
+    return sources
+      .map(s => (s && (s.sourceFile || s.title)) || "")
+      .filter(Boolean)
+      .join("\n");
+  }, [sources]);
+
   // Highlights / TOC. During streaming we extract the TOC from the partial
   // LaTeX but DO NOT prune highlights — the partial doesn't contain
   // sections that haven't streamed yet, and pruning would silently delete
@@ -1603,17 +1659,9 @@ function RealNotesView({ content, streaming, activeCourse, sources, onContentCha
   // older content (legacy partial drafts).
   React.useEffect(() => {
     if (!activeCourse) { setHighlights([]); setTocItems([]); return; }
-    // Hand the TOC extractor the course's source filenames so it can
-    // identify which `\section{...}` are file-wrappers (L1 in the tree)
-    // vs in-file section headings (L2). Catches uploads without a known
-    // extension and content where the LLM dropped the extension during
-    // review. Falls back to a filename-extension heuristic when sources
-    // is empty.
-    const fileNames = Array.isArray(sources)
-      ? sources.map(s => (s && (s.sourceFile || s.title)) || null).filter(Boolean)
-      : [];
     let toc;
     if (typeof NanoLatex !== "undefined" && NanoLatex.extractTOC) {
+      const fileNames = fileNamesKey ? fileNamesKey.split("\n") : [];
       toc = NanoLatex.extractTOC(draft, { fileNames });
     } else {
       // Markdown legacy path returns a flat list — wrap into the
@@ -1624,7 +1672,12 @@ function RealNotesView({ content, streaming, activeCourse, sources, onContentCha
     if (streaming) return;
     const result = StudyState.pruneStaleHighlights(localStorage, activeCourse, draft);
     setHighlights(result.kept);
-  }, [activeCourse, draft, streaming, sources]);
+    // review-swarm v2 fix-soon #4: depend on `fileNamesKey` (a stable
+    // string derived via useMemo, below), NOT `sources` (which gets a
+    // new array reference on every setSources — including each Library
+    // checkbox toggle). Toggling 50 sources used to re-walk the LaTeX
+    // 50× even though TOC only cares about filenames, not check state.
+  }, [activeCourse, draft, streaming, fileNamesKey]);
 
   // Re-apply highlights to DOM whenever preview html or highlights change.
   // Skip during streaming — DOM is being rewritten per-token so any wrap is
@@ -1708,7 +1761,12 @@ function RealNotesView({ content, streaming, activeCourse, sources, onContentCha
     if (!activeCourse) return;
     if (editing) return;
     if (streaming) return;
-    const scroller = previewRef.current && previewRef.current.closest(".notes-reader-body");
+    // review-swarm v2 fix-soon #5: scroll listener now anchors on
+    // rootRef (the persistent .notes-reader-body root) instead of
+    // previewRef.current.closest(...). The preview unmounts on Edit
+    // toggle but the root stays — avoids the tear-down/re-attach +
+    // synchronous cleanup-flush each toggle that could write a 0.
+    const scroller = rootRef.current;
     if (!scroller) return;
     const saved = StudyState.loadNotesScroll(localStorage, activeCourse);
     if (saved == null || saved <= 0) return;
@@ -1736,12 +1794,19 @@ function RealNotesView({ content, streaming, activeCourse, sources, onContentCha
     // see the page near the top. Cap attempts to ~20 frames (~330ms).
     let stop = false;
     let attempts = 0;
+    let tailTimer = 0;
     function tryRestore() {
       if (stop) return;
       attempts += 1;
       const maxY = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
       if (maxY >= saved) {
         applyScroll(saved);
+        // review-swarm v2 fix-soon #6: cancel the tail timer so it
+        // doesn't fire applyScroll a second time at t=600ms, which
+        // would otherwise yank the user back to `saved` if they had
+        // already scrolled somewhere else in those 600ms.
+        stop = true;
+        if (tailTimer) clearTimeout(tailTimer);
         return;
       }
       if (attempts < 20) {
@@ -1755,22 +1820,28 @@ function RealNotesView({ content, streaming, activeCourse, sources, onContentCha
     // any large \begin{align} blocks have laid out. If the document
     // still isn't tall enough we clamp via the maxY in applyScroll —
     // the user lands as close as the doc permits, not at the top.
-    const tailTimer = setTimeout(() => {
+    tailTimer = setTimeout(() => {
       if (stop) return;
       applyScroll(saved);
+      stop = true;
     }, 600);
 
     return () => {
       stop = true;
       cancelAnimationFrame(raf);
-      clearTimeout(tailTimer);
+      if (tailTimer) clearTimeout(tailTimer);
     };
-  }, [activeCourse, editing, streaming]);
+  }, [activeCourse, streaming]);
 
   React.useEffect(() => {
     if (!activeCourse) return;
-    if (editing) return;
-    const scroller = previewRef.current && previewRef.current.closest(".notes-reader-body");
+    // fix-soon #5: use the persistent rootRef instead of looking up via
+    // previewRef.closest(). Dropping `editing` from deps means we no
+    // longer re-attach/re-tear-down the listener (and run a synchronous
+    // flush) on every Edit↔Preview toggle. Listener stays attached for
+    // the lifetime of the course; we just gate the save on edit-mode
+    // via the ref below.
+    const scroller = rootRef.current;
     if (!scroller) return;
     // BUG FIX (round 2 of scroll cache): the original throttled-save
     // path queued the localStorage write inside a rAF. When the user
@@ -1789,6 +1860,11 @@ function RealNotesView({ content, streaming, activeCourse, sources, onContentCha
       requestAnimationFrame(() => {
         ticking = false;
         if (detached) return;
+        // Skip saves while the user is in Edit mode — the inner DOM
+        // (CodeMirror) has independent scroll semantics and we don't
+        // want its scrollTop to clobber the preview's saved position
+        // that we want to restore when the user toggles back.
+        if (editingRef.current) return;
         StudyState.saveNotesScroll(localStorage, activeCourse, scroller.scrollTop);
       });
     }
@@ -1798,21 +1874,21 @@ function RealNotesView({ content, streaming, activeCourse, sources, onContentCha
       scroller.removeEventListener("scroll", onScroll);
       // Final flush: capture the user's last position before the
       // component unmounts. isConnected guards against the rare case
-      // where React has already detached the node.
-      if (scroller.isConnected) {
+      // where React has already detached the node. Only flush while in
+      // Preview mode for the same reason as the onScroll guard.
+      if (scroller.isConnected && !editingRef.current) {
         StudyState.saveNotesScroll(localStorage, activeCourse, scroller.scrollTop);
       }
     };
-  }, [activeCourse, editing]);
+  }, [activeCourse]);
 
-  // Regeneration kicks off → drop the saved offset so the freshly
-  // streaming notes mount at top, not at the previous document's
-  // halfway-down position.
-  React.useEffect(() => {
-    if (streaming && activeCourse) {
-      StudyState.clearNotesScroll(localStorage, activeCourse);
-    }
-  }, [streaming, activeCourse]);
+  // review-swarm v2 fix-now #1: the previous implementation cleared the
+  // notes-scroll cache whenever `streaming` flipped true — but `streaming`
+  // is a shared global (also flipped by quiz / mindmap / report / mastery
+  // generations). The bug: read notes → "Generate Quiz" → return to Notes
+  // → notes scroll cache was wiped, user lands at top. Now the clear
+  // happens INSIDE handleGenerateNotes in App, after setStreaming(true)
+  // — guaranteed Notes-only.
 
   function updateDraft(value) {
     setDraft(value);
@@ -2029,7 +2105,7 @@ function RealNotesView({ content, streaming, activeCourse, sources, onContentCha
   );
 
   return (
-    <div className="reader-body notes-reader-body">
+    <div ref={rootRef} className="reader-body notes-reader-body">
       <div className="notes-toolbar">
         <button className="btn ghost" onClick={() => { setEditing(!editing); setSelMenu(null); setPopover(null); }}>{editing ? "Preview" : "Edit"}</button>
         <button className="btn ghost" onClick={downloadLatex} title="下载 .tex 源文件">.tex</button>

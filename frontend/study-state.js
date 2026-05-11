@@ -1003,11 +1003,22 @@
     } catch (e) { return []; }
   }
 
+  // review-swarm v2 fix-soon #11: soft size cap on list-shaped
+  // localStorage payloads. localStorage origin quota is 5-10MB; nothing
+  // in our flow legitimately needs 10k entries. Caps mean a buggy
+  // caller can't fill the quota and break unrelated keys.
+  const MAX_LIST_ENTRIES = 10000;
+
   function saveHiddenCourses(storage, ids) {
     try {
       const list = Array.isArray(ids)
         ? Array.from(new Set(ids.filter(s => typeof s === "string"))).sort()
         : [];
+      if (list.length > MAX_LIST_ENTRIES) {
+        if (typeof console !== "undefined")
+          console.warn("hidden-courses save dropped: list exceeds", MAX_LIST_ENTRIES);
+        return false;
+      }
       storage.setItem(HIDDEN_COURSES_KEY, JSON.stringify(list));
       return true;
     } catch (e) {
@@ -1039,7 +1050,10 @@
 
   function clearHiddenCourses(storage) {
     try { storage.removeItem(HIDDEN_COURSES_KEY); return true; }
-    catch (e) { return false; }
+    catch (e) {
+      if (typeof console !== "undefined") console.warn("hidden-courses clear failed", e);
+      return false;
+    }
   }
 
   // ── Notes scroll-position cache (per-course) ────────────────────────
@@ -1068,13 +1082,19 @@
     try {
       storage.setItem(_notesScrollKey(courseId), String(Math.round(n)));
       return true;
-    } catch (e) { return false; }
+    } catch (e) {
+      if (typeof console !== "undefined") console.warn("notes-scroll save failed", e);
+      return false;
+    }
   }
 
   function clearNotesScroll(storage, courseId) {
     if (!courseId) return false;
     try { storage.removeItem(_notesScrollKey(courseId)); return true; }
-    catch (e) { return false; }
+    catch (e) {
+      if (typeof console !== "undefined") console.warn("notes-scroll clear failed", e);
+      return false;
+    }
   }
 
   // ── Notes TOC collapsed-state (per-course) ──────────────────────────
@@ -1103,9 +1123,17 @@
       const list = Array.isArray(ids)
         ? Array.from(new Set(ids.filter(s => typeof s === "string"))).sort()
         : [];
+      if (list.length > MAX_LIST_ENTRIES) {
+        if (typeof console !== "undefined")
+          console.warn("toc-collapsed save dropped: list exceeds", MAX_LIST_ENTRIES);
+        return false;
+      }
       storage.setItem(_tocCollapsedKey(courseId), JSON.stringify(list));
       return true;
-    } catch (e) { return false; }
+    } catch (e) {
+      if (typeof console !== "undefined") console.warn("toc-collapsed save failed", e);
+      return false;
+    }
   }
 
   function setTocCollapsed(storage, courseId, sectionId, collapsed) {
