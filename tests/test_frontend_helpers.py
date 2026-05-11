@@ -158,6 +158,67 @@ def test_notes_edit_large():
     assert run_node(script).strip() == "ok"
 
 
+# review-swarm fix-all v1 #16: pin the new LaTeX-refactor frontend helpers.
+
+
+def test_build_latex_export_shape():
+    script = textwrap.dedent(
+        """
+        const h = require('./frontend/study-state.js');
+        const exp = h.buildLatexExport('CS182', '\\\\section{Hi}');
+        if (exp.filename !== 'CS182-notes.tex') throw new Error('bad filename: ' + exp.filename);
+        if (!exp.mime.includes('text/x-tex')) throw new Error('bad mime: ' + exp.mime);
+        if (!exp.content.includes('\\\\section{Hi}')) throw new Error('content missing');
+        console.log('ok');
+        """
+    )
+    assert run_node(script).strip() == "ok"
+
+
+def test_build_print_html_self_contained():
+    script = textwrap.dedent(
+        """
+        const h = require('./frontend/study-state.js');
+        const html = h.buildPrintHtml('CS182', '<h2>Hi</h2><div class="thm-box">x</div>');
+        if (!html.includes('katex@0.16.11')) throw new Error('katex assets missing');
+        if (!html.includes('<h2>Hi</h2>')) throw new Error('body missing');
+        if (!html.includes('renderMathInElement')) throw new Error('auto-render bootstrap missing');
+        if (!html.includes('thm-box')) throw new Error('theorem-box css missing');
+        console.log('ok');
+        """
+    )
+    assert run_node(script).strip() == "ok"
+
+
+def test_legacy_markdown_note_draft_discarded_on_first_load():
+    script = textwrap.dedent(
+        """
+        // Silence the one-time discard log so the test output is just 'ok'.
+        console.info = function () {};
+        const h = require('./frontend/study-state.js');
+        const s = h.createMemoryStorage();
+        // Seed the legacy key.
+        s.setItem('nano-nlm:v1:CS182:notes:draft', '# old markdown note');
+        // First load should discard, return empty, set the per-course flag.
+        const loaded = h.loadNoteDraft(s, 'CS182');
+        if (loaded !== '') throw new Error('legacy draft survived: ' + loaded);
+        if (s.getItem('nano-nlm:v1:CS182:notes:draft') !== null) {
+          throw new Error('legacy key not cleared');
+        }
+        if (s.getItem('nano-nlm:v1:CS182:notes-migration-logged') !== '1') {
+          throw new Error('migration flag not set');
+        }
+        // Saving a new LaTeX draft writes to the latex key, leaving the legacy untouched.
+        h.saveNoteDraft(s, 'CS182', '\\\\section{New}');
+        if (s.getItem('nano-nlm:v1:CS182:notes-latex:draft') !== '\\\\section{New}') {
+          throw new Error('new key not written');
+        }
+        console.log('ok');
+        """
+    )
+    assert run_node(script).strip() == "ok"
+
+
 def test_quiz_persistence_happy():
     script = textwrap.dedent(
         """

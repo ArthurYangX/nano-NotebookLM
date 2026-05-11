@@ -1094,11 +1094,50 @@ async def stream_full_course_notes(req: NoteFullCourseRequest):
 # resulting PDF back. tectonic absence → 503. Sanitizer rejection → 422.
 # Subprocess non-zero exit → 422 with log tail. Timeout → 504.
 _TECTONIC_TIMEOUT_SECONDS = 60
+# review-swarm fix-all v1 #2: cap concurrent tectonic processes so a burst
+# of "PDF (compile)" clicks doesn't spawn N processes (each ~300-500 MB RSS).
+# Lazy-init because asyncio.Semaphore needs a running event loop in Py<3.10.
+# Override via NANO_NLM_MAX_TECTONIC_CONCURRENCY env var.
+_TECTONIC_SEMAPHORE: "asyncio.Semaphore | None" = None
+
+
+def _get_tectonic_semaphore() -> "asyncio.Semaphore":
+    import asyncio as _aio
+    global _TECTONIC_SEMAPHORE
+    if _TECTONIC_SEMAPHORE is None:
+        cap = max(1, int(os.environ.get("NANO_NLM_MAX_TECTONIC_CONCURRENCY", "2")))
+        _TECTONIC_SEMAPHORE = _aio.Semaphore(cap)
+    return _TECTONIC_SEMAPHORE
+
+
+def _run_tectonic_blocking(tectonic_path: str, tex_path: Path,
+                            outdir: Path) -> "subprocess.CompletedProcess[bytes] | None":
+    """Run tectonic synchronously (intended for asyncio.to_thread).
+
+    Returns the CompletedProcess on normal exit (any returncode), or None
+    on TimeoutExpired (caller distinguishes via this sentinel rather than
+    re-raising across the thread boundary). Reading the resulting PDF is
+    handled by the caller after thread join.
+    """
+    try:
+        return subprocess.run(
+            [tectonic_path, "-X", "compile",
+             "--outdir", str(outdir),
+             "--keep-logs", str(tex_path)],
+            capture_output=True,
+            timeout=_TECTONIC_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return None
 
 
 @app.post("/api/notes/export/pdf", tags=["skills"],
           summary="Compile a LaTeX note body to PDF via tectonic")
-async def export_note_pdf(req: NotePdfExportRequest):
+async def export_note_pdf(req: NotePdfExportRequest, request: Request):
+    import asyncio as _aio
+    rid = getattr(request.state, "request_id", "?")
+
     if not getattr(app.state, "tectonic_available", False):
         # Surface as JSONResponse rather than HTTPException so the body
         # carries the structured `{error, request_id, detail}` envelope
@@ -1106,6 +1145,7 @@ async def export_note_pdf(req: NotePdfExportRequest):
         return JSONResponse(
             status_code=503,
             content={"error": "tectonic_unavailable",
+                     "request_id": rid,
                      "detail": "tectonic binary not found on the server PATH"},
         )
 
@@ -1114,7 +1154,9 @@ async def export_note_pdf(req: NotePdfExportRequest):
     except LaTeXUnsafeError as exc:
         return JSONResponse(
             status_code=422,
-            content={"error": "latex_unsafe", "reason": exc.reason,
+            content={"error": "latex_unsafe",
+                     "request_id": rid,
+                     "reason": exc.reason,
                      "snippet": exc.snippet},
         )
 
@@ -1125,54 +1167,60 @@ async def export_note_pdf(req: NotePdfExportRequest):
     # subprocess can't leak the dir.
     tectonic_path = app.state.tectonic_path or "tectonic"
 
-    with tempfile.TemporaryDirectory(prefix="nano_nlm_tex_") as tmpdir:
-        tmpdir_path = Path(tmpdir)
-        tex_path = tmpdir_path / "note.tex"
-        tex_path.write_text(document, encoding="utf-8")
-        try:
-            result = subprocess.run(
-                [tectonic_path, "-X", "compile",
-                 "--outdir", str(tmpdir_path),
-                 "--keep-logs", str(tex_path)],
-                capture_output=True,
-                timeout=_TECTONIC_TIMEOUT_SECONDS,
-                check=False,
-            )
-        except subprocess.TimeoutExpired:
-            logger.warning("tectonic compile timed out after %ss for course=%s",
-                           _TECTONIC_TIMEOUT_SECONDS, req.course_id)
-            return JSONResponse(
-                status_code=504,
-                content={"error": "latex_compile_timeout",
-                         "detail": f"compile exceeded {_TECTONIC_TIMEOUT_SECONDS}s"},
-            )
+    # review-swarm fix-all v1 #2: gate the blocking subprocess.run via a
+    # module-level Semaphore so a click-storm can't OOM the host. v1 #3:
+    # run the whole compile + PDF read inside asyncio.to_thread so the
+    # FastAPI event loop stays responsive for chat/mindmap/etc.
+    async with _get_tectonic_semaphore():
+        def _do_compile():
+            with tempfile.TemporaryDirectory(prefix="nano_nlm_tex_") as tmpdir:
+                tmpdir_path = Path(tmpdir)
+                tex_path = tmpdir_path / "note.tex"
+                tex_path.write_text(document, encoding="utf-8")
+                result = _run_tectonic_blocking(tectonic_path, tex_path, tmpdir_path)
+                if result is None:
+                    return ("timeout", None, None)
+                if result.returncode != 0:
+                    log_bytes = (result.stderr or b"") + (result.stdout or b"")
+                    return ("nonzero", result.returncode, log_bytes[-4000:])
+                pdf_path = tmpdir_path / "note.pdf"
+                if not pdf_path.exists():
+                    return ("missing", None, None)
+                return ("ok", None, pdf_path.read_bytes())
 
-        if result.returncode != 0:
-            log_bytes = (result.stderr or b"") + (result.stdout or b"")
-            log_tail = log_bytes[-4000:].decode("utf-8", errors="replace")
-            logger.info("tectonic compile exit=%s course=%s",
-                        result.returncode, req.course_id)
-            return JSONResponse(
-                status_code=422,
-                content={"error": "latex_compile_failed",
-                         "log": log_tail,
-                         "exit_code": result.returncode},
-            )
+        outcome, exit_code, payload = await _aio.to_thread(_do_compile)
 
-        pdf_path = tmpdir_path / "note.pdf"
-        if not pdf_path.exists():
-            logger.warning("tectonic exit=0 but note.pdf missing for course=%s", req.course_id)
-            return JSONResponse(
-                status_code=502,
-                content={"error": "latex_compile_failed",
-                         "detail": "tectonic returned 0 but no PDF was emitted"},
-            )
+    if outcome == "timeout":
+        logger.warning("tectonic compile timed out after %ss for course=%s rid=%s",
+                       _TECTONIC_TIMEOUT_SECONDS, req.course_id, rid)
+        return JSONResponse(
+            status_code=504,
+            content={"error": "latex_compile_timeout",
+                     "request_id": rid,
+                     "detail": f"compile exceeded {_TECTONIC_TIMEOUT_SECONDS}s"},
+        )
+    if outcome == "nonzero":
+        log_tail = (payload or b"").decode("utf-8", errors="replace")
+        logger.info("tectonic compile exit=%s course=%s rid=%s",
+                    exit_code, req.course_id, rid)
+        return JSONResponse(
+            status_code=422,
+            content={"error": "latex_compile_failed",
+                     "request_id": rid,
+                     "log": log_tail,
+                     "exit_code": exit_code},
+        )
+    if outcome == "missing":
+        logger.warning("tectonic exit=0 but note.pdf missing for course=%s rid=%s",
+                       req.course_id, rid)
+        return JSONResponse(
+            status_code=502,
+            content={"error": "latex_compile_failed",
+                     "request_id": rid,
+                     "detail": "tectonic returned 0 but no PDF was emitted"},
+        )
 
-        # Read into memory before the tempdir auto-cleans on `with` exit.
-        # PDFs from a single study note are small (typically <2 MB); avoid
-        # the BackgroundTask song-and-dance of holding the dir open.
-        pdf_bytes = pdf_path.read_bytes()
-
+    pdf_bytes = payload  # type: ignore[assignment]
     session_log.append(req.course_id, "generation",
                        {"kind": "notes-pdf-compile", "bytes": len(pdf_bytes)})
     safe_name = (req.course_id or "note").replace("/", "_").replace("\\", "_")

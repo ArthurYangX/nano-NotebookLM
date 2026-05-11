@@ -56,6 +56,18 @@ def test_note_request_rejects_markdown_format(latex_client):
     assert body.get("error") == "validation_error"
 
 
+@pytest.mark.parametrize("legacy_format", ["text", "html", "MARKDOWN", "tex", ""])
+def test_note_request_rejects_all_legacy_formats(latex_client, legacy_format):
+    """review-swarm fix-all v1 #12: pin that the old enum values
+    ``text`` / ``html`` (plus any other non-"latex" literal) also 422.
+    The Pydantic Literal["latex"] does this implicitly, but a future
+    schema rewrite could silently re-accept without breaking any test."""
+    client, _ = latex_client
+    resp = client.post("/api/notes",
+                       json={"course_id": "testcourse", "format": legacy_format})
+    assert resp.status_code == 422, (legacy_format, resp.text)
+
+
 def test_note_request_accepts_latex_or_default(latex_client, monkeypatch):
     """``format`` field can be omitted (default "latex") or explicitly "latex"."""
     client, server_mod = latex_client

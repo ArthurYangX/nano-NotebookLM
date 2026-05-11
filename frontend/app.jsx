@@ -944,13 +944,27 @@ function CodeMirror6Editor({ value, onChange, language, placeholder }) {
 
   // Sync external value changes (course switch, streaming overwrite) into
   // the editor without losing cursor on no-op updates.
+  //
+  // review-swarm fix-all v1 #8: a full-doc replace via dispatch({changes:
+  // {from:0, to:cur.length, ...}}) collapses the selection to position 0.
+  // When the editor has focus (user mid-type), this yanks the cursor on
+  // every external update — unusable during a streaming regenerate.
+  // Skip the sync entirely when the editor is focused; the user's own
+  // edits are the source of truth in that window. When unfocused, do the
+  // replace and try to preserve the previous selection anchor.
   React.useEffect(() => {
     const view = viewRef.current;
     if (!view) return;
     const cur = view.state.doc.toString();
     if (cur === (value || "")) return;
+    if (view.hasFocus) return; // user is typing — don't yank their cursor
+    const next = String(value || "");
+    const prevAnchor = view.state.selection.main.anchor;
     view.dispatch({
-      changes: { from: 0, to: cur.length, insert: String(value || "") },
+      changes: { from: 0, to: cur.length, insert: next },
+      // Clamp the old anchor into the new doc length so a shorter `next`
+      // doesn't blow up the selection model.
+      selection: { anchor: Math.min(prevAnchor, next.length) },
     });
   }, [value]);
 
@@ -1472,9 +1486,18 @@ function RealNotesView({ content, streaming, activeCourse, onContentChange, gene
   // LaTeX-refactor: render LaTeX → HTML via the latex-to-html shim. Math
   // placeholders are restored to $...$ / $$...$$ inside the HTML; the
   // existing KaTeX renderMath effect (above) sweeps them after mount.
-  const html = (typeof NanoLatex !== "undefined" && NanoLatex.latexToHtml)
-    ? NanoLatex.latexToHtml(draft)
-    : ""; // shim missing → empty preview rather than mangled raw source
+  //
+  // review-swarm fix-all v1 #9: memoise on `draft` so a streaming regenerate
+  // (~10 chunks/s, full-text accumulating in `draft`) doesn't re-run the
+  // 6-pass env-stash regex pipeline + HTML escape every keystroke and
+  // every chunk. KaTeX render is already throttled (`renderMathThrottled`);
+  // pairing useMemo here keeps the React render itself cheap.
+  const html = React.useMemo(
+    () => (typeof NanoLatex !== "undefined" && NanoLatex.latexToHtml)
+      ? NanoLatex.latexToHtml(draft)
+      : "", // shim missing → empty preview rather than mangled raw source
+    [draft]
+  );
 
   return (
     <div className="reader-body notes-reader-body">

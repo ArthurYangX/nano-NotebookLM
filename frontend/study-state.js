@@ -534,12 +534,16 @@
   // LaTeX-refactor: notes now persist as LaTeX source under a new storage
   // key. The old `notes:draft` key holds markdown — rendering it through
   // latex-to-html would show literal `##` / `**`, so we silently discard
-  // on first read. A one-time console.info is emitted (gated by a flag)
-  // for debuggability. The project is pre-user (CLAUDE.md) so this
-  // breaking change carries no real cost.
+  // on first read. A one-time console.info is emitted (per-course) for
+  // debuggability. The project is pre-user (CLAUDE.md) so this breaking
+  // change carries no real cost.
+  //
+  // review-swarm fix-all v1 #11: the flag was global so only the first
+  // migrated course logged. Per-course flag means each course's discard
+  // surfaces in console exactly once.
   const NOTES_DRAFT_KIND = "notes-latex:draft";
   const LEGACY_NOTES_DRAFT_KIND = "notes:draft";
-  const LEGACY_DISCARD_FLAG = `${PREFIX}:_:notes-migration-logged`;
+  const LEGACY_DISCARD_FLAG_KIND = "notes-migration-logged";
 
   function _migrateLegacyNoteDraft(storage, courseId) {
     if (!storage) return;
@@ -547,13 +551,14 @@
       const legacy = storage.getItem(key(courseId, LEGACY_NOTES_DRAFT_KIND));
       if (legacy === null || legacy === "") return;
       storage.removeItem(key(courseId, LEGACY_NOTES_DRAFT_KIND));
-      if (typeof console !== "undefined" && !storage.getItem(LEGACY_DISCARD_FLAG)) {
+      const flagKey = key(courseId, LEGACY_DISCARD_FLAG_KIND);
+      if (typeof console !== "undefined" && !storage.getItem(flagKey)) {
         console.info(
           "[nano-nlm] discarded legacy markdown note draft (course=%s) — " +
-          "the Note format switched to LaTeX. This log only fires once.",
+          "the Note format switched to LaTeX.",
           courseId
         );
-        try { storage.setItem(LEGACY_DISCARD_FLAG, "1"); } catch (e) {}
+        try { storage.setItem(flagKey, "1"); } catch (e) {}
       }
     } catch (e) {
       /* legacy migration is best-effort */

@@ -107,8 +107,14 @@
     var klass = envClassFor(env);
     if (!klass) return null;
     var label = envLabelFor(env);
+    // XSS-hardening (review-swarm fix-all v1 #1b): optionalName comes from
+    // `\begin{theorem}[<...>]` PRE-escape; it's stashed in envBuf before the
+    // Stage-5 HTML escape ever runs, so without explicit escape an attacker
+    // (LLM or user) could ship `\begin{theorem}[<img src=x onerror=...>]`
+    // and the inner HTML would land verbatim in the DOM.
+    var safeName = optionalName ? escapeHtml(optionalName) : "";
     var head = label
-      ? "<b class=\"thm-label\">" + label + (optionalName ? " (" + optionalName + ")" : "") + ".</b> "
+      ? "<b class=\"thm-label\">" + label + (safeName ? " (" + safeName + ")" : "") + ".</b> "
       : "";
     var tail = (env === "proof") ? " <span class=\"qed\">&#9633;</span>" : "";
     return "<div class=\"" + klass + "\">" + head + renderedInner + tail + "</div>";
@@ -206,7 +212,13 @@
       if (env === "itemize") return "<ul>" + renderListInner(inner) + "</ul>";
       if (env === "enumerate") return "<ol>" + renderListInner(inner) + "</ol>";
       if (env === "equation" || env === "align" || env === "align*") {
-        return "<div class=\"math-display\">$$" + inner.trim() + "$$</div>";
+        // XSS-hardening (review-swarm fix-all v1 #1a): equation / align inner
+        // bodies were stashed PRE-escape, so concatenating them raw into
+        // dangerouslySetInnerHTML let `\begin{equation}</div><script>...\end`
+        // execute in the app origin. HTML-escape first; KaTeX auto-render
+        // reads textContent (post-HTML-parse) so `&lt;` round-trips back to
+        // `<` for legitimate math like `$a<b$` — no rendering regression.
+        return "<div class=\"math-display\">$$" + escapeHtml(inner.trim()) + "$$</div>";
       }
       var rendered = renderThmFamily(env, optionalName, renderInnerFragment(inner));
       if (rendered === null) {
@@ -233,6 +245,8 @@
 
   // Extract a TOC from raw LaTeX source. Used by the Notes panel to
   // populate its sidebar before the latex-to-html pass completes.
+  // Returns items with `text` (not `title`) so the consumer matches the
+  // legacy StudyState.extractHeadingTOC shape — NotesTOC reads `it.text`.
   function extractTOC(source) {
     if (!source) return [];
     var items = [];
@@ -241,7 +255,7 @@
     while ((m = re.exec(source)) !== null) {
       items.push({
         level: m[1] === "section" ? 1 : 2,
-        title: m[2],
+        text: m[2],
         id: slugify(m[2]),
       });
     }

@@ -295,6 +295,16 @@ ignores anything outside the macro set above."""
 # path that needs to stitch the LLM body into a compilable document. Keeps
 # document class + theorem env definitions + CJK out of LLM token budget and
 # out of LLM tampering reach.
+#
+# review-swarm fix-all v1:
+#   #4 \providecommand instead of \renewcommand for \cite — article class
+#      doesn't define \cite until a bibliography package loads. \renewcommand
+#      on an undefined macro aborts the compile at the preamble itself.
+#   #5 \IfFontExistsTF fallback chain for the CJK main font. PingFang SC is
+#      macOS-only; Linux tectonic hosts get a "font not found" hard error
+#      on any Chinese content otherwise. Falls back to Noto Sans CJK SC,
+#      Source Han Sans SC, then xeCJK's built-in default. fontspec provides
+#      \IfFontExistsTF (xeCJK loads fontspec).
 NOTE_LATEX_PREAMBLE = r"""\documentclass[12pt,a4paper]{article}
 \usepackage{amsmath}
 \usepackage{amssymb}
@@ -302,13 +312,23 @@ NOTE_LATEX_PREAMBLE = r"""\documentclass[12pt,a4paper]{article}
 \usepackage{xcolor}
 \usepackage[colorlinks=true,linkcolor=blue,citecolor=teal]{hyperref}
 \usepackage{xeCJK}
-\setCJKmainfont{PingFang SC}[AutoFakeBold,AutoFakeSlant]
+\IfFontExistsTF{PingFang SC}{%
+  \setCJKmainfont{PingFang SC}[AutoFakeBold,AutoFakeSlant]%
+}{%
+  \IfFontExistsTF{Noto Sans CJK SC}{%
+    \setCJKmainfont{Noto Sans CJK SC}[AutoFakeBold,AutoFakeSlant]%
+  }{%
+    \IfFontExistsTF{Source Han Sans SC}{%
+      \setCJKmainfont{Source Han Sans SC}[AutoFakeBold,AutoFakeSlant]%
+    }{}%
+  }%
+}
 \newtheorem{theorem}{Theorem}
 \newtheorem{lemma}[theorem]{Lemma}
 \newtheorem{definition}{Definition}
 \newtheorem{example}{Example}
 \newtheorem{remark}{Remark}
-\renewcommand{\cite}[1]{\textsuperscript{\textcolor{teal}{[#1]}}}
+\providecommand{\cite}[1]{\textsuperscript{\textcolor{teal}{[#1]}}}
 \setlength{\parskip}{0.5\baselineskip}
 \setlength{\parindent}{0pt}
 \begin{document}

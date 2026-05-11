@@ -61,14 +61,19 @@ const API = {
     return _post("/search", { query, course_id: courseId, top_k: topK });
   },
 
-  async generateNotes(courseId, topic = null, format = "markdown", { userLang = null } = {}) {
-    const body = { course_id: courseId, topic, format };
+  // review-swarm fix-all v1 #7: backend Note pipeline is LaTeX-only since
+  // R4-6 (NoteRequest.format = Literal["latex"]). Hard-coding "markdown"
+  // here would 422 the request. Drop the param entirely — the field
+  // defaults to "latex" server-side; old callers passing extra positional
+  // args still work since trailing `format` arg is harmless (unused now).
+  async generateNotes(courseId, topic = null, { userLang = null } = {}) {
+    const body = { course_id: courseId, topic };
     if (userLang) body.user_lang = userLang;
     return _post("/notes", body);
   },
 
-  async streamNotes(courseId, topic = null, format = "markdown", onEvent = null, { userLang = null } = {}) {
-    const body = { course_id: courseId, topic, format };
+  async streamNotes(courseId, topic = null, onEvent = null, { userLang = null } = {}) {
+    const body = { course_id: courseId, topic };
     if (userLang) body.user_lang = userLang;
     return _stream("/notes/stream", body, onEvent);
   },

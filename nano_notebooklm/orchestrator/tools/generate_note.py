@@ -10,11 +10,14 @@ Usage:
 - Call this only when the user explicitly asks for a "note", "study note", "summary doc", "笔记". For short answers, just answer in your text response after `search_kb` — do NOT call this speculatively.
 - `course_id` is required.
 - `topic` narrows the note to a single concept. Omit to generate a full-course overview note (slow; only when explicitly requested).
-- `format` is "markdown" (default) or "latex". Pick latex when the user mentions LaTeX or math-heavy content.
-- This is a side-effecting tool: it writes a file under artifacts/courses/<course>/notes/. Returns {output_path, format, topic, sources_used}.
+- Output is always LaTeX (.tex file under artifacts/courses/<course>/notes/). Returns {output_path, format, topic, sources_used}.
 - Generation takes 5–15 s. After it returns, summarize for the user what was generated and where it was saved — don't paste the entire note body.
 """
 
+# review-swarm fix-all v1 #6: dropped `format` parameter. The Note pipeline
+# is LaTeX-only since the R4-6 refactor; advertising a `markdown` option
+# made the agent loop request markdown but receive a .tex file labelled
+# `format: "latex"` — opaque contract drift in tool result vs tool schema.
 PARAMETERS = {
     "type": "object",
     "properties": {
@@ -25,11 +28,6 @@ PARAMETERS = {
         "topic": {
             "type": "string",
             "description": "Optional focused topic. Omit for a full-course note.",
-        },
-        "format": {
-            "type": "string",
-            "enum": ["markdown", "latex"],
-            "description": "Output format. Default: markdown.",
         },
     },
     "required": ["course_id"],
@@ -57,7 +55,8 @@ def build_generate_note(orchestrator, lock_course_id: str | None = None) -> Tool
         params = {
             "course_id": clean_course,
             "topic": args.get("topic"),
-            "format": args.get("format") or "markdown",
+            # LaTeX-only — `format` is no longer in the tool schema.
+            "format": "latex",
         }
         result = await orchestrator.run_skill("note_generator", params)
         if not result.success:

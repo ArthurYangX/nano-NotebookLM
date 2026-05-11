@@ -200,3 +200,102 @@ def test_status_endpoint_exposes_tectonic_flag(pdf_client):
     _set_tectonic(server_mod, available=False)
     body = client.get("/api/status").json()
     assert body["tectonic_available"] is False
+
+
+# ── review-swarm fix-all v1 #13: PDF endpoint coverage gaps ──────────
+
+
+def test_oversized_latex_source_rejected_by_sanitizer(pdf_client):
+    """Sanitizer's 80 KB cap fires before subprocess; verify endpoint
+    surfaces it as 422 latex_unsafe with no tectonic spawn."""
+    client, server_mod = pdf_client
+    _set_tectonic(server_mod, available=True)
+    huge = "x" * (90 * 1024) + r"\section{Hi}"
+    with patch("api.server.subprocess.run") as run_mock:
+        resp = client.post("/api/notes/export/pdf", json={
+            "course_id": "testcourse",
+            "latex_source": huge,
+        })
+    assert resp.status_code == 422
+    body = resp.json()
+    assert body["error"] == "latex_unsafe"
+    assert "exceeds" in body["reason"].lower() or "byte" in body["reason"].lower()
+    run_mock.assert_not_called()
+
+
+def test_cjk_source_passes_sanitizer_and_compiles(pdf_client):
+    """Pure-Chinese source body must traverse the sanitizer (no forbidden
+    commands triggered) and reach tectonic. Real font availability is not
+    tested here — that requires a real tectonic run. We assert the
+    request flows end-to-end via the mocked subprocess.run."""
+    client, server_mod = pdf_client
+    _set_tectonic(server_mod, available=True)
+
+    fake_pdf = b"%PDF-1.4 cjk test\n%%EOF\n"
+
+    def fake_run(cmd, *args, **kwargs):
+        outdir = Path(cmd[cmd.index("--outdir") + 1])
+        (outdir / "note.pdf").write_bytes(fake_pdf)
+        # Verify the document the sanitizer let through actually contains
+        # the Chinese characters (i.e. xeCJK preamble + body wrote out).
+        tex_content = (outdir / "note.tex").read_text(encoding="utf-8")
+        assert "第一章" in tex_content
+        return subprocess.CompletedProcess(
+            args=cmd, returncode=0, stdout=b"", stderr=b"",
+        )
+
+    body = (
+        r"\section{第一章 导论}" "\n"
+        r"\begin{definition}[卷积神经网络]"
+        r"卷积神经网络（CNN）使用 $k \times k$ 卷积核提取空间特征。"
+        r"\end{definition}"
+    )
+    with patch("api.server.subprocess.run", side_effect=fake_run):
+        resp = client.post("/api/notes/export/pdf", json={
+            "course_id": "testcourse",
+            "latex_source": body,
+        })
+
+    assert resp.status_code == 200
+    assert resp.content == fake_pdf
+
+
+def test_get_method_rejected(pdf_client):
+    """The endpoint is POST-only — GET should return 405 (FastAPI default
+    for an unallowed method on a defined path)."""
+    client, server_mod = pdf_client
+    _set_tectonic(server_mod, available=True)
+    resp = client.get("/api/notes/export/pdf")
+    assert resp.status_code == 405
+
+
+def test_error_responses_carry_request_id(pdf_client):
+    """review-swarm fix-all v1 #14: every PDF-export JSONResponse error
+    body must include `request_id` so operators can cross-correlate
+    with the access log."""
+    client, server_mod = pdf_client
+
+    # 503 tectonic missing
+    _set_tectonic(server_mod, available=False)
+    body = client.post("/api/notes/export/pdf", json={
+        "course_id": "testcourse",
+        "latex_source": r"\section{Hi}",
+    }).json()
+    assert "request_id" in body
+
+    # 422 sanitizer reject
+    _set_tectonic(server_mod, available=True)
+    body = client.post("/api/notes/export/pdf", json={
+        "course_id": "testcourse",
+        "latex_source": r"\input{/etc/passwd}",
+    }).json()
+    assert "request_id" in body
+
+    # 504 timeout
+    with patch("api.server.subprocess.run",
+               side_effect=subprocess.TimeoutExpired(cmd=["t"], timeout=60)):
+        body = client.post("/api/notes/export/pdf", json={
+            "course_id": "testcourse",
+            "latex_source": r"\section{Hi}",
+        }).json()
+    assert "request_id" in body
