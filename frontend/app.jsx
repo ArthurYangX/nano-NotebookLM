@@ -88,6 +88,11 @@ function App() {
       : "user"
   );
 
+  // fix-all v1 #A6: retry button needs to re-run the last upload. We
+  // can't pass a closure through processing state (function identity
+  // breaks; React DevTools complains; gc'd on rerender). Use a ref.
+  const retryRef = useRef(null);
+
   // ── Load courses on mount ──
   useEffect(() => {
     API.getCourses(courseModeRef.current).then(data => {
@@ -317,14 +322,11 @@ function App() {
     );
     if (!courseName) return;
 
-    const input = document.createElement("input");
-    input.type = "file";
-    input.multiple = true;
-    input.accept = ".pdf,.pptx,.docx,.md,.txt";
-    input.onchange = async (e) => {
-      const files = e.target.files;
-      if (!files.length) return;
-
+    // fix-all v1 #A6: capture files in a closure so the retry button can
+    // actually re-invoke the upload with the same payload (previously
+    // onRetry={setProcessing(null)} only dismissed the modal — user
+    // had to re-pick files manually).
+    const runUpload = async (files) => {
       setUploading({ name: files[0].name + (files.length > 1 ? ` (+${files.length - 1})` : ""), pct: 0 });
       let pct = 0;
       const iv = setInterval(() => {
@@ -334,9 +336,6 @@ function App() {
       }, 200);
 
       try {
-        // R4-2: NDJSON-streamed upload. Each `stage` event ticks the
-        // matching progress bar; `done` flips the row to ✓; `error`
-        // surfaces a retry button.
         setProcessing({
           file: files[0].name,
           step: 0,
@@ -344,6 +343,7 @@ function App() {
           errorStage: null,
           errorMsg: null,
           done: false,
+          retryPayload: files,
         });
         const final = await API.uploadFiles(courseName, files, (ev) => {
           if (!ev) return;
@@ -360,18 +360,39 @@ function App() {
         });
         clearInterval(iv);
         setUploading(null);
-        if (final && final.type === "error") {
-          // Stay on processing screen so user sees the error + retry.
-          return;
-        }
-        const data = await API.getCourses(courseModeRef.current);
-        setCourses(data.courses || []);
-        setActiveCourse(courseName);
+        // fix-all v1 #A7: even on error, refresh courses so the
+        // partially-ingested course (chunks landed before KG failed) is
+        // visible in the dropdown — the test
+        // `test_upload_stream_extractor_failure_emits_error_event` proves
+        // chunks survive the extractor crash, but without this refresh
+        // the user could never reach them.
+        try {
+          const data = await API.getCourses(courseModeRef.current);
+          setCourses(data.courses || []);
+          if (!final || final.type !== "error") {
+            setActiveCourse(courseName);
+          }
+        } catch { /* best-effort refresh */ }
       } catch (err) {
         clearInterval(iv);
         setUploading(null);
         setProcessing(p => p ? { ...p, errorStage: "transport", errorMsg: err.message } : null);
       }
+    };
+
+    // Expose runUpload to the Processing render via retryRef so the
+    // retry button re-invokes the upload with the original `files`
+    // captured in this closure (preserves courseName too).
+    retryRef.current = runUpload;
+
+    const input = document.createElement("input");
+    input.type = "file";
+    input.multiple = true;
+    input.accept = ".pdf,.pptx,.docx,.md,.txt";
+    input.onchange = (e) => {
+      const files = e.target.files;
+      if (!files.length) return;
+      runUpload(files);
     };
     input.click();
   }
@@ -559,7 +580,17 @@ function App() {
               errorStage={processing.errorStage}
               errorMsg={processing.errorMsg}
               done={processing.done}
-              onRetry={() => setProcessing(null)}
+              onRetry={() => {
+                // fix-all v1 #A6: re-invoke upload with the SAME files
+                // captured at onStartUpload time. Falls back to closing
+                // the modal if the retry handler isn't wired (e.g. page
+                // reload between original click and retry).
+                if (retryRef.current && processing.retryPayload) {
+                  retryRef.current(processing.retryPayload);
+                } else {
+                  setProcessing(null);
+                }
+              }}
             />
           )}
           {effectiveMode === "skills" && (

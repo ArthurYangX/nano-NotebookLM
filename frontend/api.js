@@ -132,9 +132,19 @@ const API = {
       body: formData,
     });
     if (!res.ok) {
-      const err = new Error(`HTTP ${res.status}`);
+      // fix-all v1 #A8: parity with _request — surface server's
+      // {error, detail} envelope into err.message so the UI shows
+      // "File 'foo.exe' exceeds 50MB limit" not bare "HTTP 413".
+      let detail = null;
+      let body = null;
+      try {
+        body = await res.json();
+        detail = body.detail || body.error || null;
+      } catch { /* non-JSON body */ }
+      const err = new Error(detail || `HTTP ${res.status}`);
       err.status = res.status;
-      try { err.body = await res.json(); } catch { /* non-JSON */ }
+      err.body = body;
+      err.requestId = res.headers.get("x-request-id") || null;
       throw err;
     }
     if (!res.body || !window.TextDecoder) {

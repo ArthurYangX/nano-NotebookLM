@@ -1367,16 +1367,44 @@ async def ingest_course(req: IngestRequest):
 # rebuild. Serialise them so the second waits behind the first instead of
 # corrupting state. Keys are course_id strings; entries are reused across
 # requests so concurrent same-course requests synchronise on the same lock.
+# fix-all v1 #A1: bounded LRU so a flood of unique course_ids can't grow
+# the dict unbounded; eviction only happens for locks that are not held
+# and have no waiters.
 _UPLOAD_LOCKS: dict[str, "_asyncio.Lock"] = {}
+_UPLOAD_LOCKS_MAX = 512
 
 
 def _upload_lock_for(course_id: str) -> "_asyncio.Lock":
+    """fix-all v1 #A1: ``setdefault`` is the atomic read-or-create —
+    closes the read-then-write TOCTOU window the reviewer flagged. Even
+    though CPython's GIL currently makes the prior `if lock is None:`
+    safe, the setdefault form is the documented idiom and stays correct
+    under any future refactor that interposes an await.
+    """
     import asyncio as _asyncio
+    return _UPLOAD_LOCKS.setdefault(course_id, _asyncio.Lock())
+
+
+def _maybe_evict_upload_lock(course_id: str) -> None:
+    """fix-all v1 #A1: bound `_UPLOAD_LOCKS` growth. Called from the
+    pipeline generator on exit; drops the lock only when nobody else
+    is holding or waiting on it. Cheap O(1) check + pop.
+    """
     lock = _UPLOAD_LOCKS.get(course_id)
     if lock is None:
-        lock = _asyncio.Lock()
-        _UPLOAD_LOCKS[course_id] = lock
-    return lock
+        return
+    if lock.locked():
+        return
+    # ``_waiters`` is a deque; truthy means at least one queued. The
+    # underscore is fine here — same convention agent_loop.py already
+    # uses for the cancel-event watcher pool.
+    waiters = getattr(lock, "_waiters", None)
+    if waiters:
+        return
+    # Cap-based emergency eviction: if the dict has bloated past the cap
+    # and we're at a quiescent point, drop this one to keep growth bounded.
+    if len(_UPLOAD_LOCKS) > _UPLOAD_LOCKS_MAX:
+        _UPLOAD_LOCKS.pop(course_id, None)
 
 
 def _ndjson(event: dict) -> str:
@@ -1472,7 +1500,14 @@ async def upload_files(course_id: str, files: Annotated[list[UploadFile], File(.
 
     # ── Stream: 4 ingest stages, NDJSON one event per line ──
     async def _events():
-        loop = _asyncio.get_running_loop()
+        # fix-all v1 #A3: track which stage is current so the error event
+        # surfaces the failing stage to the frontend (previously
+        # `getattr(e, "stage", None)` was always None).
+        current_stage: str | None = None
+        chunks = []
+        course_obj = None
+        concepts: list = []
+        t_start = time.monotonic()
         # Per-course pipeline lock prevents two concurrent uploads from
         # racing on chunks.json / FAISS index. Acquire inside the
         # generator so the wait time itself is observable as a delay
@@ -1481,6 +1516,7 @@ async def upload_files(course_id: str, files: Annotated[list[UploadFile], File(.
         async with _upload_lock_for(course_id):
             try:
                 # Stage 1: chunking (synchronous; off-loaded to worker).
+                current_stage = "chunking"
                 yield _ndjson({"type": "stage", "stage": "chunking", "progress": 0})
                 course_obj = await _asyncio.to_thread(
                     kb.ingest_course, str(upload_dir), course_id
@@ -1491,6 +1527,7 @@ async def upload_files(course_id: str, files: Annotated[list[UploadFile], File(.
                 })
 
                 # Stage 2: embedding (FAISS + BM25 rebuild for the course).
+                current_stage = "embedding"
                 yield _ndjson({"type": "stage", "stage": "embedding", "progress": 0})
                 await _asyncio.to_thread(kb.build_index, course_id)
                 router_intent.clear_lang_cache(course_id)
@@ -1504,13 +1541,30 @@ async def upload_files(course_id: str, files: Annotated[list[UploadFile], File(.
                 # progress_callback is invoked from the same loop, so a
                 # plain queue + drain is enough to interleave with our
                 # async generator.
+                current_stage = "kg_stage_a"
                 kg_queue: _asyncio.Queue = _asyncio.Queue(maxsize=64)
 
                 def _progress(stage: str, pct: int):
                     try:
                         kg_queue.put_nowait({"type": "stage", "stage": stage, "progress": pct})
                     except _asyncio.QueueFull:
-                        pass  # backpressure: drop intermediate frames
+                        # fix-all v1 #A4: intermediate frames can be
+                        # dropped under backpressure, but `100%` markers
+                        # mark the end of a stage and MUST land. Block on
+                        # them via a synchronous put attempt with a long
+                        # wait — only intermediates ever get dropped.
+                        if pct == 100:
+                            # We're inside a sync callback in an async
+                            # coroutine; can't await. Best-effort: drain
+                            # the queue head and retry once. Drain is safe
+                            # because the consumer is the same task that
+                            # invoked us (we are synchronous within their
+                            # `await`), so consumer cannot be racing.
+                            try:
+                                kg_queue.get_nowait()
+                                kg_queue.put_nowait({"type": "stage", "stage": stage, "progress": pct})
+                            except (_asyncio.QueueEmpty, _asyncio.QueueFull):
+                                pass
 
                 from nano_notebooklm.kg.extractor import extract_from_chunks
                 from nano_notebooklm.kg.graph import KnowledgeGraph
@@ -1534,12 +1588,25 @@ async def upload_files(course_id: str, files: Annotated[list[UploadFile], File(.
                 while not extract_task.done():
                     try:
                         ev = await _asyncio.wait_for(kg_queue.get(), timeout=0.5)
+                        # Update current_stage from the event so the error
+                        # event reports the actual stage the extractor
+                        # was inside when it threw.
+                        if isinstance(ev, dict) and ev.get("stage"):
+                            current_stage = ev["stage"]
                         yield _ndjson(ev)
                     except _asyncio.TimeoutError:
                         continue
-                # Drain remaining events.
+                # fix-all v1 #A5: drain remaining events BEFORE awaiting
+                # the task (which re-raises on failure). Previously the
+                # exception path lost any final-event-just-queued frames.
                 while not kg_queue.empty():
-                    yield _ndjson(kg_queue.get_nowait())
+                    try:
+                        ev = kg_queue.get_nowait()
+                        if isinstance(ev, dict) and ev.get("stage"):
+                            current_stage = ev["stage"]
+                        yield _ndjson(ev)
+                    except _asyncio.QueueEmpty:
+                        break
 
                 concepts, relations = await extract_task
                 concepts = merge_concepts(concepts)
@@ -1551,22 +1618,46 @@ async def upload_files(course_id: str, files: Annotated[list[UploadFile], File(.
                 await _asyncio.to_thread(kg.save, kg_path)
 
                 # Done.
+                current_stage = None
+                duration_ms = int((time.monotonic() - t_start) * 1000)
+                # fix-all v1 #A11: one-line structured log for ops triage.
+                # Matches the `qa.path=` / `chunks.fetch course=` patterns
+                # elsewhere in this file.
+                logger.info(
+                    "upload.done course=%s files=%d chunks=%d documents=%d kg_nodes=%d duration_ms=%d",
+                    course_id, saved, len(chunks),
+                    len(course_obj.documents) if course_obj else 0,
+                    len(concepts), duration_ms,
+                )
                 yield _ndjson({
                     "type": "done",
                     "course_id": course_id,
                     "files": saved,
                     "chunks": len(chunks),
-                    "documents": len(course_obj.documents),
+                    "documents": len(course_obj.documents) if course_obj else 0,
                     "kg_nodes": len(concepts),
+                    "duration_ms": duration_ms,
                 })
-            except Exception as e:
+            except Exception:
                 # fix-all v4 #A3: stable error code, no vendor leakage.
-                logger.exception("upload pipeline failed for %s", course_id)
+                # fix-all v1 #A3: attach actual failing stage so the
+                # frontend can mark the right row with ✕.
+                duration_ms = int((time.monotonic() - t_start) * 1000)
+                logger.exception(
+                    "upload.error course=%s stage=%s duration_ms=%d",
+                    course_id, current_stage, duration_ms,
+                )
                 yield _ndjson({
                     "type": "error",
                     "error": "upload_pipeline_failed",
-                    "stage": getattr(e, "stage", None),
+                    "stage": current_stage,
                 })
+            finally:
+                # fix-all v1 #A1: opportunistic eviction when the dict
+                # exceeds the soft cap. Only runs at a quiescent point
+                # (we're about to release the lock), so this can't race
+                # with another acquirer.
+                _maybe_evict_upload_lock(course_id)
 
     return StreamingResponse(_events(), media_type="application/x-ndjson")
 

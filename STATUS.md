@@ -246,24 +246,52 @@
 - **mini-test**: `test_upload_stream_emits_four_stages` / `test_upload_stream_progress_monotonic_per_stage` / `test_processing_jsx_renders_stage_progress_grep` / `test_api_js_upload_files_supports_on_event`
 - **corner-test**: `test_upload_stream_rejects_unsupported_suffix`（pre-stream 400） / `test_upload_stream_rejects_dotdot_course_id`（pre-stream 400 — `foo..bar`） / `test_upload_stream_extractor_failure_emits_error_event`（KG 失败 → NDJSON error + `error="upload_pipeline_failed"` 不泄漏 vendor 字符串 + 已落盘 chunks 仍可见） / `test_upload_stream_concurrent_same_course_serializes` / `test_extract_from_chunks_signature_accepts_progress_callback`
 - **pytest**: **597 passed in 401s**（v4 baseline 580 + R4-1 8 条 + R4-2 9 条 = 597，零 regression）
-- **self-check**: ☑ mini  ☑ corner（5 类全覆盖：非法格式 / 上游失败 / 数据缺失 / 兼容 / 前端契约）  ☑ no regression  ☑ offline（fake_embed_fn + monkeypatch extractor）  ☐ 浏览器实测：reviewer 真上传一个 PDF/MD 看 4 段进度条（用户提供的 `test-pdf/lecture_8.pdf` 122 页 1.3MB 作 fixture）
+- **self-check**: ☑ mini  ☑ corner（5 类全覆盖：非法格式 / 上游失败 / 数据缺失 / 兼容 / 前端契约）  ☑ no regression  ☑ offline（fake_embed_fn + monkeypatch extractor）  ☑ 实测：`curl -sN -X POST -F "files=@test-pdf/lecture_8.pdf" /api/upload/Lecture8Test` 端到端通过 — chunking 0→100% / embedding 0→100% (116 chunks) / kg_stage_a 0→100% / kg_stage_b 0→16→33→50→66→83→99→100% / done(files=1, chunks=116, documents=1, kg_nodes=110)；artifacts/courses/Lecture8Test/{chunks.json, course_meta.json, knowledge_graph.json} 全部正常落盘。
+- **实测发现**（不阻塞 R4-2 落 [x]，R4-1 物理删预置后回归）：(a) embedding 阶段花了 7 分钟（v3 #C7 全局 index rebuild over 15498 preset chunks），预置课物理删后会回到 ~30s-1min；(b) Stage A 因 15s timeout 落到 fallback 但 progress_callback 仍触发 kg_stage_a 100%——NDJSON 契约不破，只是日志里有一条 WARNING，考虑 R4-4 之后调高 Stage A timeout 或往 done 事件加 `kg_fallback: true` flag。
 - **review_notes**: **breaking change**：端点响应从 JSON 变 NDJSON。仓库内只有 `frontend/app.jsx` 一处调用面，已同步切换；`uploadFiles` 仍接受老的 2-arg 签名（不传 onEvent），返回最后一个 NDJSON 事件（仍含 `chunks` / `documents` / `kg_nodes`）作为兼容。后端 Stage A 失败 fallback 路径不会触发 kg_stage_b 100%——这是 fallback 不走 batched extraction 的已知缝隙，不影响 done/error 终态。**无新依赖**。
 - **conflict notes**: 与 R4-3（codex 锁中）零冲突（纯前端 vs 主要后端）。与 R4-4/R4-5 在 `api/server.py` 上：R4-2 占 `_UPLOAD_LOCKS` / `_save_uploaded_file` / `upload_files` block；R4-4 占 `/api/chat` 主体；R4-5 占 `ChatRequest` 模型 + `/api/status`；物理隔离。
 
-### #R4-3 思维导图换成知识图谱视图（force-directed + relation labels）— [codex]
+#### R4-2 review-swarm v1 + fix-all v1（2026-05-11 00:00）
+
+4 路 review-swarm（intent/regression / security / perf-reliability / contracts-coverage）共 ~22 项 finding。fix-now 12 项（HIGH + key MEDIUM）已落地，13 条新增回归测试钉死每项 fix。其余 MEDIUM / LOW 留 fix-soon / optional。
+
+**fix-now（12 项）**：
+- **A1 `_upload_lock_for` TOCTOU + DoS 双修**：`setdefault` 一行替代 read-then-write；`_maybe_evict_upload_lock` 在 finally 里 opportunistic drop quiescent lock（`not locked()` 且 `not _waiters`）+ 软上限 `_UPLOAD_LOCKS_MAX = 512`。reviewer F1 + F2 关闭。
+- **A3 error event `stage` 真实归属**：`current_stage` 局部变量贯穿 4 阶段；exception 路径 `stage=current_stage` 替代永远 None 的 `getattr(e, "stage", None)`。
+- **A4 终态 100% 不被 `QueueFull` 吞**：`_progress(pct=100)` 失败时 drain head + 重试 put。
+- **A5 drain queue BEFORE re-raise**：reraise 前清空 queue + 更新 current_stage，exception 路径不再丢事件。
+- **A6 retry 按钮真 retry**：`retryRef = useRef` 持有 `runUpload`；`processing.retryPayload` 持有原 files；onRetry 重调闭包。
+- **A7 error 路径仍刷 courses**：partial-ingestion 的课程在 dropdown 可见。
+- **A8 uploadFiles error envelope 带 detail**：解析 `body.detail || body.error` 进 `err.message`；附加 `err.requestId`。
+- **A9 STAGE_NAMES 单一来源**：`extractor.py` export `UPLOAD_STAGES` tuple + `KG_STAGE_A/B` Final + `UploadStage` Literal；内部回调全部用常量。
+- **A10 progress_callback 异常不杀 pipeline**：`_emit` 包 try/except + `logger.warning`。
+- **A11 `upload.done` / `upload.error` 结构化日志 + `duration_ms` 透传**：one-line 日志 `course= files= chunks= kg_nodes= stage= duration_ms=`，匹配 `qa.path=` 风格。
+- **A12 CLAUDE.md Maturity Notes 更新**：append "Round 4 R4-1 + R4-2 (2026-05-10)" 段描述完整契约。
+
+**fix-soon（下次 review-swarm 后处理）**：R3 F1 client disconnect 取消 + R2 F3 slow-loris timeout + R3 F3 `kb.build_index` 全局重建（架构性，等 R4-4）+ R4 C1 OpenAPI Pydantic 模型 + R4 C4 覆盖率缺口（50MB cap / zip-bomb / fallback / kg_nodes / saved==0）+ R4 C5 真异步并发测试。
+
+**optional**：R3 F6 Stage A 心跳 + R3 F7 queued 事件 + R1 #7 空 corpus done + R2 F6 dest.unlink 同租户（pre-v3 #H2 遗留）。
+
+**files touched**: api/server.py / nano_notebooklm/kg/extractor.py / frontend/api.js / frontend/app.jsx / CLAUDE.md + **新增** tests/test_r4_2_fix_all_v1.py（13 条回归）。**pytest**: **617 passed in 436s**（v4 580 + R4-1 8 + R4-2 9 + R4-3 codex 新增 + fix-all v1 13 = 617，零 regression）。
+
+### #R4-3 思维导图换成知识图谱视图（force-directed + relation labels）— [review]
 
 - **goal ref**: GOAL.md Round 4 #R4-3
-- **status**: [codex]  ← 2026-05-10 23:30 释放给 codex（纯前端、零 server.py 冲突，最适合并行）
+- **status**: [review]  ← 2026-05-10 23:30 释放给 codex（纯前端、零 server.py 冲突，最适合并行）
 - **owner**: codex
 - **claimed_at**: 2026-05-10 23:27
-- **files (planned)**:
-  - `frontend/index.html`：CDN script 加 d3-force（`<script src="https://cdn.jsdelivr.net/npm/d3-force@3"></script>`）
+- **submitted_at**: 2026-05-11 00:04
+- **files**:
+  - `frontend/index.html`：CDN script 加 `d3-dispatch` / `d3-quadtree` / `d3-timer` / `d3-force`（force UMD 依赖按顺序加载）
   - `frontend/study-state.js`：保留 `prepareMindmap` 重命名为 `prepareMindmapTree`（向后兼容 + R3-3 测试）；新增 `prepareMindmapForce(graph)` 返回 `{nodes, links}` 喂 d3
   - `frontend/mindmap.jsx`：layout 部分改用 d3.forceSimulation；保留 R3-3 全部编辑 affordance（dblclick / N / Del / shift-drag / alt-click NodeDeepDivePanel）；toolbar 加 relation filter checkbox
-  - `frontend/styles.css`：新增 `.kg-edge-part-of` / `.kg-edge-prereq` / `.kg-edge-depends` 边样式
+  - `frontend/styles.css`：文件末尾追加 `.kg-edge-part-of` / `.kg-edge-prereq` / `.kg-edge-depends` / `.kg-edge-related` 边样式 + filter chip 样式
   - **新增** `tests/test_mindmap_force_layout.py`
-- **mini-test**: `test_mindmap_jsx_uses_force_layout_grep` / `test_prepare_mindmap_force_returns_node_link_shape` / `test_relation_filter_chip_grep`
-- **corner-test**: `test_prepare_mindmap_force_handles_100_nodes` / `test_relation_filter_zero_edges_renders_isolated_nodes` / `test_r3_3_edit_affordances_still_grepable`（dblclick / N / Del / shift+drag 在新 layout 下仍能触发 commitOps）
+- **mini-test**: `test_prepare_mindmap_force_returns_node_link_shape` / `test_mindmap_jsx_uses_force_layout_grep` / `test_index_html_loads_d3_force_cdn` / `test_styles_append_kg_edge_rules`
+- **corner-test**: `test_prepare_mindmap_force_handles_100_nodes` / `test_prepare_mindmap_force_keeps_cross_relations_out_of_parent_tree` / `test_relation_filter_zero_edges_renders_isolated_nodes` / `test_force_view_visibility_starts_from_all_nodes` / `test_r3_3_edit_affordances_still_grepable`（dblclick / N / Del / shift+drag / alt+click 在新 layout 下仍保留 commitOps + NodeDeepDivePanel 路径）
+- **pytest**: `.venv/bin/python -m pytest -q tests/test_mindmap_force_layout.py tests/test_mindmap_layout.py tests/test_frontend_helpers.py tests/test_mindmap_payload.py` **54 passed in 2.18s**。`node -c frontend/study-state.js` + `.venv/bin/python -m py_compile tests/test_mindmap_force_layout.py` + `git diff --check` 通过。
+- **self-check**: ☑ mini  ☑ corner（5 类覆盖：大图 100+ 节点 / cross relation 不污染 collapse tree / relation filter 空边 / R3-3 编辑 affordance 回归 / CDN + 样式契约）  ☑ no regression（focused mindmap/frontend 54 条通过）  ☑ offline（Node + grep + FastAPI helper import，无真实 LLM/网络）  ☐ 浏览器实测：当前沙箱外网 CDN 被 `ERR_PROXY_CONNECTION_FAILED` 拦截（Google Fonts + jsDelivr d3 脚本），无法完成真实浏览器组件挂载；代码已加 d3-unavailable fallback，reviewer 在有 CDN 的环境再验 shift+drag / alt+click。
+- **review_notes**: 实现只改 R4-3 允许的前端文件；未碰 `app.jsx` / `api.js` / `api/server.py` / upload 链路。`prepareMindmap` 保留为兼容别名，旧 M2/M3 测试继续走通；新 `prepareMindmapForce` 只产稳定初始 node-link shape，d3 simulation 在 React effect 里异步 tick。若 d3 CDN 加载失败，界面退化为静态 node-link 初始位置，不空白。
 - **conflict notes**: 纯前端任务，与 R4-2/R4-4/R4-5 都不冲突。**R4-3 owner（codex）只许动**：(a) `frontend/index.html`（追加 d3-force CDN script 标签）；(b) `frontend/study-state.js` 的 **`prepareMindmap` 函数及其测试**（rename 为 `prepareMindmapTree` + 新增 `prepareMindmapForce`），**不许动**文件末尾的 user-lang helpers / saveUserLang / loadUserLang；(c) `frontend/mindmap.jsx` **整个**文件（layout 重写自由，但必须保留 R3-3 的 NodeDeepDivePanel + commitOps + KGEdit popup 等编辑接口）；(d) `frontend/styles.css` **新增**末尾 `.kg-edge-*` 段（不动任何已有 selector）；(e) **新建** `tests/test_mindmap_force_layout.py`。
   - **不许动**：app.jsx / api.js / api/server.py / 任何后端 / processing.jsx / upload 链路 / qa_skill / router_intent。
   - **特别注意**：R3-3 的 explain-node 端点 + alt+click → NodeDeepDivePanel 链路必须保留，新 layout 下点击事件重接到 d3 selection.on("click")。dblclick 编辑 / N 加子 / Del 删 / shift+drag 连边的 commitOps 路径**完整保留**。

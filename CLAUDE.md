@@ -31,9 +31,9 @@ api/server.py      FastAPI backend — REST API + static file serving
   ├── /api/report         Course report generation
   ├── /api/mindmap/{id}        Two-stage KG extraction + user-edit overlay
   ├── /api/mindmap/{id}/edit   Apply student ops (add/update/delete/connect)
-  ├── /api/upload/{id}    File upload + indexing (50MB cap, whitelisted suffixes)
+  ├── /api/upload/{id}    File upload + 4-stage NDJSON-streamed ingest (50MB cap, whitelisted suffixes)
   ├── /api/memory         User memory persistence
-  ├── /api/courses        Course listing
+  ├── /api/courses        Course listing (mode=user|all; user hides preset courses by default)
   ├── /api/status         Backends + usage + embedding mode
   └── /api/health         Liveness probe
   Middleware: request-id, latency header, structured access log,
@@ -156,6 +156,35 @@ nano_notebooklm/   Python backend modules
   smoke, streaming endpoints, subagents, session log rotation, and frontend
   state helpers (no LLM keys or downloaded models required; uses deterministic
   hash-based fake embeddings and monkeypatched search/LLM paths).
+- Round 4 R4-1 + R4-2 (2026-05-10): direction switched to upload-only +
+  KG-driven retrieval. `/api/courses` accepts `mode: Literal["all","user"] |
+  None` defaulting to `"user"`; user mode filters `config.PRESET_COURSE_IDS`
+  (the 8 hardcoded preset course ids — Round 1 ingest is **physically kept
+  on disk** as a rollback hatch, only hidden in UI). Frontend `app.jsx` reads
+  `?show_preset=1` to opt back into the all-courses view. Empty courses
+  list renders an `.empty-courses-cta` upload prompt instead of a blank
+  workspace. `/api/upload/{id}` rewritten as `StreamingResponse` of
+  `application/x-ndjson`: pre-stream HTTPException 4xx for invalid files
+  (50MB cap, suffix whitelist, zip-bomb check); then one or more
+  `{type:"stage", stage, progress, detail?}` events per stage in order
+  `chunking → embedding → kg_stage_a → kg_stage_b`; terminal `{type:"done",
+  course_id, files, chunks, documents, kg_nodes, duration_ms}` or
+  `{type:"error", error:"upload_pipeline_failed", stage}`. Stages run via
+  `asyncio.to_thread` so the event loop stays responsive (chunking +
+  embedding) or via an in-loop async task with a `_progress` callback
+  that pushes to a bounded `asyncio.Queue(maxsize=64)` (KG extraction).
+  Per-course pipeline lock `_UPLOAD_LOCKS[course_id]` (capped at 512
+  entries with opportunistic eviction) serialises concurrent same-course
+  uploads. `extract_from_chunks` gains an optional `progress_callback`
+  kwarg; callback exceptions are caught + logged so a misbehaving
+  telemetry hook can't abort the pipeline. Stage names live in
+  `nano_notebooklm/kg/extractor.py` as `UPLOAD_STAGES` constant +
+  `UploadStage` Literal — single source of truth across server, extractor,
+  and `frontend/processing.jsx`. `frontend/processing.jsx` rewritten to
+  render 4 progress bars driven by NDJSON events; retry button re-invokes
+  the original upload via a `retryRef` closure (not just dismiss-modal).
 - Still missing for production: auth / multi-tenant, request rate limits,
   background-task ingestion, OpenAPI client codegen, structured metrics
   (Prometheus). Mastery is still read-only (KG editing landed in M3).
+  R4-4 (GraphRAG retriever) + R4-5 (Qwen-RAFT backend chip) + R4-3
+  (force-directed KG view, codex in flight) outstanding.
