@@ -335,12 +335,13 @@
 - **corner-test**: `test_graph_search_falls_back_to_rag_when_kg_missing` / `test_graph_search_zero_hits_falls_back_to_rag` / `test_graph_search_hop_limit_2_caps_chunks_at_30` / `test_concept_embedding_lazy_when_missing` / `test_chat_response_path_literal_includes_graphrag`
 - **conflict notes**: graph_search 是新文件不冲突；qa_skill.py / router_intent.py / api/server.py 改动需在 R4-1（server.py courses 改动）合入后再 rebase 一次。
 
-### #R4-5 Backend backend 切换 chip：codex GPT-5.4 / Qwen2.5-7B-RAFT — [ ]
+### #R4-5 Backend backend 切换 chip：codex GPT-5.4 / Qwen2.5-7B-RAFT — [claude]
 
 - **goal ref**: GOAL.md Round 4 #R4-5
-- **status**: [ ]  ← 2026-05-10 23:30 释放给 codex（与 R4-2/R4-4 共享 server.py，但 section 物理隔离见 conflict notes）
-- **owner**:
-- **claimed_at**:
+- **status**: [claude]  ← 2026-05-11 00:40 claude pick up (codex 此轮在 R4-4)
+- **owner**: claude
+- **claimed_at**: 2026-05-11 00:40
+- **partial_submitted_at**: 2026-05-11 00:50（part 1：backend + router + tests，未碰 server.py / app.jsx；等 R4-4 land 后做 part 2）
 - **files (planned)**:
   - **新增** `nano_notebooklm/ai/qwen_raft_backend.py`：HTTP client 到 AutoDL Gradio `:6006/api/predict`；env `QWEN_RAFT_URL` + 可选 `QWEN_RAFT_TOKEN`
   - `nano_notebooklm/ai/router.py`（或 `openai_backend.py`）：抽象 `complete()`/`complete_stream()` 接口，按 `backend` 参数 dispatch
@@ -349,7 +350,46 @@
   - **新增** `tests/test_qwen_backend.py`
 - **mini-test**: `test_chat_routes_to_qwen_when_backend_qwen_raft` / `test_status_endpoint_lists_qwen_when_url_configured`
 - **corner-test**: `test_chat_qwen_url_unconfigured_returns_422` / `test_chat_qwen_timeout_falls_back_to_codex_with_flag` / `test_status_endpoint_returns_200_when_qwen_unavailable`
-- **conflict notes**: 跟 R4-2/R4-4 共享 `api/server.py` 和 `frontend/app.jsx`，但 section 物理隔离规则**强制**：
+#### Part 1（已 land，提交时机 = R4-5 整体 [review] 之前）
+
+**files (part 1)**:
+  - **新增** `nano_notebooklm/ai/qwen_raft_backend.py`（~240 行）：`QwenRaftBackend` 实现 `LLMBackend` 抽象——`complete()` POST `/api/predict` + 解码 Gradio 三种常见响应形态（plain str / `[[user, assistant], ...]` 历史 / `{content,text}` dict）；`complete_structured()` best-effort JSON 解析（剥 code fence + 非 JSON 返 `{error: "non_json_output", raw}`）；`complete_stream()` 落 base 类的 single-chunk 默认；`health_check()` HEAD-style GET `/` 返 `{ok, status|reason}`。`QwenBackendError(code, detail)` 走 fix-all v4 #A3 stable code 模式（`not_configured` / `timeout` / `transport_failed` / `upstream_4xx` / `upstream_5xx` / `malformed_response` / `empty_response`），caller 在 server.py 只暴露 `code` 不暴露 `detail`。
+  - `nano_notebooklm/config.py`：+10 行 `QWEN_RAFT_URL` / `QWEN_RAFT_TOKEN` / `QWEN_RAFT_MODEL_NAME` / `QWEN_RAFT_HTTP_TIMEOUT` env 常量，未设时 `configured=False` 自动让 backend 不出现在 /api/status。
+  - **新增** `tests/test_qwen_backend.py`（295 行，5 mini + 14 corner）。
+
+**mini-test**: `test_qwen_backend_configured_when_url_set` / `test_complete_posts_to_api_predict_with_data_envelope` / `test_complete_accepts_chatbot_history_response_shape` / `test_complete_accepts_dict_message_shape` / `test_health_check_returns_ok_on_200`
+
+**corner-test**: `test_complete_raises_not_configured_when_url_empty` / `test_complete_raises_timeout_code_on_httpx_timeout` / `test_complete_raises_transport_failed_on_connection_error` / `test_complete_raises_upstream_5xx_on_server_error` / `test_complete_raises_empty_response_when_data_missing` / `test_qwen_backend_error_does_not_leak_url_in_message` / `test_health_check_returns_not_configured_when_url_empty` / `test_health_check_returns_unreachable_on_exception` / `test_health_check_returns_timeout_on_httpx_timeout` / `test_complete_structured_returns_dict_on_clean_json` / `test_complete_structured_strips_code_fence` / `test_complete_structured_returns_error_dict_on_non_json` / `test_complete_stream_yields_full_content_as_one_chunk`
+
+**pytest (part 1)**: **19 passed**（isolated）；全量 sweep **643 passed, 5 failed**——5 个失败**不是** R4-5 引起，全部是 R4-4 agent 并行 in-flight 工作改了 `extract_from_chunks` 签名（加 `embed_fn` kwarg）+ 重构了 `api/server.py` upload generator（`concepts, relations = await extract_task` 行被改掉）造成的契约破坏。详见下方 **Note for R4-4 agent** 段。R4-5 part 1 的 19 条单测**独立绿**。
+
+**⚠️ Note for R4-4 agent**（cross-agent coordination）：
+
+R4-4 in-flight 工作（工作树未 commit）改了以下 R4-2 已 land 的契约，让 4 条已 land 测试红：
+
+1. **extractor.py**：`extract_from_chunks` 加 `embed_fn` kwarg。R4-2 fix-all v1 的 `_fake` / `_boom` 测试 stub 签名是 `(chunks, course_name, router, max_chunks=30, progress_callback=None)`，未接 `embed_fn` → TypeError。
+   - **修法**：要么 (a) 在 R4-4 的 `extract_from_chunks` 中给 `embed_fn` 一个默认 `None` 让旧调用面兼容（**推荐**），要么 (b) 同步更新 `tests/test_r4_2_fix_all_v1.py` 和 `tests/test_upload_stream.py` 的 stub 签名。
+2. **api/server.py**：upload 生成器里 `concepts, relations = await extract_task` 这行已被改名/重构，但 R4-2 fix-all v1 的 `test_drain_queue_before_reraise_source_order` 用 string-pin 钉死这行的相对位置。
+   - **修法**：保留这行原文 / 改改 grep 匹配。
+
+具体红测：
+- `tests/test_r4_2_fix_all_v1.py::test_done_event_carries_duration_ms`（embed_fn TypeError）
+- `tests/test_r4_2_fix_all_v1.py::test_drain_queue_before_reraise_source_order`（grep 失败）
+- `tests/test_upload_stream.py::test_upload_stream_emits_four_stages`（embed_fn TypeError）
+- `tests/test_upload_stream.py::test_upload_stream_concurrent_same_course_serializes`（embed_fn TypeError）
+
+请 R4-4 owner 在 commit 之前修绿，避免 land 时把 baseline 从 R4-3 land 的 629 拉下去。
+
+
+
+#### Part 2（pending — R4-4 land 之后做）
+
+- `api/server.py`：`ChatRequest.backend: Literal["codex","qwen_raft"] | None = None`；`/api/chat` 入口 dispatch 给 `qwen_raft` backend；`/api/status` `backends` list 加 `qwen_raft` + health 字段。
+- `frontend/app.jsx` topbar-actions 块：紧挨 lang-chip 后追加 backend chip "🤖 GPT-5.4 / 🎓 Qwen-RAFT"，按 /api/status 灰掉不可用项。
+- `frontend/styles.css` 末尾：`.backend-chip` 样式段。
+- `tests/test_qwen_backend.py` 后追加 part 2 integration tests：`test_chat_routes_to_qwen_when_backend_qwen_raft` / `test_status_endpoint_lists_qwen_when_url_configured` / `test_chat_qwen_url_unconfigured_returns_422` / `test_chat_qwen_timeout_falls_back_to_codex_with_flag` / `test_status_endpoint_returns_200_when_qwen_unavailable`
+
+**conflict notes**: 跟 R4-2/R4-4 共享 `api/server.py` 和 `frontend/app.jsx`，但 section 物理隔离规则**强制**：
   - **R4-5 owner 只许动**：(a) `nano_notebooklm/ai/qwen_raft_backend.py`（**新文件**）；(b) `nano_notebooklm/ai/router.py` 的 backend dispatch 接口（如果文件不存在就新建，否则在文件**末尾追加** dispatch helper）；(c) `api/server.py` 的 **`ChatRequest` 模型定义段** + **`/api/status` 端点函数**（**仅这两处**），不许动 `/api/upload/{cid}` / `/api/chat` 主体 / `/api/courses` / `/api/mindmap/*` / 任何 Pydantic 模型以外的 endpoint；(d) `frontend/app.jsx` 的 **`<div className="topbar-actions">` 块内**（紧挨 lang-chip 之后追加 backend chip），不许动 courseModeRef / 课程下拉 / 空态 CTA / Library / workspace / Assistant 调用面；(e) **新建** `frontend/styles.css` **末尾追加**`.backend-chip` 样式段；(f) **新建** `tests/test_qwen_backend.py`。
   - **不许动**（lock 期间触碰即视为越权）：upload endpoint / ingest 链路 / kg/extractor.py / qa_skill / router_intent / kb/graph_search.py / mindmap.jsx / processing.jsx / api.js streamUpload / study-state.js。
   - 与 R4-2/R4-4 在 server.py 上的 merge 顺序：R4-2 先 land → R4-5 rebase 一次（仅 ChatRequest model 段附近可能 conflict，机械 resolve）→ R4-4 land 时再吃一次 ChatResponse.path Literal 的小改动。

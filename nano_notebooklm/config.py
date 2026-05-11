@@ -24,6 +24,16 @@ DEFAULT_BACKEND = os.getenv("DEFAULT_BACKEND", "claude")
 CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-20250514")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
 
+# ── Round 4 #R4-5 — Qwen-RAFT remote backend ────────────────────────
+# AutoDL `scripts/app.py` exposes a Gradio service on :6006 with the
+# RAFT-fine-tuned Qwen2.5-7B-Instruct. Leave the env vars empty in the
+# default deployment; setting QWEN_RAFT_URL is the opt-in to surface
+# the backend chip in /api/status and accept ChatRequest.backend="qwen_raft".
+QWEN_RAFT_URL = os.getenv("QWEN_RAFT_URL", "").rstrip("/")
+QWEN_RAFT_TOKEN = os.getenv("QWEN_RAFT_TOKEN", "")
+QWEN_RAFT_MODEL_NAME = os.getenv("QWEN_RAFT_MODEL_NAME", "qwen2.5-7b-raft")
+QWEN_RAFT_HTTP_TIMEOUT = float(os.getenv("QWEN_RAFT_HTTP_TIMEOUT", "60"))
+
 # ── Embedding ────────────────────────────────────────────────────────
 EMBEDDING_MODE = os.getenv("EMBEDDING_MODE", "local")  # "local" or "api"
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
