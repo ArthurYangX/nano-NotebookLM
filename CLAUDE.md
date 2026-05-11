@@ -244,6 +244,33 @@ nano_notebooklm/   Python backend modules
   /api/upload, or graphrag chat doesn't pay a 5-30s sentence-transformer
   model load on the request hot path. Adds 12 regression tests in
   tests/test_r4_4_fix_all_v1.py.
+- R4-4 review-swarm fix-all v2 (2026-05-11): second review pass on
+  fix-all v1 (commit 764276d) — no critical/high blocker. 10 medium
+  fix-soon items land plus 4 quick low: (V1) `_graphrag_score_floor`
+  clamps to [0, 1] (negative env value previously bypassed admission);
+  STATUS.md fix-all v1 gains explicit `status: [review]` field;
+  `test_router_intent.py` ChatResponse.path accept-list adds "graphrag";
+  `.env.example` documents `GRAPHRAG_ENABLED` /
+  `GRAPHRAG_SCORE_GATE_TOP1` / `NANO_NLM_DISABLE_EMBED_WARMUP`.
+  (V2) startup warm-up switches to `asyncio.create_task(_do_warmup())`
+  fire-and-forget so FastAPI accepts liveness probes during the model
+  load (K8s no longer CrashLoopBackOff on 5-30s sentence-transformer
+  init); `EMBEDDING_MODE=api` path skips warm-up entirely (no local
+  model to load); new `app.state.embed_warm_ok` flag surfaced via
+  `/api/status` `embed_warm_ok` field (None=in-flight/True=ok/False=
+  failed). (V3) graphrag admission now passes `min_hits=1` to
+  `passes_score_gate` explicitly so single-strong-hit small-course
+  uploads aren't rejected by the RAG default of `min_hits=2`. (V4)
+  `_resolve_node_embeddings` batch failure falls back to per-node
+  `embed_fn([t])` so a poison-text outlier only loses itself, not the
+  whole cache-miss list. (V5) log PII scrub: 3 sites drop
+  `exc_info=True` (openai-python tracebacks carry request body =
+  user query in API mode); `_load_kg` / `_load_chunks_index` log only
+  `course_id` not absolute filesystem path. (V6) `graph_search._load_kg`
+  applies a minimal `mindmap_edits.json` overlay for `delete_node` /
+  `delete_edge` ops so student-deleted nodes no longer seed
+  retrieval. Adds 16 regression tests in
+  tests/test_r4_4_fix_all_v2.py.
 - Still missing for production: auth / multi-tenant, request rate limits,
   background-task ingestion, OpenAPI client codegen, structured metrics
   (Prometheus). Mastery is still read-only (KG editing landed in M3).

@@ -623,8 +623,8 @@ def test_chat_response_model_rejects_typo_path():
     from pydantic import ValidationError
     from api.server import ChatResponse
 
-    # Each of the four canonical values must be accepted
-    for ok in ("rag", "general", "translated", "cross-course"):
+    # Each of the five canonical values must be accepted (R4-4 added "graphrag")
+    for ok in ("rag", "general", "translated", "cross-course", "graphrag"):
         ChatResponse(answer="x", path=ok)
 
     # Common typo: hyphen → underscore

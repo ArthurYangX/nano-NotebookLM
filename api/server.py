@@ -7,10 +7,12 @@ import json
 import logging
 import mimetypes
 import os
+import re
 import shutil
 import subprocess
 import tempfile
 import time
+import urllib.parse as urllib_parse
 import uuid
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -95,14 +97,35 @@ app.add_middleware(
 # otherwise pay the model load on every TestClient reload).
 @app.on_event("startup")
 async def _warm_embed_fn() -> None:
+    # fix-all v2 #V2 (R4-4 review-swarm v2): three changes:
+    #   (a) fire-and-forget create_task so startup returns immediately and
+    #       FastAPI accepts liveness probes during the model load;
+    #   (b) EMBEDDING_MODE=api skip (no local model = nothing to warm);
+    #   (c) app.state.embed_warm_ok surfaced via /api/status.
+    app.state.embed_warm_ok = None
     if os.environ.get("NANO_NLM_DISABLE_EMBED_WARMUP"):
+        # Test-mode skip — pretend warmed; kb.embed_fn lazy-loads on first call.
+        app.state.embed_warm_ok = True
+        return
+    if (config.EMBEDDING_MODE or "local").lower() != "local":
+        # API mode has no local model to load.
+        app.state.embed_warm_ok = True
         return
     import asyncio as _aio
-    try:
-        await _aio.to_thread(lambda: kb.embed_fn(["__warmup__"]))
-        logger.info("kb.embed_fn warmed at startup")
-    except Exception:  # noqa: BLE001 — never block boot on a warm-up failure
-        logger.warning("kb.embed_fn warm-up failed; will lazy-load on first request", exc_info=True)
+
+    async def _do_warmup() -> None:
+        try:
+            await _aio.to_thread(lambda: kb.embed_fn(["__warmup__"]))
+            app.state.embed_warm_ok = True
+            logger.info("kb.embed_fn warmed at startup")
+        except Exception:  # noqa: BLE001 — never block boot on a warm-up failure
+            app.state.embed_warm_ok = False
+            logger.warning(
+                "kb.embed_fn warm-up failed; will lazy-load on first request",
+                exc_info=True,
+            )
+
+    _aio.create_task(_do_warmup())
 
 
 # LaTeX-refactor: probe `tectonic` once at boot. The PDF compile endpoint
@@ -125,6 +148,59 @@ async def _probe_tectonic() -> None:
 MAX_UPLOAD_SIZE_MB = 50
 MAX_UPLOAD_SIZE_BYTES = MAX_UPLOAD_SIZE_MB * 1024 * 1024
 ALLOWED_UPLOAD_SUFFIXES = {".pdf", ".pptx", ".docx", ".md", ".txt"}
+
+# review-swarm fix-all v1 #6: reject any uploaded filename that contains
+# C0 controls (\x00-\x1f), DEL (\x7f), or Unicode bidi/format characters.
+# These slip past the suffix check, then flow into:
+#   1. Content-Disposition: inline; filename="..."  (response splitting via
+#      CR/LF embedded in the filename — splits HTTP headers)
+#   2. \section{<source_file>} in generated LaTeX (newlines break parsing,
+#      bidi overrides spoof file extensions visually)
+#   3. structured access log lines (log injection)
+# Suffix whitelist alone is not sufficient because "evil\r\n.pdf" passes.
+_FILENAME_FORBIDDEN_RE = re.compile(
+    "[\x00-\x1f\x7f"          # C0 controls + DEL
+    "‎‏"            # LTR / RTL marks
+    "‪-‮"           # bidi override block
+    "⁦-⁩"           # isolate block
+    "]"
+)
+
+
+def _safe_upload_name(raw: str | None) -> str:
+    """Return a filesystem- and header-safe leaf filename, or raise 400.
+
+    Strips directory components (defense in depth — `Path.name` already
+    drops them), rejects empty / control-char / bidi-override filenames.
+    Returned value is safe to use inside Content-Disposition's quoted
+    filename= field AND inside a `\\section{}` LaTeX argument.
+    """
+    name = (raw or "").strip()
+    if not name:
+        raise HTTPException(400, "filename is empty")
+    leaf = Path(name).name
+    if not leaf or leaf in {".", ".."}:
+        raise HTTPException(400, "filename resolves to empty leaf")
+    if _FILENAME_FORBIDDEN_RE.search(leaf):
+        raise HTTPException(400, "filename contains control or bidi characters")
+    if len(leaf.encode("utf-8")) > 255:
+        raise HTTPException(400, "filename exceeds 255 bytes")
+    return leaf
+
+
+def _content_disposition(filename: str, *, disposition: str = "inline") -> str:
+    """Build a safe Content-Disposition header value.
+
+    RFC 6266: prefer ``filename*=UTF-8''`` (percent-encoded) so non-ASCII
+    filenames don't depend on the legacy quoted form, AND include an
+    ASCII-only ``filename=`` fallback for clients that ignore the
+    extended form. Embedded `"` / CR / LF in the input become %22 / %0D
+    / %0A under percent-encoding, neutralising response-splitting.
+    """
+    safe = _safe_upload_name(filename)
+    quoted = urllib_parse.quote(safe, safe="")
+    ascii_fallback = re.sub(r"[^A-Za-z0-9._-]", "_", safe) or "file"
+    return f'{disposition}; filename="{ascii_fallback}"; filename*=UTF-8\'\'{quoted}'
 
 # review-swarm fix-all v3 #C2: ingest_course must not accept arbitrary local
 # directories (`/Users/...` or `/etc/...`). Whitelist roots to artifacts/uploads
@@ -754,9 +830,15 @@ async def get_source_file(course_id: str, doc_id: str):
     return FileResponse(
         path,
         media_type=mime,
-        # `inline` keeps the browser's native viewer active for PDFs; we strip
-        # any directory components from the filename Content-Disposition header.
-        headers={"Content-Disposition": f'inline; filename="{Path(target.source_file).name}"'},
+        # `inline` keeps the browser's native viewer active for PDFs.
+        # _content_disposition strips dir components, rejects CR/LF/NUL
+        # (response splitting), and emits both an ASCII fallback and an
+        # RFC 6266 percent-encoded filename* for non-ASCII names.
+        headers={
+            "Content-Disposition": _content_disposition(
+                Path(target.source_file).name, disposition="inline"
+            )
+        },
     )
 
 
@@ -877,15 +959,31 @@ async def stream_notes(req: NoteRequest):
     }, req.course_id, "notes")
 
 
+# review-swarm fix-all v1 #8: cap concurrent full-course requests across the
+# whole app. Without this, 8 simultaneous users × concurrency=8 = 64 in-flight
+# codex calls — enough to wedge the router for chat/report/agent (all share
+# the same backend). The lazy-init pattern mirrors _TECTONIC_SEMAPHORE.
+# Override via NANO_NLM_MAX_FULL_COURSE_CONCURRENCY env var.
+_FULL_COURSE_SEMAPHORE: "asyncio.Semaphore | None" = None
+
+
+def _get_full_course_semaphore() -> "asyncio.Semaphore":
+    global _FULL_COURSE_SEMAPHORE
+    if _FULL_COURSE_SEMAPHORE is None:
+        cap = max(1, int(os.environ.get("NANO_NLM_MAX_FULL_COURSE_CONCURRENCY", "2")))
+        _FULL_COURSE_SEMAPHORE = asyncio.Semaphore(cap)
+    return _FULL_COURSE_SEMAPHORE
+
+
 @app.post("/api/notes/full-course/stream", tags=["skills"],
           summary="Generate full-course notes file-by-file (parallel) + merge + review")
-async def stream_full_course_notes(req: NoteFullCourseRequest):
+async def stream_full_course_notes(req: NoteFullCourseRequest, request: Request):
     """Per-file parallel note generation with progressive NDJSON emission.
 
     Phases:
       1. plan          — group chunks by source_file, emit the file list
       2. per-file      — Semaphore(concurrency)-throttled LLM calls; each
-                         result emits as soon as it finishes (asyncio.as_completed)
+                         result emits as soon as it finishes
       3. merging       — programmatic \\section{} concat (no LLM cost)
       4. reviewing     — single LLM polish pass, token-streamed
       5. done          — final reviewed LaTeX body
@@ -898,9 +996,16 @@ async def stream_full_course_notes(req: NoteFullCourseRequest):
       {"type":"file_error", "idx":i, "source_file":..., "error":"<code>"}
       {"type":"merging", "files_succeeded":m, "files_failed":f}
       {"type":"reviewing"}
-      {"type":"review_chunk", "delta":"...", "partial":"..."}
+      {"type":"review_chunk", "delta":"..."}    # client accumulates
       {"type":"done", "content":"...", "files_succeeded":m, "files_failed":f}
       {"type":"error", "error":"<code>", "partial":"...", "retryable":true}
+
+    Event ordering contract: `file_start` and `file_done`/`file_error`
+    events are NOT globally ordered relative to each other. A fast
+    worker can emit `start(A) → done(A)` before a slower worker emits
+    its `start(B)`. Consumers MUST key on `idx` (assigned in the plan
+    event) to associate events with files — do not rely on event-arrival
+    order matching plan-list order.
 
     Cost note: ~N+1 LLM calls per request (one per file plus one review).
     For a 20-file course at default concurrency=4 the wall clock is
@@ -909,181 +1014,237 @@ async def stream_full_course_notes(req: NoteFullCourseRequest):
     course_id = req.course_id
     user_lang = req.user_lang
     concurrency = req.concurrency
+    rid = getattr(request.state, "request_id", "?")
 
-    plans = notes_full_course.plan_for_course(kb, course_id, user_lang=user_lang)
+    # fix-all v1 #20 (optional polish): plan_for_course reads chunks.json
+    # off disk and instantiates Pydantic models — for a 15K-chunk course
+    # that's 100-500ms of sync work before the first `plan` event can
+    # ship. Push it to a thread so the event loop stays responsive.
+    plans = await asyncio.to_thread(
+        notes_full_course.plan_for_course, kb, course_id, user_lang=user_lang
+    )
+
+    global_sem = _get_full_course_semaphore()
 
     async def events():
         partial = ""
-        try:
-            if not plans:
-                yield json.dumps({
-                    "type": "error",
-                    "error": "no_chunks",
-                    "detail": f"course {course_id!r} has no indexed chunks",
-                    "retryable": False,
-                }, ensure_ascii=False) + "\n"
-                return
-
-            yield json.dumps({
-                "type": "plan",
-                "files": [
-                    {"idx": p.idx, "source_file": p.source_file,
-                     "chunk_count": p.chunk_count}
-                    for p in plans
-                ],
-                "total": len(plans),
-                "concurrency": concurrency,
-            }, ensure_ascii=False) + "\n"
-
-            semaphore = asyncio.Semaphore(concurrency)
-            # Bounded queue: per-file work produces 2 events (start + done/error).
-            # 4× plans gives slack for the merging/reviewing/done tail without
-            # an unbounded queue that could mask backpressure bugs.
-            queue: asyncio.Queue = asyncio.Queue(maxsize=max(64, len(plans) * 4))
-            results: list[notes_full_course.FileResult] = [None] * len(plans)  # type: ignore[list-item]
-
-            async def run_one(plan):
-                # Acquire the semaphore first so file_start reflects "a
-                # worker actually picked this file up", not "scheduled at
-                # t=0 alongside the other 19".
-                async with semaphore:
-                    await queue.put({
-                        "type": "file_start",
-                        "idx": plan.idx,
-                        "source_file": plan.source_file,
-                        "total": len(plans),
-                    })
-                    result = await notes_full_course.generate_file(router, plan)
-                    results[plan.idx] = result
-                    if result.content:
-                        await queue.put({
-                            "type": "file_done",
-                            "idx": result.idx,
-                            "source_file": result.source_file,
-                            "content": result.content,
-                            "chunks_used": result.chunk_count,
-                        })
-                    else:
-                        await queue.put({
-                            "type": "file_error",
-                            "idx": result.idx,
-                            "source_file": result.source_file,
-                            "error": result.error or "unknown",
-                        })
-
-            tasks = [asyncio.create_task(run_one(p)) for p in plans]
-            try:
-                done_count = 0
-                while done_count < len(plans):
-                    event = await queue.get()
-                    yield json.dumps(event, ensure_ascii=False) + "\n"
-                    if event["type"] in ("file_done", "file_error"):
-                        done_count += 1
-                # Producers should already be done since each pushed its
-                # terminal event before returning, but await them so any
-                # exception propagates (and so cancellation can join).
-                await asyncio.gather(*tasks, return_exceptions=True)
-            finally:
-                # Client disconnect → StreamingResponse cancels this
-                # generator; cancel outstanding LLM tasks so we don't keep
-                # burning tokens for a closed connection.
-                for t in tasks:
-                    if not t.done():
-                        t.cancel()
-
-            settled = [r for r in results if r is not None]
-            succeeded = [r for r in settled if r.content]
-            failed = [r for r in settled if not r.content]
-
-            if not succeeded:
-                yield json.dumps({
-                    "type": "error",
-                    "error": "all_files_failed",
-                    "detail": f"{len(failed)} of {len(plans)} files failed; "
-                              f"nothing left to merge",
-                    "retryable": True,
-                }, ensure_ascii=False) + "\n"
-                return
-
-            yield json.dumps({
-                "type": "merging",
-                "files_succeeded": len(succeeded),
-                "files_failed": len(failed),
-            }, ensure_ascii=False) + "\n"
-
-            draft = notes_full_course.concat_draft(settled)
-
-            yield json.dumps({"type": "reviewing"}, ensure_ascii=False) + "\n"
-
-            review_inputs = notes_full_course.prepare_review_inputs(
-                course_id=course_id,
-                draft=draft,
-                file_count=len(succeeded),
-                user_lang=user_lang,
-            )
-
-            async for delta in router.complete_stream(
-                review_inputs["prompt"],
-                task_type=review_inputs["task_type"],
-                system=review_inputs["system"],
-                temperature=review_inputs["temperature"],
-                max_tokens=review_inputs["max_tokens"],
-            ):
-                partial += delta
-                yield json.dumps({
-                    "type": "review_chunk",
-                    "delta": delta,
-                    "partial": partial,
-                }, ensure_ascii=False) + "\n"
-
-            # Sanitize the reviewed body with the no-cap variant — a
-            # 20-file course legitimately exceeds the 80KB single-topic
-            # cap, but the forbidden-command threat model still applies.
-            final_content = partial.strip()
-            if not final_content:
-                # Review pass returned nothing — fall back to the raw draft
-                # rather than failing the whole request. Better to give the
-                # user un-polished sections than no notes at all.
-                logger.warning("review pass empty for course %s; "
-                               "falling back to raw concat draft", course_id)
-                final_content = draft
-            try:
-                final_content = latex_check_unbounded(final_content)
-            except LaTeXUnsafeError as e:
-                logger.warning("merged notes failed sanitizer for course %s: %s",
-                               course_id, e.reason)
-                yield json.dumps({
-                    "type": "error",
-                    "error": "latex_unsafe",
-                    "detail": e.reason,
-                    "partial": partial,
-                    "retryable": True,
-                }, ensure_ascii=False) + "\n"
-                return
-
-            session_log.append(course_id, "generation", {
-                "kind": "notes-full-course",
-                "files_succeeded": len(succeeded),
-                "files_failed": len(failed),
-            })
-            yield json.dumps({
-                "type": "done",
-                "content": final_content,
-                "files_succeeded": len(succeeded),
-                "files_failed": len(failed),
-            }, ensure_ascii=False) + "\n"
-
-        except asyncio.CancelledError:
-            # Client disconnect — let it bubble so StreamingResponse cleans up.
-            raise
-        except Exception:  # noqa: BLE001
-            logger.exception("full-course note stream failed for %s", course_id)
+        if not plans:
             yield json.dumps({
                 "type": "error",
-                "error": "stream_failed",
-                "partial": partial,
-                "retryable": True,
+                "error": "no_chunks",
+                "detail": f"course {course_id!r} has no indexed chunks",
+                "retryable": False,
             }, ensure_ascii=False) + "\n"
+            return
+        # fix-all v1 #8: hold the global semaphore for the LLM-heavy span
+        # (plan → review). Prevents 8 simultaneous users × concurrency=8 =
+        # 64 in-flight codex calls from wedging chat/report/agent on the
+        # shared router. async with ensures release even on early return
+        # / cancellation / exception.
+        async with global_sem:
+            try:
+                yield json.dumps({
+                    "type": "plan",
+                    "files": [
+                        {"idx": p.idx, "source_file": p.source_file,
+                         "chunk_count": p.chunk_count}
+                        for p in plans
+                    ],
+                    "total": len(plans),
+                    "concurrency": concurrency,
+                }, ensure_ascii=False) + "\n"
+
+                semaphore = asyncio.Semaphore(concurrency)
+                # Bounded queue: per-file work produces 2 events (start + done/error).
+                # 4× plans gives slack for the merging/reviewing/done tail without
+                # an unbounded queue that could mask backpressure bugs.
+                queue: asyncio.Queue = asyncio.Queue(maxsize=max(64, len(plans) * 4))
+                results: list[notes_full_course.FileResult] = [None] * len(plans)  # type: ignore[list-item]
+
+                async def run_one(plan):
+                    # Acquire the semaphore first so file_start reflects "a
+                    # worker actually picked this file up", not "scheduled at
+                    # t=0 alongside the other 19".
+                    async with semaphore:
+                        await queue.put({
+                            "type": "file_start",
+                            "idx": plan.idx,
+                            "source_file": plan.source_file,
+                            "total": len(plans),
+                        })
+                        result = await notes_full_course.generate_file(router, plan)
+                        results[plan.idx] = result
+                        if result.content:
+                            await queue.put({
+                                "type": "file_done",
+                                "idx": result.idx,
+                                "source_file": result.source_file,
+                                "content": result.content,
+                                "chunks_used": result.chunk_count,
+                            })
+                        else:
+                            await queue.put({
+                                "type": "file_error",
+                                "idx": result.idx,
+                                "source_file": result.source_file,
+                                "error": result.error or "unknown",
+                            })
+
+                tasks = [asyncio.create_task(run_one(p)) for p in plans]
+                queue_waiter: asyncio.Task | None = None
+                try:
+                    # Drive the drain off task completion, NOT a done_count we
+                    # increment from queue events. A naive `while done_count <
+                    # N: await queue.get()` hangs forever if any producer
+                    # fails between `router.complete()` returning and
+                    # `queue.put(terminal_event)` — the terminal event never
+                    # arrives and the main loop has no way out.
+                    #
+                    # Loop until every task is done. On each iteration: drain
+                    # whatever's currently in the queue, then await EITHER the
+                    # next queue.put OR any task completing. This way a
+                    # producer that died without enqueuing its terminal event
+                    # still unblocks us via task completion.
+                    pending = set(tasks)
+                    while pending:
+                        while not queue.empty():
+                            event = queue.get_nowait()
+                            yield json.dumps(event, ensure_ascii=False) + "\n"
+                        if queue_waiter is None or queue_waiter.done():
+                            queue_waiter = asyncio.create_task(queue.get())
+                        done, _ = await asyncio.wait(
+                            pending | {queue_waiter},
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        if queue_waiter in done:
+                            event = queue_waiter.result()
+                            yield json.dumps(event, ensure_ascii=False) + "\n"
+                            queue_waiter = None
+                        pending = {t for t in pending if not t.done()}
+                    # All tasks finished — drain any straggler events the
+                    # final tasks pushed before exiting, then surface any
+                    # task-level exceptions for the log.
+                    if queue_waiter is not None and not queue_waiter.done():
+                        queue_waiter.cancel()
+                    while not queue.empty():
+                        event = queue.get_nowait()
+                        yield json.dumps(event, ensure_ascii=False) + "\n"
+                    for t in tasks:
+                        if t.done() and not t.cancelled():
+                            exc = t.exception()
+                            if exc is not None:
+                                logger.warning(
+                                    "per-file note task raised %s",
+                                    type(exc).__name__,
+                                )
+                finally:
+                    # Client disconnect → StreamingResponse cancels this
+                    # generator; cancel outstanding LLM tasks so we don't keep
+                    # burning tokens for a closed connection.
+                    for t in tasks:
+                        if not t.done():
+                            t.cancel()
+                    if queue_waiter is not None and not queue_waiter.done():
+                        queue_waiter.cancel()
+
+                settled = [r for r in results if r is not None]
+                succeeded = [r for r in settled if r.content]
+                failed = [r for r in settled if not r.content]
+
+                if not succeeded:
+                    yield json.dumps({
+                        "type": "error",
+                        "error": "all_files_failed",
+                        "detail": f"{len(failed)} of {len(plans)} files failed; "
+                                  f"nothing left to merge",
+                        "retryable": True,
+                    }, ensure_ascii=False) + "\n"
+                    return
+
+                yield json.dumps({
+                    "type": "merging",
+                    "files_succeeded": len(succeeded),
+                    "files_failed": len(failed),
+                }, ensure_ascii=False) + "\n"
+
+                draft = notes_full_course.concat_draft(settled)
+
+                yield json.dumps({"type": "reviewing"}, ensure_ascii=False) + "\n"
+
+                review_inputs = notes_full_course.prepare_review_inputs(
+                    course_id=course_id,
+                    draft=draft,
+                    file_count=len(succeeded),
+                    user_lang=user_lang,
+                )
+
+                async for delta in router.complete_stream(
+                    review_inputs["prompt"],
+                    task_type=review_inputs["task_type"],
+                    system=review_inputs["system"],
+                    temperature=review_inputs["temperature"],
+                    max_tokens=review_inputs["max_tokens"],
+                ):
+                    partial += delta
+                    # Wire-cost note: ship `delta` only — DO NOT also ship
+                    # `partial` here. Earlier versions included partial in
+                    # every event, which made the cumulative wire bytes O(N²)
+                    # in response length (a 30 KB reviewed body became 7.5 MB
+                    # on the wire). The frontend accumulates deltas itself.
+                    yield json.dumps({
+                        "type": "review_chunk",
+                        "delta": delta,
+                    }, ensure_ascii=False) + "\n"
+
+                # Sanitize the reviewed body with the no-cap variant — a
+                # 20-file course legitimately exceeds the 80KB single-topic
+                # cap, but the forbidden-command threat model still applies.
+                final_content = partial.strip()
+                if not final_content:
+                    # Review pass returned nothing — fall back to the raw draft
+                    # rather than failing the whole request. Better to give the
+                    # user un-polished sections than no notes at all.
+                    logger.warning("review pass empty for course %s; "
+                                   "falling back to raw concat draft", course_id)
+                    final_content = draft
+                try:
+                    final_content = latex_check_unbounded(final_content)
+                except LaTeXUnsafeError as e:
+                    logger.warning("merged notes failed sanitizer for course %s: %s",
+                                   course_id, e.reason)
+                    yield json.dumps({
+                        "type": "error",
+                        "error": "latex_unsafe",
+                        "detail": e.reason,
+                        "partial": partial,
+                        "retryable": True,
+                    }, ensure_ascii=False) + "\n"
+                    return
+
+                session_log.append(course_id, "generation", {
+                    "kind": "notes-full-course",
+                    "files_succeeded": len(succeeded),
+                    "files_failed": len(failed),
+                })
+                yield json.dumps({
+                    "type": "done",
+                    "content": final_content,
+                    "files_succeeded": len(succeeded),
+                    "files_failed": len(failed),
+                }, ensure_ascii=False) + "\n"
+
+            except asyncio.CancelledError:
+                # Client disconnect — let it bubble so StreamingResponse cleans up.
+                raise
+            except Exception:  # noqa: BLE001
+                logger.exception("rid=%s full-course note stream failed for %s",
+                                 rid, course_id)
+                yield json.dumps({
+                    "type": "error",
+                    "error": "stream_failed",
+                    "partial": partial,
+                    "retryable": True,
+                }, ensure_ascii=False) + "\n"
 
     return StreamingResponse(events(), media_type="application/x-ndjson")
 
@@ -1228,7 +1389,9 @@ async def export_note_pdf(req: NotePdfExportRequest, request: Request):
         iter([pdf_bytes]),
         media_type="application/pdf",
         headers={
-            "Content-Disposition": f'attachment; filename="{safe_name}.pdf"',
+            "Content-Disposition": _content_disposition(
+                f"{safe_name}.pdf", disposition="attachment"
+            ),
             "Content-Length": str(len(pdf_bytes)),
         },
     )
@@ -2060,7 +2223,9 @@ async def upload_files(course_id: str, files: Annotated[list[UploadFile], File(.
                 400,
                 f"Unsupported file type '{suffix}'. Allowed: {sorted(ALLOWED_UPLOAD_SUFFIXES)}",
             )
-        safe_name = Path(f.filename).name
+        # fix-all v1 #6: reject control / bidi chars; defense vs filename
+        # injection into LaTeX \section{} and Content-Disposition headers.
+        safe_name = _safe_upload_name(f.filename)
         dest = upload_dir / safe_name
         written = await _save_uploaded_file(f, dest, suffix)
         if suffix in (".pptx", ".docx"):
@@ -2359,6 +2524,10 @@ async def status_endpoint():
         # LaTeX-refactor: frontend reads this to decide whether to show the
         # "高质量编译" PDF button (vs. only the browser-print fallback).
         "tectonic_available": bool(getattr(app.state, "tectonic_available", False)),
+        # fix-all v2 #V2: surface embed warm state so operators see a
+        # degraded backend without grepping logs. None = warm-up still
+        # in flight (fire-and-forget hasn't resolved yet); False = failed.
+        "embed_warm_ok": getattr(app.state, "embed_warm_ok", None),
         "version": app.version,
     }
 

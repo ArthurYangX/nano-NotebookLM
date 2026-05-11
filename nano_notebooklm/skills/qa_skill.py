@@ -58,6 +58,17 @@ def _graphrag_score_floor() -> float:
         return DEFAULT_GRAPHRAG_TOP1_THRESHOLD
     if value != value or value in (float("inf"), float("-inf")):  # NaN / Inf
         return DEFAULT_GRAPHRAG_TOP1_THRESHOLD
+    # fix-all v2 #V1 (R4-4 review-swarm v2): clamp to [0, 1]. A negative
+    # env value silently bypasses the admission gate (any cosine >= -1
+    # passes), turning graphrag into the original `len >= 2` regression
+    # the v1 #A3 fix was meant to prevent. Above-1 values would block
+    # every query — operator can self-diagnose that case, but symmetry +
+    # one INFO log makes the misconfig visible.
+    if value < 0.0 or value > 1.0:
+        logger.info(
+            "GRAPHRAG_SCORE_GATE_TOP1=%s clamped to [0, 1]", value,
+        )
+        value = max(0.0, min(1.0, value))
     return value
 
 
@@ -161,15 +172,24 @@ class QASkill(Skill):
         # → general chain.
         if course_filter and not checked_files and _graphrag_enabled():
             graphrag_results = await self._maybe_graphrag(question, course_filter)
-            # fix-all v1 #A3: admission gate uses passes_score_gate with a
-            # graphrag-specific cosine floor (default 0.15) instead of the
-            # original `len >= 2` check. The latter let every chat on a
-            # course with ≥2 topic nodes hit graphrag regardless of how
-            # unrelated the query was, pre-empting the RAG path with a
-            # noisy retrieval.
+            # fix-all v1 #A3 + v2 #V3: admission gate uses passes_score_gate
+            # with a graphrag-specific cosine floor (default 0.15) instead of
+            # the original `len >= 2` check.
+            #
+            # fix-all v2 #V3: pin `min_hits=1` rather than inheriting
+            # RAG_SCORE_GATE_MIN_HITS (default 2). graphrag's whole-chunk
+            # output is qualitatively different from RAG: one strong-cosine
+            # seed (>= 2 * floor) already represents a high-confidence
+            # neighbourhood, whereas RAG needs 2 hits because RRF scores are
+            # tiny + the per-doc strength varies. The RAG default would
+            # otherwise reject single-doc course uploads (one strong concept
+            # match, one cosine, no second hit) even though the score is
+            # high — the exact failure mode upgrading the gate was meant
+            # to avoid.
             if graphrag_results and router_intent.passes_score_gate(
                 graphrag_results,
                 top1_threshold=_graphrag_score_floor(),
+                min_hits=1,
             ):
                 logger.info("qa.path=graphrag course=%s top1=%.4f hits=%d",
                             course_filter, graphrag_results[0].score,
@@ -345,8 +365,12 @@ class QASkill(Skill):
                 graph_search, question, course_filter, self.kb.embed_fn,
             )
         except Exception as exc:  # noqa: BLE001 — never crash chat on KG error
-            logger.warning("graph_search failed for course=%s: %s",
-                           course_filter, exc, exc_info=True)
+            # fix-all v2 #V5 (R4-4 review-swarm v2): drop exc_info=True so
+            # API-mode openai-python tracebacks don't ship user query text
+            # into log shippers / on-call alerts. Exception type + repr is
+            # enough for triage.
+            logger.warning("graph_search failed for course=%s (%s: %s)",
+                           course_filter, type(exc).__name__, exc)
             return None
 
     def _maybe_cross_course_fallback(

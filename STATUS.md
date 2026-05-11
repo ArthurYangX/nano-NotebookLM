@@ -356,6 +356,10 @@
 
 #### R4-4 review-swarm v1 + fix-all v1（2026-05-11，reviewer: claude）
 
+- **status**: [review]
+- **owner**: claude
+- **submitted_at**: 2026-05-11 11:44 (commit 764276d)
+
 4 路 review-swarm（intent+regression / security+privacy / performance+reliability / contracts+coverage）汇出 ~25 项 finding。fix-now 3 项（A1-A3，HIGH/CRITICAL）+ fix-soon 4 项（B4-B7，MEDIUM）+ low 3 项（C8-C10）共 10 条落地，**新增 12 条回归测试**。
 
 **A 批 fix-now（核心正确性）**：
@@ -380,6 +384,29 @@
 **files touched**: nano_notebooklm/kg/{graph.py, extractor.py} / nano_notebooklm/kb/graph_search.py / nano_notebooklm/skills/qa_skill.py / tests/{conftest.py, test_upload_stream.py, test_r4_2_fix_all_v1.py} + **新增** tests/test_r4_4_fix_all_v1.py（12 条回归）。**api/server.py 的 fix-all v1 改动**（B7 startup hook、ChatResponse docstring "four→five"、update_node 编辑后 pop concept_embedding）**意外在 e60bca3 R4-6 commit 中一并 land** — 用户上一会话 commit R4-6 LaTeX pipeline 时 stage 了 working tree 的全部 server.py 改动，这部分等同已 land 但 attribution 在 R4-6。**pytest**: **729 passed in 1171s**（R4-4 + R4-6 baseline + fix-all v1 12 新回归 + conftest disable embed-warmup 让 TestClient 重启不再阻塞）。
 
 **review_notes**: 未处理的 review-swarm finding（下一轮再看）：(a) Reviewer 3 #3 KG/chunks.json 每次 chat 重读（mtime LRU cache，独立成 fix-all v2）；(b) Reviewer 3 #4 api_score 与 sort_key 不一致（架构性，影响 UI score chip 可比性，独立 v2）；(c) Reviewer 2 五条 hardening（path traversal 内嵌防御、NaN/Inf check、node count cap、日志去 absolute path、query length bound — 防御深度，独立 v2）；(d) Reviewer 4 #4 mindmap GET 响应 concept_embedding 隔离 assert 测试（防 future spread refactor 退化）；(e) graphrag-zero → cross-course 链 / user_lang × graphrag prompt 注入端到端测试（需要更完整的 chat_capture fixture，独立 v2 补）。
+
+#### R4-4 review-swarm v2 + fix-all v2（2026-05-11，reviewer: claude）
+
+- **status**: [review]
+- **owner**: claude
+- **submitted_at**: 2026-05-11
+
+第二轮 4 路 review-swarm 对 764276d (fix-all v1) 重审，汇出 ~25 项 finding。**无 critical / high blocker**（v1 已修干净）。10 medium fix-soon 全部落地 + 4 quick low 顺手做。**新增 16 条回归测试**。
+
+**V 批 fix-soon（v1 review 出的 medium）**：
+
+- **V1 contract / doc / clamp**（4 条 low-medium quick）：(a) `_graphrag_score_floor` clamp 到 [0, 1] + INFO log（之前 `-0.5` 完全绕过 admission gate）；(b) STATUS.md fix-all v1 subsection 加 `status: [review]` + `submitted_at` 显式字段；(c) `tests/test_router_intent.py` ChatResponse.path 接受测试加 `"graphrag"`（之前只 4 值）；(d) `.env.example` 加 3 个新 env 注释（`GRAPHRAG_ENABLED` / `GRAPHRAG_SCORE_GATE_TOP1` / `NANO_NLM_DISABLE_EMBED_WARMUP`）。
+- **V2 startup hook 不阻塞 boot + status surface + API mode skip**（MEDIUM，R1 F2 + R3 F2 + R2 F1）：startup 改 `asyncio.create_task(_do_warmup())` fire-and-forget，FastAPI 立即接受连接（K8s liveness 不再 5-30s 拒）；新增 `app.state.embed_warm_ok` flag（`None=in-flight` / `True=ok` / `False=failed`）surface 到 `/api/status` `embed_warm_ok` 字段；`EMBEDDING_MODE=api` 路径完全跳 warmup（API mode 无 local model 可 load，原本会发一次 outbound HTTP 含 literal `"__warmup__"`）。conftest 仍设 `NANO_NLM_DISABLE_EMBED_WARMUP=1`（测试 short-circuit）。
+- **V3 graphrag admission `min_hits=1`**（MEDIUM，R1 F1）：`passes_score_gate(graphrag_results, top1_threshold=_graphrag_score_floor(), min_hits=1)` 显式钉 `min_hits=1`。之前默认继承 `RAG_SCORE_GATE_MIN_HITS=2`，单一强 hit（top1=0.22，>= 2τ 但只有 1 hit）的小课会被 RAG-style "需 ≥2 hits" 拒掉。graphrag 一个强 seed 已足够触发邻居扩展。
+- **V4 batched embed partial fallback**（MEDIUM，R1 F5 + R3 F4）：原 `_resolve_node_embeddings` batch 失败 → 整个 cache-miss 列表丢失（legacy KG 上 = 全部节点，graph_search 返 []）。新加 `_resolve_per_node` helper，batch except → 逐节点 try/except 兜底，poison-text outlier 只丢自身节点不丢全部。
+- **V5 log PII scrub**（MEDIUM，R2 F3 + R2 F4）：3 处 log 修：(a) `graph_search.py:embed_fn failed on query` 去 `exc_info=True`（openai-python 异常 traceback 可能含 `input=[query]`）；(b) `qa_skill._maybe_graphrag` failure log 同样去 `exc_info=True`；(c) `_load_kg` / `_load_chunks_index` 失败 log 只显示 `course=%s` 不显示 absolute path。
+- **V6 `_load_kg` apply user-edit overlay**（MEDIUM，R1 F8）：新增 `_apply_minimal_edit_overlay` helper，graphrag 加载 KG 时也走一遍 `mindmap_edits.json` 的 `delete_node` / `delete_edge` ops，让学生删的节点真正不再 seed 检索。`add_node` / `update_node` / `add_edge` ops 不处理（前者无 source_chunks 无价值，update_node 已通过 v1 #B5 pop concept_embedding 走 lazy 自然新算）。
+
+**files touched**: nano_notebooklm/kb/graph_search.py / nano_notebooklm/skills/qa_skill.py / api/server.py / .env.example / tests/test_router_intent.py + **新增** tests/test_r4_4_fix_all_v2.py（16 条回归）。**pytest**: **(待补)**。
+
+**self-check**: ☑ mini-test（4 个 ChatResponse.path / docstring grep / status surface / API mode skip）  ☑ corner-test（clamp 负值 / clamp 上限 / batch partial fallback / 三处 log PII / delete_node overlay / delete_edge overlay / 无 edits / 损坏 edits 文件）  ☑ no regression（待全 suite 验证）  ☑ offline。
+
+**review_notes**: 仍 deferred 到 v3（不阻塞）：(a) Reviewer 3 #3 KG/chunks.json mtime LRU cache；(b) Reviewer 3 #4 api_score 与 sort_key 不一致；(c) Reviewer 4 #4 mindmap GET concept_embedding 隔离 assert 测试；(d) graphrag-zero → cross-course 链 / user_lang × graphrag prompt 注入端到端测试；(e) `_Shim` 类型化用 Concept；(f) 6 个 preset KG 一次性 backfill script；(g) Reviewer 3 #1 SentenceTransformer 首加载竞争锁。
 
 ### #R4-5 Backend backend 切换 chip：codex GPT-5.4 / Qwen2.5-7B-RAFT — [claude]
 

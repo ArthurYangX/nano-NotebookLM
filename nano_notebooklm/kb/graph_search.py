@@ -66,10 +66,77 @@ def _load_kg(course_id: str, artifacts_dir: Path) -> dict[str, Any] | None:
     if not kg_path.exists():
         return None
     try:
-        return json.loads(kg_path.read_text(encoding="utf-8"))
+        kg = json.loads(kg_path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
-        logger.warning("graph_search: failed to load %s; treating as no-KG", kg_path)
+        # fix-all v2 #V5: log only course_id (not full absolute path) to
+        # avoid disclosing server filesystem layout in shared log shippers.
+        logger.warning(
+            "graph_search: failed to load knowledge_graph.json for course=%s; "
+            "treating as no-KG", course_id,
+        )
         return None
+    # fix-all v2 #V6 (R4-4 review-swarm v2): apply user-edit overlay so a
+    # node the student deleted via /api/mindmap/{id}/edit doesn't keep
+    # seeding graphrag retrieval. The system-KG file is append-only
+    # (re-extraction rewrites the whole file); student edits live in a
+    # sidecar mindmap_edits.json replayed on every read in api/server.py
+    # — graphrag previously bypassed this overlay by reading the raw KG.
+    return _apply_minimal_edit_overlay(kg, course_id, artifacts_dir)
+
+
+def _apply_minimal_edit_overlay(
+    kg: dict[str, Any], course_id: str, artifacts_dir: Path
+) -> dict[str, Any]:
+    """fix-all v2 #V6: apply the subset of student edits that affects
+    graphrag retrieval — `delete_node`, `delete_edge`. We don't replay
+    `add_node` / `add_edge` (student-added nodes carry no source_chunks
+    and add no value to retrieval) or `update_node` text edits (the v1
+    #B5 fix already pops the stale embedding in api/server.py so the
+    lazy recompute on next graph_search reads the fresh name/definition).
+
+    Keeping this overlay minimal + local avoids a circular dependency
+    between nano_notebooklm.kb and api.server.
+    """
+    edits_path = artifacts_dir / "courses" / course_id / "mindmap_edits.json"
+    if not edits_path.exists():
+        return kg
+    try:
+        ops = json.loads(edits_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return kg
+    if not isinstance(ops, list):
+        return kg
+
+    deleted_nodes: set[str] = set()
+    deleted_edges: set[tuple[str, str]] = set()
+    for op in ops:
+        if not isinstance(op, dict):
+            continue
+        kind = op.get("op")
+        if kind == "delete_node":
+            nid = op.get("id")
+            if isinstance(nid, str):
+                deleted_nodes.add(nid)
+        elif kind == "delete_edge":
+            src, tgt = op.get("source"), op.get("target")
+            if isinstance(src, str) and isinstance(tgt, str):
+                deleted_edges.add((src, tgt))
+
+    if not deleted_nodes and not deleted_edges:
+        return kg
+
+    out = dict(kg)  # shallow copy; nodes/edges are list refs (we replace them)
+    if deleted_nodes:
+        out["nodes"] = [n for n in (kg.get("nodes") or [])
+                        if n.get("id") not in deleted_nodes]
+    if deleted_nodes or deleted_edges:
+        out["edges"] = [
+            e for e in (kg.get("edges") or [])
+            if e.get("source") not in deleted_nodes
+            and e.get("target") not in deleted_nodes
+            and (e.get("source"), e.get("target")) not in deleted_edges
+        ]
+    return out
 
 
 def _load_chunks_index(course_id: str, artifacts_dir: Path) -> dict[str, dict[str, Any]]:
@@ -83,7 +150,8 @@ def _load_chunks_index(course_id: str, artifacts_dir: Path) -> dict[str, dict[st
     try:
         data = json.loads(chunks_path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
-        logger.warning("graph_search: failed to load %s", chunks_path)
+        # fix-all v2 #V5: log only course_id, not full absolute path.
+        logger.warning("graph_search: failed to load chunks.json for course=%s", course_id)
         return {}
     return {row["chunk_id"]: row for row in data if isinstance(row, dict) and row.get("chunk_id")}
 
@@ -141,15 +209,26 @@ def _resolve_node_embeddings(
         if batch_arr.ndim != 2:
             logger.warning(
                 "graph_search: batched embed returned rank %d (expected 2); "
-                "skipping %d lazy nodes", batch_arr.ndim, len(to_compute),
+                "falling back to per-node embed", batch_arr.ndim,
             )
+            _resolve_per_node(to_compute, embed_fn, expected_dim, cache)
             return cache
-    except Exception:  # noqa: BLE001 — partial cache still ranks the cached nodes
+    except Exception as exc:  # noqa: BLE001
+        # fix-all v2 #V4 (R4-4 review-swarm v2): the v1 batched path
+        # returned `cache` empty-handed on any batch failure, so a single
+        # bad token / tokenizer error / rate limit wiped out the whole
+        # cache-miss list. On legacy KGs (no cached embeddings on disk)
+        # that's the entire ranking input → graph_search silently
+        # returned []. Fall back to per-node embed so a single bad text
+        # only loses its own node, not all 200. Log without exc_info to
+        # avoid leaking request bodies from openai-python tracebacks
+        # (#V5 PII scrub principle).
         logger.warning(
-            "graph_search: batched lazy embed failed for %d nodes; "
-            "ranking will use cached-only subset",
-            len(to_compute), exc_info=True,
+            "graph_search: batched lazy embed failed (%s: %s); "
+            "falling back to per-node embed for %d nodes",
+            type(exc).__name__, exc, len(to_compute),
         )
+        _resolve_per_node(to_compute, embed_fn, expected_dim, cache)
         return cache
 
     for (nid, _), emb in zip(to_compute, batch_arr):
@@ -161,6 +240,34 @@ def _resolve_node_embeddings(
                 nid, emb.shape, expected_dim,
             )
     return cache
+
+
+def _resolve_per_node(
+    to_compute: list[tuple[str, str]],
+    embed_fn: Callable[[list[str]], Any],
+    expected_dim: int,
+    cache: dict[str, np.ndarray],
+) -> None:
+    """fix-all v2 #V4: per-node embed_fn fallback after a batch failure.
+
+    Each failed node loses only itself, not the whole batch — preserves
+    partial-cache ranking when the corpus has a poison-text outlier
+    (e.g. a chunk that the tokenizer rejects) or a transient API blip.
+    Mutates `cache` in place.
+    """
+    for nid, text in to_compute:
+        try:
+            out = embed_fn([text])
+            arr = np.asarray(out, dtype=np.float32)
+            if arr.ndim == 2 and arr.shape[0] == 1:
+                arr = arr[0]
+            if arr.shape == (expected_dim,):
+                cache[nid] = arr
+        except Exception as exc:  # noqa: BLE001 — one bad node must not abort the rest
+            logger.debug(
+                "graph_search: per-node embed failed for %s (%s)",
+                nid, type(exc).__name__,
+            )
 
 
 def _bfs_neighbors(
@@ -224,8 +331,14 @@ def graph_search(
         if q_emb.ndim != 1:
             logger.warning("graph_search: query embedding has rank %d, expected 1", q_emb.ndim)
             return []
-    except Exception:  # noqa: BLE001 — embed_fn failure cannot crash chat
-        logger.warning("graph_search: embed_fn failed on query", exc_info=True)
+    except Exception as exc:  # noqa: BLE001 — embed_fn failure cannot crash chat
+        # fix-all v2 #V5 (R4-4 review-swarm v2): drop exc_info=True on the
+        # query-embed path. In EMBEDDING_MODE=api, the openai-python SDK's
+        # exception object often carries the request body (`input=[query]`)
+        # in its repr/traceback, which would land the user's question in
+        # log shippers. Type + message is sufficient for triage.
+        logger.warning("graph_search: embed_fn failed on query (%s: %s)",
+                       type(exc).__name__, exc)
         return []
 
     expected_dim = int(q_emb.shape[0])
