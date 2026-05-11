@@ -1640,22 +1640,60 @@ function RealNotesView({ content, streaming, activeCourse, onContentChange, gene
     if (streaming) return;
     const scroller = previewRef.current && previewRef.current.closest(".notes-reader-body");
     if (!scroller) return;
-    let cancelled = false;
-    let pendingRaf2 = 0;
-    const raf1 = requestAnimationFrame(() => {
-      if (cancelled) return;
-      pendingRaf2 = requestAnimationFrame(() => {
-        if (cancelled) return;
-        const saved = StudyState.loadNotesScroll(localStorage, activeCourse);
-        if (saved != null && scroller.scrollHeight > 0) {
-          scroller.scrollTop = Math.min(saved, scroller.scrollHeight);
-        }
-      });
-    });
+    const saved = StudyState.loadNotesScroll(localStorage, activeCourse);
+    if (saved == null || saved <= 0) return;
+
+    // Suppress the `.notes-reader-body { scroll-behavior: smooth }` CSS
+    // so the user doesn't see a 1-2 second animated scroll from top to
+    // their saved position — looks like the page is dragging itself.
+    function applyScroll(targetY) {
+      const prev = scroller.style.scrollBehavior;
+      scroller.style.scrollBehavior = "auto";
+      const maxY = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+      scroller.scrollTop = Math.min(targetY, maxY);
+      // Force reflow so the browser commits the scrollTop before we
+      // hand the smooth-scroll behavior back; otherwise the next user
+      // interaction can animate from a partial state.
+      // eslint-disable-next-line no-unused-expressions
+      scroller.offsetHeight;
+      scroller.style.scrollBehavior = prev;
+    }
+
+    // Retry across animation frames until the document is tall enough
+    // to actually hold our saved offset — KaTeX auto-render is async
+    // and grows content height after the initial paint, so a single
+    // rAF×2 restore would silently land short and the user would still
+    // see the page near the top. Cap attempts to ~20 frames (~330ms).
+    let stop = false;
+    let attempts = 0;
+    function tryRestore() {
+      if (stop) return;
+      attempts += 1;
+      const maxY = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+      if (maxY >= saved) {
+        applyScroll(saved);
+        return;
+      }
+      if (attempts < 20) {
+        requestAnimationFrame(tryRestore);
+      }
+    }
+    const raf = requestAnimationFrame(tryRestore);
+
+    // Tail-time fallback: after 600ms, force a best-effort restore
+    // regardless. By then KaTeX has run (its throttle is 200ms) and
+    // any large \begin{align} blocks have laid out. If the document
+    // still isn't tall enough we clamp via the maxY in applyScroll —
+    // the user lands as close as the doc permits, not at the top.
+    const tailTimer = setTimeout(() => {
+      if (stop) return;
+      applyScroll(saved);
+    }, 600);
+
     return () => {
-      cancelled = true;
-      cancelAnimationFrame(raf1);
-      if (pendingRaf2) cancelAnimationFrame(pendingRaf2);
+      stop = true;
+      cancelAnimationFrame(raf);
+      clearTimeout(tailTimer);
     };
   }, [activeCourse, editing, streaming]);
 
@@ -1664,17 +1702,37 @@ function RealNotesView({ content, streaming, activeCourse, onContentChange, gene
     if (editing) return;
     const scroller = previewRef.current && previewRef.current.closest(".notes-reader-body");
     if (!scroller) return;
+    // BUG FIX (round 2 of scroll cache): the original throttled-save
+    // path queued the localStorage write inside a rAF. When the user
+    // clicked a citation chip, RealNotesView unmounted and the rAF then
+    // fired with a detached DOM whose .scrollTop reads as 0 —
+    // overwriting the user's real position with 0 right at unmount.
+    // Now we (a) flag the effect as detached in cleanup so the rAF
+    // bails, and (b) do a synchronous final save on cleanup while the
+    // DOM is still connected. That last-chance save is what lets the
+    // restore on remount land at the right spot.
+    let detached = false;
     let ticking = false;
     function onScroll() {
       if (ticking) return;
       ticking = true;
       requestAnimationFrame(() => {
         ticking = false;
+        if (detached) return;
         StudyState.saveNotesScroll(localStorage, activeCourse, scroller.scrollTop);
       });
     }
     scroller.addEventListener("scroll", onScroll, { passive: true });
-    return () => scroller.removeEventListener("scroll", onScroll);
+    return () => {
+      detached = true;
+      scroller.removeEventListener("scroll", onScroll);
+      // Final flush: capture the user's last position before the
+      // component unmounts. isConnected guards against the rare case
+      // where React has already detached the node.
+      if (scroller.isConnected) {
+        StudyState.saveNotesScroll(localStorage, activeCourse, scroller.scrollTop);
+      }
+    };
   }, [activeCourse, editing]);
 
   // Regeneration kicks off → drop the saved offset so the freshly
