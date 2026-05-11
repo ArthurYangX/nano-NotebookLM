@@ -140,12 +140,17 @@ def test_startup_warmup_uses_create_task_not_blocking_await(monkeypatch):
 
 def test_status_endpoint_surfaces_embed_warm_ok():
     """grep /api/status response shape for embed_warm_ok key.
-    Slice widened to 2400 chars: R4-5 part 2 added a qwen health probe
-    block at the top of status_endpoint that pushed embed_warm_ok past
-    the original 1200-char window."""
+
+    R4-5 fix-all v1 #V8 (R4-5 review v1): replace the magic char-count
+    slice with a sentinel-based slice — find the end of status_endpoint
+    by locating the next `async def` declaration. This makes the grep
+    robust to future status_endpoint growth (the original 1200/2400
+    char windows already broke once when v2 / part 2 grew the body)."""
     src = (REPO_ROOT / "api" / "server.py").read_text(encoding="utf-8")
-    status_block = src[src.index("async def status_endpoint"):
-                       src.index("async def status_endpoint") + 2400]
+    start = src.index("async def status_endpoint")
+    # Next `async def` (or `def`) declaration marks the end of the function.
+    end = src.index("\nasync def ", start + 1)
+    status_block = src[start:end]
     assert '"embed_warm_ok"' in status_block, \
         "/api/status must surface embed_warm_ok"
 

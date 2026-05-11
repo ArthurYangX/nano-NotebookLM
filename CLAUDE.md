@@ -337,6 +337,39 @@ nano_notebooklm/   Python backend modules
   and the default-None routing case so the chip can't accidentally
   force every request through qwen. **Round 4 P0 (R4-1..R4-5) is now
   complete.**
+- R4-5 part 2 review-swarm fix-all v1 (2026-05-11): first review-swarm
+  on commit 6d2e590 surfaced 1 CRITICAL ("codex" alias hard-assumed
+  OPENAI_API_KEY existed → claude-only / qwen-only deployments 500 on
+  every chat) + 10 MEDIUM + 12 LOW. All 1+10 land plus 5 quick LOW; 21
+  regression tests in tests/test_r4_5_part2_fix_all_v1.py. Key changes:
+  (V1) `_complete_with_backend_fallback` treats `backend="codex"` as
+  default task routing (same semantics as None) instead of pinning the
+  internal "openai" backends key — the chip's "codex" label is the
+  user-facing "use the configured main backend" not a hard openai pin.
+  (V2) `/api/status` qwen health probe is now TTL-cached on
+  `app.state.qwen_health_cache` (`QWEN_HEALTH_TTL_SECONDS` env, default
+  15s) so the 10s frontend poll × N tabs doesn't trigger 6N req/min
+  outbound to AutoDL; failure is cached too. (V3) `QWEN_RAFT_URL` is
+  validated at config load — scheme must be http/https, host must not
+  be a cloud-metadata endpoint (AWS / GCP / Aliyun IMDS); plaintext on
+  non-loopback host warns. (V4) qwen path inside the helper uses
+  `max_retries=1` (outer wait_for is the budget; router-level retries
+  inside wait something for nothing), `except` narrows to
+  `(QwenBackendError, RuntimeError, httpx.HTTPError)` (so a real
+  programming bug surfaces as 500 instead of getting silently masked
+  by `backend_fallback=True`), and log lines use
+  `getattr(exc, "code", type(exc).__name__)` to avoid leaking prompt /
+  URL via `str(exc)`. (V5) `QWEN_BACKEND_TIMEOUT_SECONDS` env override
+  (default 30s) — operators can tune. (V6) frontend `useEffect` auto-
+  rollbacks the chip selection to "codex" when /api/status reports
+  qwen unavailable / unconfigured; status polling adds ±20% jitter so
+  concurrent tabs don't pulse AutoDL in unison. (V7) `.env.example`
+  documents 6 R4-5 env knobs. (V8) ChatRequest.backend and
+  ChatResponse.backend_fallback get `Field(description=...)` so
+  OpenAPI `/docs` surfaces the semantics; tests/test_r4_4_fix_all_v2's
+  status_endpoint grep uses a sentinel slice instead of a magic char
+  count (robust against future status_endpoint growth). Round 4 P0
+  (R4-1 ~ R4-5 + 1 R4-5 fix-all v1) is now production-grade.
 - Still missing for production: auth / multi-tenant, request rate limits,
   background-task ingestion, OpenAPI client codegen, structured metrics
   (Prometheus). Mastery is still read-only (KG editing landed in M3).

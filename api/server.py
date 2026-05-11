@@ -152,6 +152,12 @@ async def _probe_tectonic() -> None:
 # ── Upload limits ────────────────────────────────────────────────────
 MAX_UPLOAD_SIZE_MB = 50
 MAX_UPLOAD_SIZE_BYTES = MAX_UPLOAD_SIZE_MB * 1024 * 1024
+
+# fix-all v1 #V2 (R4-5 review v1): TTL for the qwen_raft health probe
+# cached on app.state.qwen_health_cache. 15s > 10s frontend poll → cache
+# hit rate ~100% for steady-state polling; cold pulse on operator config
+# change still surfaces within one cycle.
+QWEN_HEALTH_TTL_SECONDS = float(os.environ.get("QWEN_HEALTH_TTL_SECONDS", "15.0"))
 ALLOWED_UPLOAD_SUFFIXES = {".pdf", ".pptx", ".docx", ".md", ".txt"}
 
 # review-swarm fix-all v1 #6: reject any uploaded filename that contains
@@ -449,13 +455,24 @@ class ChatRequest(BaseModel):
     # rejected at the Pydantic layer so a stale localStorage value can't
     # smuggle a bogus instruction into the prompt.
     user_lang: Literal["zh", "en"] | None = None
-    # R4-5 part 2: optional backend override. "codex" routes the chat
-    # through the OpenAI-compatible proxy (GPT-5.4 etc.); "qwen_raft"
-    # routes through the AutoDL Qwen2.5-7B-RAFT HTTP backend. None =
-    # default task routing (codex stays the main path). The chat endpoint
-    # 422s when backend="qwen_raft" but QWEN_RAFT_URL is unset, so a stale
-    # localStorage chip selection doesn't silently fall through.
-    backend: Literal["codex", "qwen_raft"] | None = None
+    # R4-5 part 2 + fix-all v1 #V8: optional backend override surfaced
+    # via the topbar chip. "codex" = default task routing (the chip's
+    # user-facing label for "use the configured main backend"; v1
+    # treated this as a hard openai pin but that 500s in claude-only
+    # deployments — fix-all v1 #V1 reverted to "default routing" so
+    # codex never forces openai). "qwen_raft" = explicit pin on the
+    # AutoDL Qwen2.5-7B-RAFT HTTP backend. None = same as "codex".
+    # The chat endpoint 422s when backend="qwen_raft" but
+    # QWEN_RAFT_URL is unset, so a stale localStorage chip selection
+    # doesn't silently fall through.
+    backend: Literal["codex", "qwen_raft"] | None = Field(
+        default=None,
+        description=(
+            'Optional backend override surfaced via the topbar chip. '
+            '"codex" = default task routing; "qwen_raft" = AutoDL '
+            'Qwen2.5-7B-RAFT (requires QWEN_RAFT_URL configured).'
+        ),
+    )
 
     @field_validator("question")
     @classmethod
@@ -523,12 +540,20 @@ class ChatResponse(BaseModel):
     filter_empty: bool | None = None
     filter_low_quality: bool | None = None
     cross_course_origin: str | None = None
-    # R4-5 part 2: True when an explicit backend="qwen_raft" request fell
-    # back to codex inside qa_skill (qwen timeout / upstream error).
+    # R4-5 part 2 + fix-all v1 #V8: True when an explicit
+    # backend="qwen_raft" request silently degraded to the default
+    # routing backend inside qa_skill (qwen timeout / upstream error).
     # `QWEN_RAFT_URL` unset would have 422'd at the endpoint earlier, so
     # this flag specifically signals a runtime degradation, not a config
     # miss. None when no fallback occurred.
-    backend_fallback: bool | None = None
+    backend_fallback: bool | None = Field(
+        default=None,
+        description=(
+            "True when the response degraded from the requested backend "
+            '(typically qwen_raft) to the default routing backend due to '
+            "timeout or upstream failure. None when no fallback occurred."
+        ),
+    )
     model_config = {"extra": "forbid"}
 
 
@@ -2610,16 +2635,27 @@ async def status_endpoint():
     #   - qwen_raft_available  = health_check returned ok within 2s
     # The health probe is wrapped in wait_for + broad except so this
     # endpoint never 500s on a flaky AutoDL backend.
+    # fix-all v1 #V2 (R4-5 review v1): cache the qwen health probe so
+    # the frontend's 10s status poll across N tabs doesn't pin AutoDL
+    # with 6N outbound requests/min. TTL=15s means worst-case rate is
+    # 4 outbound/min regardless of tab count. Failure is cached too —
+    # no point hammering a dead host once we know it's dead.
     qwen_configured = bool(config.QWEN_RAFT_URL)
     qwen_available = False
     if qwen_configured and "qwen_raft" in router.backends:
-        try:
-            qwen_health = await asyncio.wait_for(
-                router.backends["qwen_raft"].health_check(), timeout=2.0,
-            )
-            qwen_available = bool(qwen_health.get("ok"))
-        except Exception:  # noqa: BLE001 — status must never 500
-            qwen_available = False
+        cached = getattr(app.state, "qwen_health_cache", None)
+        now = time.monotonic()
+        if cached is not None and (now - cached[0]) < QWEN_HEALTH_TTL_SECONDS:
+            qwen_available = bool(cached[1])
+        else:
+            try:
+                qwen_health = await asyncio.wait_for(
+                    router.backends["qwen_raft"].health_check(), timeout=2.0,
+                )
+                qwen_available = bool(qwen_health.get("ok"))
+            except Exception:  # noqa: BLE001 — status must never 500
+                qwen_available = False
+            app.state.qwen_health_cache = (now, qwen_available)
 
     return {
         "backends": list(router.backends.keys()),

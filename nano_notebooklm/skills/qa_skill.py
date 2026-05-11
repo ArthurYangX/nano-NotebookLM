@@ -23,10 +23,28 @@ import re
 from typing import Iterable
 
 from nano_notebooklm.ai import prompt_templates as prompts
+from nano_notebooklm.ai.qwen_raft_backend import QwenBackendError
 from nano_notebooklm.orchestrator import router_intent
 from nano_notebooklm.orchestrator.memory import add_interaction, get_context_prompt
 from nano_notebooklm.skills.base import Skill
 from nano_notebooklm.types import LLMResponse, SearchResult, SkillResult
+
+try:
+    import httpx as _httpx
+    _HTTP_ERROR_TYPE: type = _httpx.HTTPError
+except ImportError:  # pragma: no cover — httpx is a hard dependency, just defensive
+    _HTTP_ERROR_TYPE = Exception
+
+# fix-all v1 #V4 (R4-5 review v1): narrow `except Exception` in the qwen
+# fallback path so a genuine programming bug (KeyError/TypeError on a
+# malformed LLMResponse) surfaces as a 500 rather than getting masked
+# by `backend_fallback=True`. RuntimeError covers router.complete's
+# "all retries exhausted" + _resolve_backend's missing-backend raise.
+_QWEN_EXPECTED_ERRORS: tuple[type[BaseException], ...] = (
+    QwenBackendError,
+    RuntimeError,
+    _HTTP_ERROR_TYPE,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -41,13 +59,35 @@ TRANSLATION_TIMEOUT_SECONDS = 5.0
 # leaving headroom for legacy KGs that pay the per-node batch on first use.
 GRAPHRAG_TIMEOUT_SECONDS = 10.0
 
-# R4-5 part 2: bound an explicit `backend="qwen_raft"` LLM call. AutoDL
-# Qwen2.5-7B-RAFT inference is typically 3-15s on warm GPU; 30s catches
-# a hung HTTP connection / cold-start anomaly while leaving runway for
-# legitimate slow responses. On timeout the chat path silently degrades
-# to codex and the response carries `backend_fallback=True` so the
-# frontend can chip-flag the degradation.
-QWEN_BACKEND_TIMEOUT_SECONDS = 30.0
+# R4-5 part 2 + fix-all v1 #V5: bound an explicit `backend="qwen_raft"`
+# LLM call. AutoDL Qwen2.5-7B-RAFT inference is typically 3-15s on warm
+# GPU; 30s catches a hung HTTP connection / cold-start anomaly while
+# leaving runway for legitimate slow responses. On timeout the chat
+# path silently degrades to the default routing backend and the response
+# carries `backend_fallback=True` so the frontend can chip-flag the
+# degradation. Operators tuning AutoDL cold-start budgets override via
+# `QWEN_BACKEND_TIMEOUT_SECONDS` env. The qwen client's own transport
+# timeout (`QWEN_RAFT_HTTP_TIMEOUT`, default 60s) is independent —
+# operators raising this above this constant will see chat still time
+# out at the chat-path budget.
+def _qwen_backend_timeout() -> float:
+    raw = os.getenv("QWEN_BACKEND_TIMEOUT_SECONDS")
+    if not raw:
+        return 30.0
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning(
+            "QWEN_BACKEND_TIMEOUT_SECONDS=%r is not a float; using default 30.0",
+            raw,
+        )
+        return 30.0
+    if value <= 0 or value != value or value in (float("inf"), float("-inf")):
+        return 30.0
+    return value
+
+
+QWEN_BACKEND_TIMEOUT_SECONDS = _qwen_backend_timeout()
 
 # fix-all v1 #A3 / #B6 (R4-4 review-swarm): graphrag admission gate. Plain
 # cosine ranking against the KG concept embeddings yields api_scores roughly
@@ -529,18 +569,38 @@ class QASkill(Skill):
         max_tokens: int = 4096,
         backend: str | None = None,
     ) -> tuple[LLMResponse, bool]:
-        """R4-5 part 2: wrap router.complete with qwen_raft → codex
-        fallback semantics.
+        """R4-5 part 2 + fix-all v1: wrap router.complete with
+        qwen_raft → default fallback semantics.
 
         When `backend="qwen_raft"`, the call is bounded by
         `QWEN_BACKEND_TIMEOUT_SECONDS` and any failure (timeout, HTTP
-        error, malformed response) silently degrades to codex. Returns
+        error, transient 5xx) silently degrades. Returns
         (response, fell_back) so the caller can surface
         `backend_fallback=True` to the client.
 
-        When `backend` is None or "codex", the call follows the normal
-        router path with no extra timeout — router.complete already has
-        its own retry-with-fallback chain.
+        **fix-all v1 #V1 (R4-5 review v1)**: `backend="codex"` is
+        treated as **default task routing** (same as `None`), NOT as
+        an explicit "openai" pin. The original v1 wired codex→openai
+        via alias + disabled router auto-fallback, which 500s on any
+        deployment without `OPENAI_API_KEY` set (claude-only +
+        qwen-only configs). codex is the chip's user-facing label for
+        "use the default backend", not a hard pin on the openai key.
+
+        **fix-all v1 #V4**: when qwen_raft is pinned, set
+        `max_retries=1` so the router's exponential-backoff retry
+        loop doesn't burn 3.3s before the outer `wait_for` catches a
+        fast-failing 5xx. The `wait_for(30s)` is the budget; retries
+        within it are wasted.
+
+        **fix-all v1 #V4**: narrow the broad `except Exception` to
+        `(httpx.HTTPError, RuntimeError, QwenBackendError)` so a
+        genuine programming bug (TypeError, KeyError) surfaces as 500
+        rather than getting silently masked by the fallback.
+
+        **fix-all v1 #V4 PII scrub**: log only `getattr(exc, "code",
+        type(exc).__name__)` — QwenBackendError carries a stable
+        `code` attribute designed for safe logging. Drop `str(exc)`
+        which may contain prompts / URLs.
         """
         if backend == "qwen_raft":
             try:
@@ -549,30 +609,35 @@ class QASkill(Skill):
                         prompt, task_type=task_type, system=system,
                         temperature=temperature, max_tokens=max_tokens,
                         backend="qwen_raft",
+                        max_retries=1,  # #V4: outer wait_for is the budget
                     ),
                     timeout=QWEN_BACKEND_TIMEOUT_SECONDS,
                 )
                 return resp, False
             except asyncio.TimeoutError:
                 logger.warning(
-                    "qwen_raft backend timed out (>%ss); falling back to codex",
+                    "qwen_raft backend timed out (>%ss); falling back to default routing",
                     QWEN_BACKEND_TIMEOUT_SECONDS,
                 )
-            except Exception as exc:  # noqa: BLE001 — explicit fallback
+            except _QWEN_EXPECTED_ERRORS as exc:
+                # #V4 PII scrub: prefer stable error code; never log exc body.
+                code = getattr(exc, "code", type(exc).__name__)
                 logger.warning(
-                    "qwen_raft backend failed (%s: %s); falling back to codex",
-                    type(exc).__name__, exc,
+                    "qwen_raft backend failed (%s); falling back to default routing",
+                    code,
                 )
-            # Fallback to codex. Use an explicit backend kwarg so the
-            # router doesn't try its own auto-fallback chain on top.
+            # #V1: fall back to **default task routing** (no explicit
+            # backend pin). Avoids the codex→openai hard assumption.
             resp = await self.router.complete(
                 prompt, task_type=task_type, system=system,
                 temperature=temperature, max_tokens=max_tokens,
-                backend="codex",
             )
             return resp, True
 
-        # No qwen override → default task-type routing (current behaviour).
+        # backend is None or "codex": default task-type routing.
+        # #V1: "codex" is the user-facing chip label; treat it as
+        # "use whatever backend the operator configured" rather than
+        # forcing openai. Operator's DEFAULT_BACKEND + TASK_ROUTES rule.
         resp = await self.router.complete(
             prompt, task_type=task_type, system=system,
             temperature=temperature, max_tokens=max_tokens,
