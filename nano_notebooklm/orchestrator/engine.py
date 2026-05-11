@@ -11,6 +11,7 @@ from nano_notebooklm.orchestrator.parallel import ParallelRunner
 from nano_notebooklm.orchestrator.session import Session
 from nano_notebooklm.skills.base import Skill
 from nano_notebooklm.skills.exam_analyzer import ExamAnalyzerSkill
+from nano_notebooklm.skills.exam_prep import ExamPrepSkill
 from nano_notebooklm.skills.mastery_tracker import MasteryTrackerSkill
 from nano_notebooklm.skills.note_generator import NoteGeneratorSkill
 from nano_notebooklm.skills.qa_skill import QASkill
@@ -37,6 +38,7 @@ class Orchestrator:
             "note_generator": NoteGeneratorSkill(kb, router),
             "quiz_generator": QuizGeneratorSkill(kb, router),
             "exam_analyzer": ExamAnalyzerSkill(kb, router),
+            "exam_prep": ExamPrepSkill(kb, router),
             "mastery_tracker": MasteryTrackerSkill(kb, router),
             "report_generator": ReportGeneratorSkill(kb, router),
         }

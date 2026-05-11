@@ -1708,7 +1708,7 @@ mark.hl[data-has-note="1"] {
   box-shadow: inset 0 -2px 0 0 var(--accent);
 }
 mark.hl:hover { filter: brightness(0.95); }
-mark.hl-flash { animation: hl-flash 0.9s ease-out; }
+mark.hl-flash, .hl-jump.hl-flash { animation: hl-flash 0.9s ease-out; }
 @keyframes hl-flash {
   0%   { outline: 2px solid var(--accent); outline-offset: 1px; }
   100% { outline: 2px solid transparent; outline-offset: 1px; }
@@ -2698,6 +2698,113 @@ mark.hl-flash { animation: hl-flash 0.9s ease-out; }
 }
 .lang-modal-close:hover { color: var(--ink-2); }
 
+/* ── In-Notes citation PDF preview modal ──
+   A floating viewer that opens when the user clicks a `\cite{}` chip in the
+   Notes preview. iframe hosts the browser's native PDF renderer; the
+   `#page=N` URL anchor on `API.sourceFileUrl` jumps to the cited page. */
+.pdf-preview-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.42);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1100;  /* above .lang-modal-overlay so a citation chip in the
+                    course-manager wouldn't be hidden behind it; in practice
+                    the two modals never co-exist, but cheap insurance. */
+  padding: 24px;
+}
+.pdf-preview-modal {
+  background: var(--paper);
+  color: var(--ink);
+  border: 1px solid var(--paper-3);
+  border-radius: 10px;
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.28);
+  width: min(1100px, 90vw);
+  height: min(820px, 88vh);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.pdf-preview-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--paper-3);
+  background: var(--paper-2);
+  flex-shrink: 0;
+}
+.pdf-preview-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink-2);
+}
+.pdf-preview-filename {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.pdf-preview-page {
+  font-size: 11px;
+  color: var(--ink-3);
+  letter-spacing: 0.04em;
+  flex-shrink: 0;
+}
+.pdf-preview-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+.pdf-preview-action {
+  background: var(--paper);
+  color: var(--ink-2);
+  border: 1px solid var(--paper-3);
+  border-radius: 6px;
+  padding: 5px 11px;
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  cursor: pointer;
+  transition: background 0.12s ease, border-color 0.12s ease, color 0.12s ease;
+}
+.pdf-preview-action:hover {
+  background: var(--paper-2);
+  border-color: var(--ink-4);
+  color: var(--ink);
+}
+.pdf-preview-close {
+  width: 28px;
+  height: 28px;
+  background: transparent;
+  color: var(--ink-3);
+  border: 1px solid transparent;
+  border-radius: 6px;
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease;
+}
+.pdf-preview-close:hover {
+  background: var(--paper-3);
+  color: var(--ink);
+  border-color: var(--paper-3);
+}
+.pdf-preview-frame {
+  flex: 1 1 auto;
+  width: 100%;
+  border: none;
+  background: var(--paper-2);
+}
+
 /* ── R4-1: empty-courses CTA card (upload-only flow first run) ── */
 .empty-courses-cta {
   display: flex;
@@ -3058,3 +3165,155 @@ mark.hl-flash { animation: hl-flash 0.9s ease-out; }
   color: oklch(0.42 0.18 60);
   background: oklch(0.97 0.03 60);
 }
+
+/* ── Exam Prep ─────────────────────────────────────────────────────── */
+/* The root <div> uses className="reader-body exam-prep-wrap" so it picks
+ * up the R3-1 scroll container (.reader-body sets height:100% + overflow-y:
+ * auto). This class only controls internal layout (padding, max width). */
+.exam-prep-wrap { padding: 28px 40px; max-width: 1100px; margin: 0 auto; }
+.exam-prep-header {
+  display: flex; justify-content: space-between; align-items: flex-start;
+  gap: 16px; margin-bottom: 20px; padding-bottom: 16px;
+  border-bottom: 1px dashed var(--rule);
+}
+.exam-prep-header h2 { margin: 0 0 6px; font-family: var(--serif); font-size: 22px; }
+.exam-prep-overall { display: flex; gap: 6px; align-items: center; font-size: 13px; color: var(--ink-3); }
+.exam-prep-overall b { color: var(--ink); font-weight: 600; }
+.exam-prep-overall .dot { color: var(--ink-4); }
+.exam-prep-actions { display: flex; gap: 8px; flex-shrink: 0; }
+.exam-prep-actions .btn.danger { color: var(--crimson); border-color: var(--crimson-soft); }
+.exam-prep-actions .btn.danger:hover { background: var(--crimson-soft); }
+.exam-prep-empty {
+  text-align: center; padding: 60px 20px; color: var(--ink-3);
+}
+.exam-prep-empty h2 { font-family: var(--serif); margin-top: 0; }
+.exam-prep-empty p { margin-bottom: 18px; }
+.exam-prep-loading {
+  text-align: center; padding: 40px; font-family: var(--mono);
+  font-size: 13px; color: var(--ink-4);
+}
+.exam-prep-loading-label { color: var(--ink-3); margin-bottom: 6px; font-family: var(--serif); font-size: 14px; }
+.exam-prep-loading-elapsed { color: var(--ink-4); font-size: 11px; letter-spacing: 0.04em; }
+
+/* Topic grid */
+.exam-prep-cta-row { margin-bottom: 16px; }
+.topic-grid {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 14px;
+}
+.topic-card {
+  border: 1px solid var(--rule); border-radius: 8px; padding: 14px 16px;
+  background: var(--paper); transition: border-color 120ms, transform 120ms;
+}
+.topic-card:hover { border-color: var(--rule-strong); }
+.topic-card.mastered {
+  background: oklch(0.97 0.025 145);
+  border-color: oklch(0.78 0.10 145);
+}
+.topic-card-head {
+  display: flex; justify-content: space-between; align-items: flex-start;
+  gap: 8px; margin-bottom: 6px;
+}
+.topic-card-head h3 {
+  font-family: var(--serif); font-size: 15px; margin: 0;
+  line-height: 1.3; color: var(--ink);
+}
+.topic-mastered-chip {
+  font-family: var(--mono); font-size: 10px; padding: 2px 7px; border-radius: 10px;
+  background: oklch(0.92 0.07 145); color: oklch(0.35 0.15 145); flex-shrink: 0;
+}
+.topic-meta {
+  display: flex; gap: 4px; align-items: center; font-size: 11px;
+  color: var(--ink-4); margin-bottom: 8px;
+}
+.topic-meta .dot { color: var(--ink-4); }
+.topic-attempts { margin-top: -4px; }
+.topic-correct-rate.good { color: oklch(0.45 0.16 145); font-weight: 600; }
+.topic-correct-rate.mid  { color: oklch(0.5 0.14 65); font-weight: 600; }
+.topic-correct-rate.bad  { color: oklch(0.55 0.18 25); font-weight: 600; }
+.topic-progress {
+  height: 6px; background: var(--paper-2); border-radius: 3px;
+  overflow: hidden; margin-bottom: 10px;
+}
+.topic-progress-bar {
+  height: 100%; background: linear-gradient(90deg, var(--accent) 0%, oklch(0.65 0.18 145) 100%);
+  transition: width 200ms ease-out;
+}
+.topic-card.mastered .topic-progress-bar { background: oklch(0.65 0.18 145); }
+.topic-quiz-btn { width: 100%; font-size: 12px; }
+.topic-card.mastered .topic-quiz-btn { opacity: 0.5; }
+
+/* Active quiz */
+.exam-prep-quiz { padding: 4px 0; }
+.exam-prep-quiz-head {
+  display: flex; justify-content: space-between; align-items: center;
+  margin-bottom: 18px; padding-bottom: 12px; border-bottom: 1px dashed var(--rule);
+}
+.exam-prep-quiz-progress {
+  display: flex; gap: 10px; align-items: center;
+}
+.exam-prep-quiz-progress .topic-progress { margin-bottom: 0; }
+.exam-question {
+  margin-bottom: 22px; padding-bottom: 18px;
+  border-bottom: 1px dashed var(--rule);
+}
+.exam-q-num {
+  display: flex; gap: 8px; align-items: center; margin-bottom: 6px;
+  font-family: var(--mono); font-size: 11px; color: var(--accent-ink);
+}
+.exam-q-num .dim { color: var(--ink-4); font-weight: normal; }
+.exam-q-prompt { font-size: 14px; line-height: 1.55; margin: 6px 0 10px; }
+.exam-q-options { display: flex; flex-direction: column; gap: 6px; }
+.exam-q-option {
+  display: flex; gap: 10px; align-items: flex-start;
+  padding: 8px 12px; border-radius: 6px; cursor: pointer;
+  border: 1px solid transparent; font-size: 13px;
+  transition: border-color 80ms, background 80ms;
+}
+.exam-q-option:hover { background: var(--paper-2); }
+.exam-q-option.selected {
+  border-color: var(--accent); background: var(--accent-soft);
+}
+.exam-q-option input[type=radio] { margin-top: 3px; }
+.exam-q-textarea {
+  width: 100%; padding: 10px 12px; border: 1px solid var(--rule);
+  border-radius: 6px; font-family: var(--serif); font-size: 13px;
+  background: var(--paper); color: var(--ink); resize: vertical;
+}
+.exam-q-textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+.exam-prep-quiz-footer {
+  display: flex; justify-content: space-between; margin-top: 24px;
+  padding-top: 16px; border-top: 1px solid var(--rule);
+}
+
+/* Graded result */
+.exam-prep-result { padding: 4px 0; }
+.exam-result-summary {
+  display: flex; gap: 16px; margin-bottom: 24px;
+  padding: 18px 20px; border-radius: 10px; background: var(--paper-2);
+  border: 1px solid var(--rule);
+}
+.exam-result-stat {
+  display: flex; flex-direction: column; align-items: center;
+  flex: 1; gap: 2px;
+}
+.exam-result-stat b { font-size: 28px; font-weight: 600; color: var(--ink); font-family: var(--serif); }
+.exam-result-stat span { font-size: 11px; color: var(--ink-4); text-transform: uppercase; letter-spacing: 0.05em; }
+.exam-result-stat.correct b { color: oklch(0.55 0.18 145); }
+.exam-result-stat.wrong b { color: oklch(0.55 0.22 25); }
+.exam-result-stat.variants b { color: oklch(0.5 0.15 260); }
+.exam-result-list { display: flex; flex-direction: column; gap: 12px; margin-bottom: 20px; }
+.exam-result-item {
+  padding: 14px 16px; border-radius: 8px; border-left: 4px solid var(--rule);
+  background: var(--paper);
+}
+.exam-result-item.correct { border-left-color: oklch(0.65 0.18 145); background: oklch(0.97 0.025 145); }
+.exam-result-item.wrong { border-left-color: oklch(0.62 0.22 25); background: oklch(0.97 0.03 25); }
+.exam-result-head {
+  display: flex; gap: 10px; align-items: center; margin-bottom: 6px;
+  font-family: var(--mono); font-size: 12px; font-weight: 600;
+}
+.exam-result-head .dim { color: var(--ink-4); font-weight: normal; }
+.exam-result-detail { font-size: 13px; line-height: 1.5; color: var(--ink-2); }
+.exam-result-detail > div { margin-top: 4px; }
+.exam-result-detail .dim { color: var(--ink-4); }

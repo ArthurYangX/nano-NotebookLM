@@ -475,6 +475,93 @@ nano_notebooklm/   Python backend modules
     externally-driven attacks are blocked, but local users + a future
     deployment surface need per-IP/per-user rate limit. Accepted in
     pre-user phase; add rate limit when auth lands.
+- **Exam Prep — closed-loop self-evolving exam preparation (2026-05-11):**
+  New skill `nano_notebooklm/skills/exam_prep.py` + 6 REST endpoints
+  (`/api/exam-prep/plan|seed|quiz/next|quiz/submit` POST, `/api/exam-prep/
+  {course_id}` GET+DELETE) + new frontend mode `exam-prep` mounted as
+  `<ExamPrep>` in `frontend/exam-prep.jsx`. Replaces the disjoint
+  Exam Analysis → Quiz → Mastery flow with a single state machine
+  persisted at `artifacts/courses/<id>/exam_bank.json` (version=1
+  envelope, atomic .json.tmp → rename writes).
+  **Lifecycle (action dispatched on the skill via `params["action"]`):**
+  `plan` runs a single LLM call (temperature=0.3) over up to 15 KB
+  search hits → 5–8 exam-relevant topics with stable
+  `topic_id = sha1(name.lower())[:10]`, weight ∈ [0,1], seed
+  source_chunks. `seed` (or implicit on first `next_quiz` for an
+  unseeded topic) fires per-topic LLM calls (concurrent via
+  `asyncio.gather`) at temperature=0.6 to produce mixed-type questions
+  (`multiple_choice` requires exactly 4 `["A. text"]` options + bare-
+  letter `answer`; `short_answer` omits options). `next_quiz` samples
+  non-mastered questions weighted by `topic.weight × (0.4 + 0.6 ×
+  wrong_rate)`, with `max_per_topic = max(1, size/N + 1)` so a tiny
+  topic-count quiz still has breadth. `submit` grades via
+  `check_answer` (multi-choice = letter match using `_extract_letter`;
+  short_answer = ≥3-char substring overlap either direction), pushes
+  `{timestamp, user_answer, correct}` to each question's `history`,
+  advances `consecutive_correct` (resets on wrong), flips
+  `mastered=True` at `MASTERED_THRESHOLD=3` consecutive correct. Then
+  the self-evolution pass: for each wrong-answered topic, one LLM call
+  appends `variant_budget(wrong_topic_count)` fresh questions with
+  `variant_of=<source_q_id>` provenance and alternating kind
+  (multi-choice vs short-answer based on existing question count
+  parity) so variants don't all share the same shape.
+  **Variant budget** (`exam_prep.variant_budget`): `min(PER_TOPIC_CAP=5,
+  max(1, TOTAL_VARIANT_CAP=20 // wrong_topic_count))`. So 1 wrong topic
+  → 5 variants, 5 wrong → 4 each (20 total), 20+ wrong → 1 each. The
+  PER_TOPIC_CAP prevents a single-topic miss from burning the entire
+  20-call budget on near-identical variants.
+  **Topic mastery** (`topic_mastery`): a topic is fully mastered when
+  `total_questions ≥ TOPIC_MASTERY_MIN_QUESTIONS=3` AND
+  `mastered_count / max(total, 3) ≥ TOPIC_MASTERY_RATIO=0.8`. Archived
+  questions excluded from both numerator + denominator. The view payload
+  exposed by `_compute_view` carries per-topic + overall ratios for the
+  frontend progress page.
+  **API surface:** GET / DELETE use `course_id: str` + manual
+  `_validate_course_id_path()` so path-traversal returns the standard
+  `{error, request_id, detail}` envelope at 400, not Pydantic's 422.
+  POST endpoints use `ReqCourseId` body-field Annotated type. The
+  submit endpoint caps `answers` at 50 entries and 2KB per value via a
+  `field_validator` so a runaway client can't enqueue thousands of LLM
+  calls in one submit. Session log records `kind=exam-prep-plan` and
+  `kind=exam-prep-submit {wrong_topic_count, variants_added}`.
+  **Frontend** (`frontend/exam-prep.jsx`): three internal views —
+  `topics` (per-topic mastery progress card grid, "Start Mixed Quiz"
+  + per-topic quiz CTA, mastered topics get a green chip + disabled
+  CTA), `quiz` (mixed multi-choice + short-answer answer pane with a
+  live answered-count bar), `result` (per-question green/red banner
+  + variants-generated count badge so users see the bank growing).
+  CSS lives in `frontend/styles.css` under `/* ── Exam Prep ── */`
+  with oklch greens/reds consistent with the rest of the app. Wired
+  into main nav via `tabs` array `{ id: "exam-prep", label: "Exam
+  Prep", num: "★" }` and `{effectiveMode === "exam-prep" && <ExamPrep
+  .../>}` in app.jsx; script tag registered before assistant.jsx in
+  index.html.
+  Tests: `tests/test_exam_prep.py` (26 — variant_budget math, mastery
+  state transitions, check_answer letter+substring matching, bank
+  load/save roundtrip + version mismatch recovery, plan reuses on
+  second call but force regenerates, submit grades correctly + only
+  wrong topics get variants + variant_of provenance recorded + 3
+  consecutive correct flips mastered + wrong resets streak,
+  reset wipes bank, unknown action surfaces error) +
+  `tests/test_api_smoke.py` (4 new — empty-course view, traversal
+  rejection, oversized-answers 422, no-topics 502).
+  Known gaps: (a) `check_answer` for short_answer is substring-based
+  not LLM-graded — fast and offline but accepts loose matches; an
+  LLM-judge pass is a fix-later if false positives become a pattern;
+  (b) variant generation is fire-and-forget within submit and adds
+  ~3-8s latency proportional to wrong_topic_count — fine for
+  N≤5 wrong but a 20-wrong-topic submit could feel slow (mitigated by
+  the `min(5,…)` cap making max concurrent gen = 5); (c) `seed_questions`
+  in `_generate_questions` falls back to `self.kb.search(topic.name)`
+  when source_chunks are empty, so a topic with no chunk grounding can
+  still produce questions but they may drift from course content;
+  (d) the per-question-id `q_<uuid12>` IDs are random — stable enough
+  for an exam bank lifetime, but if a future feature needs reproducible
+  IDs across re-extracts we'd need to switch to content-hash IDs.
 - Still missing for production: auth / multi-tenant, request rate limits,
   background-task ingestion, OpenAPI client codegen, structured metrics
   (Prometheus). Mastery is still read-only (KG editing landed in M3).
+  The Exam Analysis / Mastery cards in the `Skills` tab are kept
+  alongside Exam Prep as the older fire-once view — they may be
+  retired once Exam Prep gains feature parity (per-topic drilldown,
+  history visualisation).

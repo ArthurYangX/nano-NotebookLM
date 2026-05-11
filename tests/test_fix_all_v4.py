@@ -452,13 +452,20 @@ def test_findTextRangeInRoot_injects_phantom_block_separator():
     """Highlights spanning a heading + paragraph used to fail to re-apply
     because the walker concatenated text-node contents without the block
     separator that `sel.toString()` produces. Pin the phantom-newline
-    injection so a future refactor can't regress."""
+    injection so a future refactor can't regress. The walker logic was
+    extracted into `getBlockAwareDomText` so it can be shared with the
+    selection-capture and prune paths — the pin moved with it."""
     src = Path("frontend/app.jsx").read_text(encoding="utf-8")
-    m = re.search(r"function findTextRangeInRoot\([\s\S]+?\n\}\n", src)
-    assert m, "findTextRangeInRoot not found"
+    m = re.search(r"function getBlockAwareDomText\([\s\S]+?\n\}\n", src)
+    assert m, "getBlockAwareDomText not found"
     body = m.group(0)
     assert "h1,h2,h3" in body, "block-element selector list missing"
     assert 'combined += "\\n\\n"' in body, "phantom newline injection missing"
+    # findTextRangeInRoot must still route through the helper, otherwise
+    # the original highlight Range-resolution loses block-aware text.
+    range_fn = re.search(r"function findTextRangeInRoot\([\s\S]+?\n\}\n", src)
+    assert range_fn and "getBlockAwareDomText(root)" in range_fn.group(0), \
+        "findTextRangeInRoot no longer routes through getBlockAwareDomText"
 
 
 def test_ingest_validates_fallback_cid(secure_client, tmp_path):

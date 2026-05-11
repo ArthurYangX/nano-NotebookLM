@@ -1,4 +1,4 @@
-/* global React, Library, Reader, Notes, MindMap, Quiz, Assistant, Processing, API, StudyState,
+/* global React, Library, Reader, Notes, MindMap, Quiz, ExamPrep, Assistant, Processing, API, StudyState,
    SAMPLE_SOURCES, TweaksPanel, useTweaks, TweakSection, TweakSelect,
    TweakRadio, TweakSlider, TweakToggle, NOTES_DATA, QUIZ_DATA, MINDMAP */
 const { useState, useEffect, useRef } = React;
@@ -13,6 +13,94 @@ const TWEAK_DEFAULTS = /*EDITMODE-BEGIN*/{
   "serifHeads": true
 }/*EDITMODE-END*/;
 
+// CitationPreviewModal — opens a small floating window when the user clicks
+// a Notes citation chip. Hands the file off to the browser's native PDF
+// viewer via `<iframe>` + `#page=N` anchor (same approach as reader.jsx
+// DocumentPdfFrame). Non-PDF sources and missing files fall through to the
+// legacy Reader-tab path before this component is rendered.
+function CitationPreviewModal({ preview, onClose, onOpenInReader }) {
+  // `preview` truthy/null is the only thing that gates the listener.
+  // `onClose` is intentionally NOT in deps — including it would re-bind
+  // the listener on every parent render (App re-renders ~10×/sec while
+  // notes are streaming) because callers pass a fresh arrow each time.
+  // The closure captures `onClose` from the current render, which is
+  // fine — React's setter identity is stable.
+  useEffect(() => {
+    if (!preview) return;
+    function onKey(e) { if (e.key === "Escape") onClose(); }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [preview]);
+
+  // Backdrop click → close, BUT only when the mousedown also originated on
+  // the overlay. Without this guard, a text-selection drag that starts in
+  // the toolbar and releases on the dark backdrop fires `click` on the
+  // overlay (the common ancestor) and dismisses the modal mid-copy. The
+  // ref lives across renders; the modal subtree unmounts when preview is
+  // null, resetting it implicitly.
+  const downOnOverlayRef = useRef(false);
+
+  if (!preview) return null;
+  const { courseId, docId, sourceFile, page } = preview;
+  const url = API.sourceFileUrl(courseId, docId, { page });
+
+  return (
+    <div
+      className="pdf-preview-overlay"
+      role="dialog"
+      aria-modal="true"
+      onMouseDown={(e) => { downOnOverlayRef.current = e.target === e.currentTarget; }}
+      onClick={(e) => {
+        const ok = downOnOverlayRef.current && e.target === e.currentTarget;
+        downOnOverlayRef.current = false;
+        if (ok) onClose();
+      }}
+    >
+      <div className="pdf-preview-modal">
+        <div className="pdf-preview-toolbar">
+          <div className="pdf-preview-title" title={sourceFile}>
+            <span className="pdf-preview-filename">{sourceFile}</span>
+            {page ? <span className="pdf-preview-page mono"> · p.{page}</span> : null}
+          </div>
+          <div className="pdf-preview-actions">
+            <button
+              className="pdf-preview-action mono"
+              onClick={onOpenInReader}
+              title="切换到 Reader 标签页全屏查看"
+            >在 Reader 中打开 ↗</button>
+            <button
+              className="pdf-preview-close"
+              onClick={onClose}
+              aria-label="关闭预览"
+              title="关闭 (Esc)"
+            >✕</button>
+          </div>
+        </div>
+        <iframe
+          className="pdf-preview-frame"
+          src={url}
+          title={sourceFile}
+          // No `sandbox` attribute: Chrome's PDFium plugin renders inline
+          // PDFs as plugin content, and ANY `sandbox` value (even the
+          // permissive `allow-scripts allow-same-origin allow-popups`)
+          // suppresses plugin content → iframe shows the broken-doc icon
+          // instead of the PDF. We tried adding sandbox in fix-all v1
+          // and it broke Reader + modal across all PDFs in Chrome.
+          // Defense-in-depth is preserved server-side via
+          // `X-Content-Type-Options: nosniff` on `/api/source/.../file`,
+          // so a renamed-`.pdf` upload can't ride MIME sniffing into
+          // script execution. `referrerpolicy` still strips the Referer
+          // header so the loaded subresource can't fingerprint the
+          // parent path.
+          referrerPolicy="no-referrer"
+          allow="fullscreen"
+        />
+      </div>
+    </div>
+  );
+}
+
 function App() {
   const tweaks = useTweaks(TWEAK_DEFAULTS);
   const [mode, setMode] = useState("reader");
@@ -22,6 +110,18 @@ function App() {
   const [highlightedId, setHighlightedId] = useState(null);
   const [highlightedNode, setHighlightedNode] = useState(null);
   const [citationNotice, setCitationNotice] = useState("");
+  // Citation navigation epoch — bumped on EVERY citation dispatch so the
+  // Reader can react even when activeId + activePage are unchanged (e.g.
+  // clicking the same `lecture_8.pdf, p.85` twice in a row). Without this
+  // React short-circuits the no-op state writes, the iframe `src` stays
+  // identical, and the second click silently does nothing.
+  const [navEpoch, setNavEpoch] = useState(0);
+  // In-Notes PDF preview modal: shows the cited page in a floating window
+  // instead of yanking the user out to the Reader tab. Set by
+  // handleCitationPreview when the source is a PDF; null otherwise (the
+  // user is in the Notes view but no chip has been clicked, or the cited
+  // source is non-PDF and fell back to the Reader-tab path).
+  const [pdfPreview, setPdfPreview] = useState(null);
   const [uploading, setUploading] = useState(null);
   const [processing, setProcessing] = useState(null);
   const [streaming, setStreaming] = useState(false);
@@ -213,10 +313,34 @@ function App() {
     }
   }, [backendStatus, backend]);
 
+  // ── Close the citation preview modal when the user navigates away from
+  // Notes (Reader/Quiz/Mindmap/Skills/History). The modal is the Notes
+  // view's affordance; leaving it open across tabs floats stale PDF
+  // chrome on top of an unrelated workspace. We don't include
+  // `pdfPreview` in deps — only `mode` — because we want the close to
+  // fire on the mode transition, not on the (impossible) modal-open
+  // during a non-notes mode.
+  useEffect(() => {
+    if (mode !== "notes") setPdfPreview(null);
+  }, [mode]);
+
   // ── Load sources when course changes; restore generated content from cache ──
   useEffect(() => {
-    // Restore previous generated content for this course (if any)
-    setRealNotes(loadCached(activeCourse, "notes"));
+    // Restore previous generated content for this course (if any).
+    // R4-6 LaTeX migration: pre-R4-6 caches hold Markdown ("## section",
+    // "- bullet"). The LaTeX preview shim can't render that — the user
+    // would see literal '##' text. Detect and discard so the placeholder
+    // CTA appears instead, prompting a regenerate that produces LaTeX.
+    const cachedNotes = loadCached(activeCourse, "notes");
+    if (cachedNotes && !StudyState.isLatexNotesContent(cachedNotes)) {
+      if (activeCourse) saveCached(activeCourse, "notes", null);
+      console.info(
+        `[nano-nlm] discarded pre-R4-6 markdown notes cache for ${activeCourse || "(no course)"}; click Generate to produce fresh LaTeX`
+      );
+      setRealNotes(null);
+    } else {
+      setRealNotes(cachedNotes);
+    }
     setRealQuiz(loadCached(activeCourse, "quiz"));
     const cachedMm = loadCached(activeCourse, "mindmap");
     setRealMindmap(cachedMm);
@@ -225,6 +349,12 @@ function App() {
     setReportData(loadCached(activeCourse, "report"));
     setMasteryData(loadCached(activeCourse, "mastery"));
     setGenerationState(StudyState.createGenerationState());
+    // Cross-course leak guard: a citation modal opened for the *previous*
+    // course must close on switch. Otherwise the iframe keeps showing
+    // courseA's PDF while the UI labels everything as courseB, and the
+    // "Open in Reader" button would dispatch a stale `nav` whose
+    // `activeId` no longer exists in the new `sources` list.
+    setPdfPreview(null);
 
     if (!activeCourse) {
       // "All Courses" mode — show sources from every VISIBLE course.
@@ -244,8 +374,17 @@ function App() {
             // courses were hidden.
             const cid = visible[ci].id;
             (data.sources || []).forEach((s, i) => {
+              // `fileType` is the raw backend enum value (pdf/pptx/docx/
+              // md/txt) used by the citation modal to decide preview vs
+              // Reader fallback. `type` is the legacy 3-way display tag
+              // (pdf/ppt/txt) — kept distinct so the Library icon mapping
+              // doesn't have to learn the full enum and so a future PPTX
+              // preview branch can opt in by reading `fileType` directly.
               allSrcs.push({
                 id: `${cid}_${s.id || i}`,
+                docId: s.id || null,
+                courseId: cid,
+                fileType: s.type || null,
                 type: s.type === "pdf" ? "pdf" : s.type === "pptx" ? "ppt" : "txt",
                 title: `[${cid}] ${s.title}`,
                 sourceFile: s.title,
@@ -294,6 +433,9 @@ function App() {
     API.getSources(activeCourse).then(data => {
       const srcs = (data.sources || []).map((s, i) => ({
         id: s.id || `s${i}`,
+        docId: s.id || null,
+        courseId: activeCourse,
+        fileType: s.type || null,
         type: s.type === "pdf" ? "pdf" : s.type === "pptx" ? "ppt" : "txt",
         title: s.title,
         sourceFile: s.title,  // raw filename, used for backend filter
@@ -593,17 +735,95 @@ function App() {
     setStreaming(false);
   }
 
+  // Reader-tab dispatch shared by handleCitation AND the modal's
+  // "Open in Reader" button. Accepting a pre-resolved `nav` lets the
+  // modal avoid re-parsing refText (the parser sees `sources` at click
+  // time, which may have changed between modal-open and modal-close).
+  function dispatchNavToReader(nav, notice) {
+    setCitationNotice(notice || "");
+    setActiveId(nav.activeId);
+    setActivePage(nav.page);
+    setHighlightedId(nav.highlightedId);
+    setMode("reader");
+    setNavEpoch(e => e + 1);
+  }
+
   function handleCitation(refText) {
     const nav = StudyState.resolveCitationNavigation(refText, sources);
     if (!nav.ok) {
       setCitationNotice(nav.message);
       return;
     }
+    dispatchNavToReader(nav, "");
+  }
+
+  // Notes-view citation click: try to open the cited page in a floating
+  // PDF modal first. Falls back to the Reader tab when:
+  //   • the source isn't a PDF (pptx/docx/md/txt need text-mode rendering)
+  //   • the source object is missing docId / courseId / fileType
+  //   • the file is gone from disk (HEAD probe returns 404 — common after
+  //     a re-ingest that drops a previously-indexed file)
+  // The HEAD probe is best-effort: any error other than a clean 404 lets
+  // the modal open anyway (the iframe will show whatever the browser can
+  // render, and the user can hit "Open in Reader" themselves).
+  async function handleCitationPreview(refText) {
+    const nav = StudyState.resolveCitationNavigation(refText, sources);
+    if (!nav.ok) {
+      setCitationNotice(nav.message);
+      return;
+    }
+    const source = (sources || []).find((s) => s.id === nav.activeId);
+    const decision = StudyState.shouldPreviewCitation(source);
+    if (!decision.canPreview) {
+      // Surface *why* we're falling back so the user isn't surprised by a
+      // silent tab switch after expecting a modal.
+      dispatchNavToReader(nav, decision.reason);
+      return;
+    }
+    // HEAD preflight: degrade to Reader text-mode when the file is gone
+    // from disk. Server returns 404 from `_resolve_source_path` failure.
+    try {
+      const probeUrl = API.sourceFileUrl(source.courseId, source.docId, {});
+      const head = await fetch(probeUrl, { method: "HEAD" });
+      if (head.status === 404) {
+        dispatchNavToReader(nav, "源文件不在磁盘 · 在 Reader 文本视图查看");
+        return;
+      }
+    } catch {
+      // Network blip / CORS / server doesn't support HEAD on old build.
+      // Open the modal anyway; iframe handles its own failure modes.
+    }
     setCitationNotice("");
-    setActiveId(nav.activeId);
-    setActivePage(nav.page);
-    setHighlightedId(nav.highlightedId);
-    setMode("reader");
+    setPdfPreview({
+      courseId: source.courseId,
+      docId: source.docId,
+      sourceFile: source.sourceFile || source.title,
+      page: nav.page,
+      nav,  // captured so "Open in Reader" doesn't re-parse refText
+    });
+    // Telemetry: per-user-tab session log so we can measure preview vs
+    // tab-switch usage without standing up Prometheus.
+    if (typeof API !== "undefined" && API.appendSessionLog) {
+      API.appendSessionLog(activeCourse, "citation_preview", {
+        doc_id: source.docId,
+        page: nav.page,
+      }).catch(() => {});
+    }
+  }
+
+  function handleOpenPreviewInReader() {
+    if (!pdfPreview) return;
+    const nav = pdfPreview.nav;
+    const docId = pdfPreview.docId;
+    setPdfPreview(null);
+    if (nav) {
+      dispatchNavToReader(nav, "");
+      if (typeof API !== "undefined" && API.appendSessionLog) {
+        API.appendSessionLog(activeCourse, "citation_preview_to_reader", {
+          doc_id: docId,
+        }).catch(() => {});
+      }
+    }
   }
 
   function handleMindmapSource(chunk) {
@@ -725,6 +945,7 @@ function App() {
     { id: "notes", label: "Notes", num: realNotes ? "✓" : "—" },
     { id: "mindmap", label: "Knowledge Graph", num: realMindmap ? "✓" : "—" },
     { id: "quiz", label: "Quiz", num: realQuiz && realQuiz.length ? `Q·${realQuiz.length}` : "—" },
+    { id: "exam-prep", label: "Exam Prep", num: "★" },
     { id: "skills", label: "Skills", num: [examAnalysis, reportData, masteryData].filter(Boolean).length || "—" },
     { id: "history", label: "History", num: Object.keys(sessionDays || {}).length || "—" },
   ];
@@ -880,6 +1101,7 @@ function App() {
               activePage={activePage}
               highlightedId={highlightedId}
               notice={citationNotice}
+              navEpoch={navEpoch}
               onHighlight={setHighlightedId}
               onCite={handleCitation}
             />
@@ -897,7 +1119,7 @@ function App() {
                   }}
                   onRetry={handleRetryGeneration}
                   generationState={generationState}
-                  onCitation={handleCitation}
+                  onCitation={handleCitationPreview}
                 />
               : <ActionPlaceholder
                   title="Study Notes"
@@ -933,7 +1155,7 @@ function App() {
           )}
           {effectiveMode === "quiz" && (
             realQuiz && realQuiz.length > 0
-              ? <RealQuizView questions={realQuiz} activeCourse={activeCourse} />
+              ? <RealQuizView questions={realQuiz} activeCourse={activeCourse} onRegenerate={handleGenerateQuiz} regenerating={streaming} />
               : <ActionPlaceholder
                   title="Practice Quiz"
                   desc={activeCourse ? `Generate a practice quiz for ${activeCourse}` : "Select a course first"}
@@ -962,6 +1184,9 @@ function App() {
                 }
               }}
             />
+          )}
+          {effectiveMode === "exam-prep" && (
+            <ExamPrep activeCourse={activeCourse} userLang={userLang} />
           )}
           {effectiveMode === "skills" && (
             <SkillsDashboard
@@ -1058,6 +1283,13 @@ function App() {
             ]} />
         </TweakSection>
       </TweaksPanel>
+
+      {/* ========= In-Notes citation PDF preview modal ========= */}
+      <CitationPreviewModal
+        preview={pdfPreview}
+        onClose={() => setPdfPreview(null)}
+        onOpenInReader={handleOpenPreviewInReader}
+      />
 
       {/* ========= R3-2 first-run / re-pick language modal ========= */}
       {showLangModal && (
@@ -1356,19 +1588,20 @@ function CodeMirror6Editor({ value, onChange, language, placeholder }) {
 
 /* ── Real Notes View — reading UX (Range API + highlights + TOC + chip routing) ── */
 
-function findTextRangeInRoot(root, text, before, after) {
-  // Walk text nodes; concatenate to find `text` (preferring positions whose
-  // surrounding chars best match before/after). Returns a Range or null.
-  // fix: insert a phantom "\n\n" into `combined` whenever we cross a
-  // block-level ancestor boundary, so the concatenated string aligns with
-  // what `sel.toString()` and `range.toString()` produce in modern
-  // browsers (which inject newline between block elements). Without this,
-  // any selection that spans a heading + paragraph fails to re-apply
-  // because the saved text contains "\n\n" but the walker produces a
-  // glued string. The phantom characters do NOT enter `nodes`, so
-  // start/end offsets resolved via `locate()` always land on real text.
+// Shared block-aware DOM text walker. Returns `{ combined, nodes }` where
+// `combined` injects "\n\n" at every block-level ancestor boundary (matching
+// what `sel.toString()` / `range.toString()` produce in modern browsers).
+// Used by `findTextRangeInRoot` (Range resolution), `captureSelection`
+// (before/after context capture), and the highlight prune effect — so the
+// stored text / before / after fields stay aligned with what we search at
+// prune and re-apply time. The LaTeX preview renders via `latexToHtml`, so
+// the raw `draft` string no longer matches the visible text (e.g. selecting
+// rendered "Theorem 1.2" while the raw source is `\begin{theorem}`); doing
+// every step against the same rendered-DOM string keeps the three callers
+// in sync.
+function getBlockAwareDomText(root) {
   const BLOCK_SEL = "h1,h2,h3,h4,h5,h6,p,li,blockquote,pre,div";
-  if (!root || !text) return null;
+  if (!root) return { combined: "", nodes: [] };
   const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null);
   const nodes = [];
   let combined = "";
@@ -1384,6 +1617,15 @@ function findTextRangeInRoot(root, text, before, after) {
     nodes.push({ node: n, start: combined.length, end: combined.length + n.nodeValue.length });
     combined += n.nodeValue;
   }
+  return { combined, nodes };
+}
+
+function findTextRangeInRoot(root, text, before, after) {
+  // Walk text nodes via `getBlockAwareDomText`; find `text` preferring
+  // positions whose surrounding chars best match before/after. Returns a
+  // Range or null.
+  if (!root || !text) return null;
+  const { combined, nodes } = getBlockAwareDomText(root);
   if (!combined) return null;
   let cursor = 0;
   let bestIdx = -1;
@@ -1581,7 +1823,7 @@ function HighlightDrawer({ highlights, onJump, onRemove, onClose }) {
       <ul>
         {highlights.map(h => (
           <li key={h.id} className={`hl-row hl-row-${h.color}`}>
-            <button className="hl-jump" onClick={() => onJump(h.id)} title={h.text}>
+            <button className="hl-jump" data-hid={h.id} onClick={() => onJump(h.id)} title={h.text}>
               <span className={`hl-dot hl-${h.color}`}></span>
               <span className="hl-text">{h.text.length > 60 ? h.text.slice(0, 57) + "…" : h.text}</span>
             </button>
@@ -1670,8 +1912,26 @@ function RealNotesView({ content, streaming, activeCourse, sources, onContentCha
     }
     setTocItems(toc);
     if (streaming) return;
-    const result = StudyState.pruneStaleHighlights(localStorage, activeCourse, draft);
-    setHighlights(result.kept);
+    // Prune against the rendered preview text (block-aware), not the raw
+    // LaTeX draft. Highlight text/before/after are captured from the
+    // rendered DOM, so the same view must be used when checking whether
+    // they still exist — otherwise valid highlights get dropped on every
+    // draft change and the in-DOM <mark> disappears, breaking both
+    // "click the highlight" and the drawer's jump-to-highlight button.
+    const root = previewRef.current;
+    if (root) {
+      const { combined } = getBlockAwareDomText(root);
+      if (combined) {
+        const result = StudyState.pruneStaleHighlights(localStorage, activeCourse, combined);
+        setHighlights(result.kept);
+      } else {
+        setHighlights(StudyState.loadHighlights(localStorage, activeCourse));
+      }
+    } else {
+      // Preview hasn't mounted yet (initial render); keep stored
+      // highlights as-is — the next effect tick will prune against DOM.
+      setHighlights(StudyState.loadHighlights(localStorage, activeCourse));
+    }
     // review-swarm v2 fix-soon #4: depend on `fileNamesKey` (a stable
     // string derived via useMemo, below), NOT `sources` (which gets a
     // new array reference on every setSources — including each Library
@@ -1833,25 +2093,19 @@ function RealNotesView({ content, streaming, activeCourse, sources, onContentCha
     };
   }, [activeCourse, streaming]);
 
-  React.useEffect(() => {
+  // Round 3 of scroll cache: useEffect cleanup is *passive* and runs AFTER
+  // React removes the DOM node, so `scroller.isConnected` is false in the
+  // unmount path and the previous `isConnected`-gated final flush never
+  // executed. Switch to useLayoutEffect: its cleanup fires synchronously
+  // during the mutation phase BEFORE the DOM mutation, so scroller is
+  // still in the tree and scrollTop reads the user's real position. This
+  // guarantees the final scrollTop is captured even when the user scrolls
+  // and clicks a citation chip within the same 16ms tick (rAF tick may
+  // not have fired yet → without this, no save → restore bails to 0).
+  React.useLayoutEffect(() => {
     if (!activeCourse) return;
-    // fix-soon #5: use the persistent rootRef instead of looking up via
-    // previewRef.closest(). Dropping `editing` from deps means we no
-    // longer re-attach/re-tear-down the listener (and run a synchronous
-    // flush) on every Edit↔Preview toggle. Listener stays attached for
-    // the lifetime of the course; we just gate the save on edit-mode
-    // via the ref below.
     const scroller = rootRef.current;
     if (!scroller) return;
-    // BUG FIX (round 2 of scroll cache): the original throttled-save
-    // path queued the localStorage write inside a rAF. When the user
-    // clicked a citation chip, RealNotesView unmounted and the rAF then
-    // fired with a detached DOM whose .scrollTop reads as 0 —
-    // overwriting the user's real position with 0 right at unmount.
-    // Now we (a) flag the effect as detached in cleanup so the rAF
-    // bails, and (b) do a synchronous final save on cleanup while the
-    // DOM is still connected. That last-chance save is what lets the
-    // restore on remount land at the right spot.
     let detached = false;
     let ticking = false;
     function onScroll() {
@@ -1872,11 +2126,9 @@ function RealNotesView({ content, streaming, activeCourse, sources, onContentCha
     return () => {
       detached = true;
       scroller.removeEventListener("scroll", onScroll);
-      // Final flush: capture the user's last position before the
-      // component unmounts. isConnected guards against the rare case
-      // where React has already detached the node. Only flush while in
-      // Preview mode for the same reason as the onScroll guard.
-      if (scroller.isConnected && !editingRef.current) {
+      // Final flush runs in layout-effect cleanup, i.e. BEFORE DOM removal,
+      // so scroller is still connected and scrollTop is the live value.
+      if (!editingRef.current) {
         StudyState.saveNotesScroll(localStorage, activeCourse, scroller.scrollTop);
       }
     };
@@ -1993,12 +2245,49 @@ function RealNotesView({ content, streaming, activeCourse, sources, onContentCha
     // A new selection always wins over any open popover — without this the
     // popover from a previously clicked highlight blocks fresh highlighting.
     setPopover(null);
+    // Capture before/after context from the rendered DOM (block-aware).
+    // CRITICAL: we use the Range's own startContainer/startOffset to compute
+    // the *exact* absolute position in `combined`, NOT a top-to-bottom
+    // `indexOf(text)` — if the same text appears multiple times in the
+    // notes ("gradient" × 12), `indexOf` would return the first match and
+    // we'd silently capture the wrong occurrence's context, then re-apply
+    // the highlight onto the first hit instead of the one the user picked.
     const probe = { text, before: "", after: "" };
-    const idx = StudyState.locateHighlight(draft, probe);
-    if (idx >= 0) {
-      const ctx = StudyState.buildContextWindows(draft, idx, text);
-      probe.before = ctx.before;
-      probe.after = ctx.after;
+    const { combined, nodes } = getBlockAwareDomText(root);
+    if (combined && nodes.length) {
+      // Resolve range.startContainer → absolute offset in `combined`. The
+      // walker may split selection into adjacent text nodes (e.g.
+      // start-of-mark / end-of-mark); we accept the lowest-offset node
+      // ancestor for the start and the highest for the end so multi-node
+      // ranges still map correctly.
+      function absOffset(container, off, mode) {
+        for (const entry of nodes) {
+          if (entry.node === container) return entry.start + off;
+        }
+        // Selection started in an element (e.g. <p>) rather than a text
+        // node — find the first/last text-node descendant.
+        if (container && container.nodeType === Node.ELEMENT_NODE) {
+          const descendants = nodes.filter(n => container.contains(n.node));
+          if (descendants.length) {
+            return mode === "end"
+              ? descendants[descendants.length - 1].end
+              : descendants[0].start;
+          }
+        }
+        return -1;
+      }
+      const startAbs = absOffset(range.startContainer, range.startOffset, "start");
+      const endAbs = absOffset(range.endContainer, range.endOffset, "end");
+      if (startAbs >= 0 && endAbs > startAbs) {
+        probe.before = combined.slice(Math.max(0, startAbs - 30), startAbs);
+        probe.after = combined.slice(endAbs, Math.min(combined.length, endAbs + 30));
+        // Re-derive `text` from combined so the saved string includes the
+        // exact block-boundary "\n\n" that `findTextRangeInRoot` expects;
+        // `sel.toString()` uses single "\n" between blocks, which can drift
+        // from the walker's separator and break re-apply on cross-block
+        // selections.
+        probe.text = combined.slice(startAbs, endAbs);
+      }
     }
     const rect = range.getBoundingClientRect();
     const stageRect = (root.closest(".notes-stage") || root).getBoundingClientRect();
@@ -2044,6 +2333,17 @@ function RealNotesView({ content, streaming, activeCourse, sources, onContentCha
         y: rect.bottom - stageRect.top + 6,
         hl,
       });
+      // Reveal the corresponding drawer entry — click-in-notes → see-in-index
+      // round-trip. Scrolls the side drawer to the entry and flashes it so
+      // the user can tell which highlight just got tapped, even with 30+
+      // entries in the list. Best-effort: drawer may be hidden, in which
+      // case there's no DOM to scroll and we silently skip.
+      const drawerEntry = document.querySelector(`.notes-hl-drawer .hl-jump[data-hid="${hid}"]`);
+      if (drawerEntry) {
+        drawerEntry.scrollIntoView({ behavior: "smooth", block: "center" });
+        drawerEntry.classList.add("hl-flash");
+        setTimeout(() => drawerEntry.classList.remove("hl-flash"), 900);
+      }
       return;
     }
     setPopover(null);
@@ -2200,7 +2500,22 @@ function RealNotesView({ content, streaming, activeCourse, sources, onContentCha
 }
 
 /* ── Real Quiz View ── */
-function RealQuizView({ questions, activeCourse }) {
+// Backend quiz_generator emits the canonical answer as `q.answer` =
+// "B. <full text>" (LLM-generated), not as a bare letter. Legacy / demo
+// fixtures use `q.correct = "B"` instead. Extract the letter once so the
+// render-time isCorrect check actually fires — without this, every picked
+// option was framed red because `q.correct` was undefined and `isCorrect`
+// was permanently false.
+function correctLetter(q) {
+  if (q && q.correct) return String(q.correct).trim();
+  if (q && typeof q.answer === "string") {
+    const m = q.answer.trim().match(/^([A-Za-z])[.\s)]/);
+    if (m) return m[1].toUpperCase();
+  }
+  return "";
+}
+
+function RealQuizView({ questions, activeCourse, onRegenerate, regenerating }) {
   const loaded = StudyState.loadQuizAnswers(localStorage, activeCourse, questions);
   const [answers, setAnswers] = React.useState(loaded.answers || {});
   const [submitted, setSubmitted] = React.useState(false);
@@ -2227,6 +2542,19 @@ function RealQuizView({ questions, activeCourse }) {
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
         <h2 style={{ fontFamily: "var(--serif)", margin: 0 }}>Practice Quiz — {questions.length} Questions</h2>
         <div style={{ display: "flex", gap: 8 }}>
+          {onRegenerate && (
+            <button
+              className="btn ghost"
+              onClick={() => {
+                if (!window.confirm("Generate a fresh quiz? Current answers will be discarded.")) return;
+                onRegenerate();
+              }}
+              disabled={regenerating}
+              title="Discard this quiz and generate a brand-new question set"
+            >
+              {regenerating ? "Generating…" : "↻ Regenerate"}
+            </button>
+          )}
           <button className="btn ghost" onClick={() => setReviewWrong(!reviewWrong)} disabled={!submitted}>
             {reviewWrong ? "All Questions" : "Wrong Only"}
           </button>
@@ -2237,22 +2565,45 @@ function RealQuizView({ questions, activeCourse }) {
 
       {visibleQuestions.map((q) => {
         const i = questions.indexOf(q);
+        // Whole-question correctness — only meaningful for multi-choice
+        // (the answer letter comes from `q.correct` or, for LLM-generated
+        // payloads, the leading "X." of `q.answer`). Essay questions can't
+        // be auto-graded so they show no red/green frame on submit.
+        const userAnswered = answers[i] != null && answers[i] !== "";
+        const correct = correctLetter(q);
+        const isGraded = submitted && q.options && correct;
+        const gotItRight = isGraded && userAnswered && answers[i] === correct;
+        const gotItWrong = isGraded && userAnswered && answers[i] !== correct;
         return (
-        <div key={i} style={{ marginBottom: 20, paddingBottom: 16, borderBottom: "1px dashed var(--rule)" }}>
-          <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 6 }}>
-            <strong style={{ color: "var(--accent)" }}>Q{i + 1}.</strong>
+        <div key={i} style={{
+          marginBottom: 20, paddingBottom: 16, borderBottom: "1px dashed var(--rule)",
+          // Tag the whole question card with a coloured left rail so the
+          // user can scan a long quiz and spot wrong / right answers
+          // without parsing each option's border.
+          borderLeft: gotItRight ? "4px solid oklch(0.65 0.18 145)"
+                    : gotItWrong ? "4px solid oklch(0.62 0.22 25)"
+                    : "4px solid transparent",
+          paddingLeft: 10,
+        }}>
+          <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 6, alignItems: "center" }}>
+            <strong style={{ color: "var(--accent)" }}>
+              Q{i + 1}.
+              {gotItRight && <span style={{ marginLeft: 8, fontSize: 11, color: "oklch(0.55 0.18 145)", fontWeight: 600 }}>✓ Correct</span>}
+              {gotItWrong && <span style={{ marginLeft: 8, fontSize: 11, color: "oklch(0.55 0.22 25)", fontWeight: 600 }}>✗ Wrong</span>}
+            </strong>
             <span className="mono" style={{ fontSize: 10, color: "var(--ink-4)" }}>{q.type || "question"} · {q.difficulty || ""}</span>
           </div>
           <p style={{ marginBottom: 10 }}>{q.question}</p>
 
           {q.options && q.options.map((opt, j) => {
             const optText = typeof opt === "string" ? opt : `${opt.l}. ${opt.t}`;
-            const isCorrect = q.correct && (typeof opt === "string" ? opt.charAt(0) === q.correct : opt.l === q.correct);
+            const isCorrect = correct && (typeof opt === "string" ? opt.charAt(0).toUpperCase() === correct : opt.l === correct);
             const optValue = typeof opt === "string" ? opt.charAt(0) : opt.l;
             return (
               <label key={j} style={{
                 display: "block", padding: "5px 8px", cursor: "pointer", borderRadius: 4, marginBottom: 2,
-                background: submitted && isCorrect ? "oklch(0.92 0.04 160)" : submitted && answers[i] === optValue && !isCorrect ? "oklch(0.92 0.06 25)" : "transparent",
+                border: "2px solid " + (submitted && isCorrect ? "oklch(0.65 0.18 145)" : submitted && answers[i] === optValue && !isCorrect ? "oklch(0.62 0.22 25)" : "transparent"),
+                background: submitted && isCorrect ? "oklch(0.96 0.03 145)" : submitted && answers[i] === optValue && !isCorrect ? "oklch(0.96 0.04 25)" : "transparent",
               }}>
                 <input type="radio" name={`q${i}`} checked={answers[i] === optValue}
                   onChange={() => !submitted && updateAnswer(i, optValue)}
@@ -2271,8 +2622,26 @@ function RealQuizView({ questions, activeCourse }) {
           )}
 
           {submitted && (q.answer || q.explanation) && (
-            <div style={{ marginTop: 8, padding: "10px 14px", background: "var(--paper-2)", borderLeft: "3px solid var(--accent)", borderRadius: "0 4px 4px 0", fontSize: 13 }}>
-              {q.answer && <div><strong>Answer:</strong> {q.answer}</div>}
+            <div style={{
+              marginTop: 8, padding: "10px 14px",
+              background: gotItRight ? "oklch(0.96 0.03 145)"
+                        : gotItWrong ? "oklch(0.96 0.04 25)"
+                        : "var(--paper-2)",
+              borderLeft: "3px solid " + (gotItRight ? "oklch(0.65 0.18 145)"
+                                        : gotItWrong ? "oklch(0.62 0.22 25)"
+                                        : "var(--accent)"),
+              borderRadius: "0 4px 4px 0", fontSize: 13,
+            }}>
+              {q.answer && (
+                <div>
+                  <strong>Answer:</strong> {q.answer}
+                  {gotItWrong && userAnswered && (
+                    <span style={{ marginLeft: 10, color: "oklch(0.55 0.22 25)" }}>
+                      (your answer: <b>{answers[i]}</b>)
+                    </span>
+                  )}
+                </div>
+              )}
               {q.explanation && <p style={{ marginTop: 4, color: "var(--ink-3)" }}>{q.explanation}</p>}
             </div>
           )}

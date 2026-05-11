@@ -653,6 +653,51 @@ class ExamAnalysisRequest(BaseModel):
     course_id: ReqCourseId
 
 
+class ExamPrepPlanRequest(BaseModel):
+    model_config = {"extra": "forbid"}
+    course_id: ReqCourseId
+    max_topics: int = Field(8, ge=3, le=15)
+    force: bool = False
+    user_lang: Literal["zh", "en"] | None = None
+
+
+class ExamPrepSeedRequest(BaseModel):
+    model_config = {"extra": "forbid"}
+    course_id: ReqCourseId
+    topic_ids: list[str] | None = None
+    seeds_per_type: int = Field(2, ge=1, le=5)
+    user_lang: Literal["zh", "en"] | None = None
+
+
+class ExamPrepNextQuizRequest(BaseModel):
+    model_config = {"extra": "forbid"}
+    course_id: ReqCourseId
+    size: int = Field(8, ge=1, le=20)
+    topic_ids: list[str] | None = None
+    user_lang: Literal["zh", "en"] | None = None
+
+
+class ExamPrepSubmitRequest(BaseModel):
+    model_config = {"extra": "forbid"}
+    course_id: ReqCourseId
+    answers: dict[str, str] = Field(default_factory=dict)
+    user_lang: Literal["zh", "en"] | None = None
+
+    @field_validator("answers")
+    @classmethod
+    def _bound_answers(cls, v: dict[str, str]) -> dict[str, str]:
+        if len(v) > 50:
+            raise ValueError("too many answers (cap 50 per submit)")
+        for qid, ans in v.items():
+            if not isinstance(qid, str) or not qid:
+                raise ValueError("question_id must be non-empty string")
+            if len(qid) > 64:
+                raise ValueError("question_id too long")
+            if isinstance(ans, str) and len(ans) > 2000:
+                raise ValueError("answer too long (cap 2000 chars)")
+        return v
+
+
 class MemoryUpdate(BaseModel):
     model_config = {"extra": "forbid"}
     key: str = Field(..., min_length=1, max_length=200)
@@ -856,13 +901,20 @@ async def get_source_chunks(course_id: str, doc_id: str):
     }
 
 
-@app.get("/api/source/{course_id}/{doc_id}/file",
-         tags=["courses"], summary="Serve the original source file (PDF/PPTX/DOCX/MD/PNG)")
+@app.api_route(
+    "/api/source/{course_id}/{doc_id}/file",
+    methods=["GET", "HEAD"],
+    tags=["courses"],
+    summary="Serve the original source file (PDF/PPTX/DOCX/MD/PNG)",
+)
 async def get_source_file(course_id: str, doc_id: str):
     """Stream the original file for in-browser viewers (e.g. pdf.js / native
     `<iframe>` PDF viewer). Path resolution goes through
     `_resolve_source_path` which guards against `..`-traversal by resolving
     each candidate and rejecting anything outside its allowed root.
+
+    HEAD is accepted so the Notes citation-preview modal can probe for a
+    200 before mounting the iframe; falls back to Reader text-mode on 404.
     """
     course_id = _validate_course_id_path(course_id)
     if not doc_id or not _DOC_ID_RE.match(doc_id):
@@ -887,10 +939,14 @@ async def get_source_file(course_id: str, doc_id: str):
         # _content_disposition strips dir components, rejects CR/LF/NUL
         # (response splitting), and emits both an ASCII fallback and an
         # RFC 6266 percent-encoded filename* for non-ASCII names.
+        # `nosniff` blocks browser MIME-sniffing — defense-in-depth in
+        # case any future ingest path lets a non-PDF file ride a `.pdf`
+        # suffix past the upload validator.
         headers={
             "Content-Disposition": _content_disposition(
                 Path(target.source_file).name, disposition="inline"
-            )
+            ),
+            "X-Content-Type-Options": "nosniff",
         },
     )
 
@@ -988,6 +1044,95 @@ async def analyze_exam(req: ExamAnalysisRequest):
     if not result.success:
         raise HTTPException(status_code=502, detail=result.error or "exam analysis failed")
     session_log.append(req.course_id, "generation", {"kind": "exam-analysis"})
+    return result.data
+
+
+# ── Exam Prep — closed-loop exam preparation ──────────────────────────
+# Five thin wrappers around ExamPrepSkill's `action` dispatch. The skill
+# owns all persistence + LLM calls + self-evolution; the API layer just
+# validates inputs, threads the action, and logs sessions.
+
+
+@app.post("/api/exam-prep/plan", tags=["exam-prep"], summary="Extract exam-relevant topics for a course")
+async def exam_prep_plan(req: ExamPrepPlanRequest):
+    result = await orchestrator.run_skill("exam_prep", {
+        "action": "plan",
+        "course_id": req.course_id,
+        "max_topics": req.max_topics,
+        "force": req.force,
+        "user_lang": req.user_lang,
+    })
+    if not result.success:
+        raise HTTPException(status_code=502, detail=result.error or "exam_prep_plan_failed")
+    session_log.append(req.course_id, "generation", {"kind": "exam-prep-plan"})
+    return result.data
+
+
+@app.post("/api/exam-prep/seed", tags=["exam-prep"], summary="Seed initial questions for topics")
+async def exam_prep_seed(req: ExamPrepSeedRequest):
+    result = await orchestrator.run_skill("exam_prep", {
+        "action": "seed",
+        "course_id": req.course_id,
+        "topic_ids": req.topic_ids,
+        "seeds_per_type": req.seeds_per_type,
+        "user_lang": req.user_lang,
+    })
+    if not result.success:
+        raise HTTPException(status_code=502, detail=result.error or "exam_prep_seed_failed")
+    return result.data
+
+
+@app.post("/api/exam-prep/quiz/next", tags=["exam-prep"], summary="Sample the next quiz from the bank")
+async def exam_prep_next_quiz(req: ExamPrepNextQuizRequest):
+    result = await orchestrator.run_skill("exam_prep", {
+        "action": "next_quiz",
+        "course_id": req.course_id,
+        "size": req.size,
+        "topic_ids": req.topic_ids,
+        "user_lang": req.user_lang,
+    })
+    if not result.success:
+        raise HTTPException(status_code=502, detail=result.error or "exam_prep_quiz_failed")
+    return result.data
+
+
+@app.post("/api/exam-prep/quiz/submit", tags=["exam-prep"], summary="Grade answers + self-evolve variants for wrong topics")
+async def exam_prep_submit(req: ExamPrepSubmitRequest):
+    result = await orchestrator.run_skill("exam_prep", {
+        "action": "submit",
+        "course_id": req.course_id,
+        "answers": req.answers,
+        "user_lang": req.user_lang,
+    })
+    if not result.success:
+        raise HTTPException(status_code=502, detail=result.error or "exam_prep_submit_failed")
+    session_log.append(req.course_id, "generation", {
+        "kind": "exam-prep-submit",
+        "wrong_topic_count": result.data.get("wrong_topic_count", 0),
+        "variants_added": sum(result.data.get("variants_added", {}).values()),
+    })
+    return result.data
+
+
+@app.get("/api/exam-prep/{course_id}", tags=["exam-prep"], summary="Inspect the current bank + mastery view")
+async def exam_prep_view(course_id: str):
+    course_id = _validate_course_id_path(course_id)
+    result = await orchestrator.run_skill("exam_prep", {
+        "action": "view", "course_id": course_id,
+    })
+    if not result.success:
+        raise HTTPException(status_code=502, detail=result.error or "exam_prep_view_failed")
+    return result.data
+
+
+@app.delete("/api/exam-prep/{course_id}", tags=["exam-prep"], summary="Wipe the exam bank for a course")
+async def exam_prep_reset(course_id: str):
+    course_id = _validate_course_id_path(course_id)
+    result = await orchestrator.run_skill("exam_prep", {
+        "action": "reset", "course_id": course_id,
+    })
+    if not result.success:
+        raise HTTPException(status_code=502, detail=result.error or "exam_prep_reset_failed")
     return result.data
 
 

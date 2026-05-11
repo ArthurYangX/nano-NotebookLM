@@ -139,6 +139,41 @@ const API = {
     return _post("/exam-analysis", { course_id: courseId });
   },
 
+  // ── Exam Prep (closed-loop) ─────────────────────────────────────
+  // `userLang` ∈ {"zh","en",null} threads the user's language preference
+  // down to topic + question generation so the LLM doesn't echo the
+  // source-material language when the student picked the other one.
+  async examPrepPlan(courseId, { maxTopics = 8, force = false, userLang = null } = {}) {
+    const body = { course_id: courseId, max_topics: maxTopics, force };
+    if (userLang) body.user_lang = userLang;
+    return _post("/exam-prep/plan", body);
+  },
+  async examPrepSeed(courseId, { topicIds = null, seedsPerType = 2, userLang = null } = {}) {
+    const body = { course_id: courseId, topic_ids: topicIds, seeds_per_type: seedsPerType };
+    if (userLang) body.user_lang = userLang;
+    return _post("/exam-prep/seed", body);
+  },
+  async examPrepNextQuiz(courseId, { size = 8, topicIds = null, userLang = null } = {}) {
+    const body = { course_id: courseId, size, topic_ids: topicIds };
+    if (userLang) body.user_lang = userLang;
+    return _post("/exam-prep/quiz/next", body);
+  },
+  async examPrepSubmit(courseId, answers, { userLang = null } = {}) {
+    const body = { course_id: courseId, answers };
+    if (userLang) body.user_lang = userLang;
+    return _post("/exam-prep/quiz/submit", body);
+  },
+  async examPrepView(courseId) {
+    const res = await fetch(`${API_BASE}/exam-prep/${encodeURIComponent(courseId)}`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return res.json();
+  },
+  async examPrepReset(courseId) {
+    const res = await fetch(`${API_BASE}/exam-prep/${encodeURIComponent(courseId)}`, { method: "DELETE" });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return res.json();
+  },
+
   async ingestCourse(courseDir, courseId = null) {
     return _post("/ingest", { course_dir: courseDir, course_id: courseId });
   },
@@ -237,9 +272,16 @@ const API = {
   // Returns a URL string (not a fetch) so the Reader can hand it to an
   // `<iframe src>` and let the browser's native PDF viewer handle range
   // requests, scroll, zoom, and the `#page=N` anchor.
+  //
+  // `page` is appended only when it's a positive integer. Anything else
+  // (null, NaN, "5; rm -rf /", Infinity) drops the fragment — defensive
+  // belt against future callers that bypass `resolveCitationNavigation`
+  // (which already pins `page` to a `Number(/[0-9]+/)` match).
   sourceFileUrl(courseId, docId, { page = null } = {}) {
     const url = `/api/source/${encodeURIComponent(courseId)}/${encodeURIComponent(docId)}/file`;
-    return page ? `${url}#page=${encodeURIComponent(page)}` : url;
+    const n = Number(page);
+    if (!Number.isInteger(n) || n < 1) return url;
+    return `${url}#page=${n}`;
   },
 
   async getStatus() {

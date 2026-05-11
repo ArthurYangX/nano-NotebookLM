@@ -98,6 +98,29 @@
     };
   }
 
+  // Decision predicate for the Notes in-place PDF preview modal.
+  // Pure (no React, no DOM) so it lives here and gets node-tested.
+  //
+  // `canPreview` is true only when the source carries everything the modal
+  // needs to render the browser's native PDF viewer: a "pdf" `fileType`
+  // (raw backend enum value), a backend doc_id, and a course_id. All other
+  // shapes — PPTX/DOCX/MD/TXT, missing doc id, future enum values — fall
+  // through to the legacy Reader-tab path. `reason` is a short user-facing
+  // string suitable for `citationNotice` (zh) so the caller can surface
+  // *why* it fell back; consumers may also leave it blank.
+  function shouldPreviewCitation(source) {
+    if (!source) return { canPreview: false, reason: "" };
+    if (!source.docId) return { canPreview: false, reason: "" };
+    if (!source.courseId) return { canPreview: false, reason: "" };
+    if (source.fileType === "pdf") return { canPreview: true, reason: "" };
+    const labelMap = { pptx: "PPTX", docx: "DOCX", md: "Markdown", txt: "纯文本" };
+    const label = labelMap[source.fileType] || source.fileType;
+    return {
+      canPreview: false,
+      reason: label ? `${label} 文件在 Reader 中查看` : "",
+    };
+  }
+
   // M2 (2026-05-06): parent-aware recursive radial layout. Pre-M2 layout
   // placed siblings on a uniform circle by array index, so children of one
   // topic scattered across the canvas. The new algorithm:
@@ -1151,6 +1174,18 @@
     }
   }
 
+  // ── Notes content schema check (R4-6 LaTeX migration) ───────────────
+  // Pre-R4-6 notes were Markdown ("## section", "- bullet", "**bold**").
+  // R4-6 switched to LaTeX-only (\section{...}, \begin{remark}, \cite{...}).
+  // Old localStorage caches survive across the migration and would render
+  // as garbled literal-text in the LaTeX preview shim. This check returns
+  // true only when the canonical LaTeX structural markers are present so
+  // the load site can discard legacy markdown and trigger a regenerate.
+  function isLatexNotesContent(text) {
+    if (typeof text !== "string" || !text.trim()) return false;
+    return /\\section\{|\\subsection\{|\\begin\{/.test(text);
+  }
+
   // ── Notes TOC collapsed-state (per-course) ──────────────────────────
   // Stores an array of section ids that the user has explicitly
   // collapsed. Default behaviour is "everything expanded", so an empty /
@@ -1227,6 +1262,7 @@
     createSkillEntries,
     getCheckedSourceFiles,
     resolveCitationNavigation,
+    shouldPreviewCitation,
     prepareMindmap,
     prepareMindmapTree,
     prepareMindmapForce,
@@ -1278,6 +1314,7 @@
     loadNotesScroll,
     saveNotesScroll,
     clearNotesScroll,
+    isLatexNotesContent,
     loadTocCollapsed,
     saveTocCollapsed,
     setTocCollapsed,

@@ -95,6 +95,41 @@ def test_citation_navigation_invalid():
     assert run_node(script).strip() == "ok"
 
 
+def test_should_preview_citation():
+    """Pin the modal-vs-Reader routing predicate.
+
+    The Notes view dispatches to the in-place PDF modal when canPreview is
+    true and falls back to the Reader tab otherwise. Five cases pin the
+    contract so a future backend FileType enum change (or accidental field
+    drop) trips a test instead of a UX regression.
+    """
+    script = textwrap.dedent(
+        """
+        const h = require('./frontend/study-state.js');
+        const pdfSrc = {id:'a_b', docId:'b', courseId:'a', fileType:'pdf'};
+        const pptxSrc = {id:'a_c', docId:'c', courseId:'a', fileType:'pptx'};
+        const noDocId = {id:'a_d', docId:null, courseId:'a', fileType:'pdf'};
+        const noCourseId = {id:'e', docId:'b', courseId:null, fileType:'pdf'};
+        const unknownType = {id:'a_f', docId:'f', courseId:'a', fileType:'epub'};
+        const pdf = h.shouldPreviewCitation(pdfSrc);
+        if (!pdf.canPreview) throw new Error('pdf source must preview');
+        const pptx = h.shouldPreviewCitation(pptxSrc);
+        if (pptx.canPreview) throw new Error('pptx must fall through');
+        if (!pptx.reason.includes('PPTX')) throw new Error('pptx reason missing label');
+        const missing = h.shouldPreviewCitation(noDocId);
+        if (missing.canPreview) throw new Error('missing docId must fall through');
+        const missingCourse = h.shouldPreviewCitation(noCourseId);
+        if (missingCourse.canPreview) throw new Error('missing courseId must fall through');
+        const unknown = h.shouldPreviewCitation(unknownType);
+        if (unknown.canPreview) throw new Error('unknown fileType must fall through');
+        const undef = h.shouldPreviewCitation(undefined);
+        if (undef.canPreview) throw new Error('undefined source must fall through');
+        console.log('ok');
+        """
+    )
+    assert run_node(script).strip() == "ok"
+
+
 def test_mindmap_layout_happy():
     script = textwrap.dedent(
         """
@@ -875,6 +910,93 @@ def test_notes_scroll_roundtrip():
         """
     )
     assert run_node(script).strip() == "ok"
+
+
+def test_is_latex_notes_content_discriminates_legacy_markdown():
+    """R4-6 LaTeX migration: pre-R4-6 markdown caches stranded in
+    localStorage render as literal '##' text in the LaTeX preview. The
+    load site uses isLatexNotesContent to decide whether to keep a
+    cached value or discard it (→ user sees the Generate CTA → fresh
+    LaTeX gen overwrites the stale cache).
+
+    Pin the schema check so a future LLM prompt edit that accidentally
+    emits markdown for a moment doesn't silently survive a re-cache.
+    """
+    script = textwrap.dedent(
+        """
+        const h = require('./frontend/study-state.js');
+
+        // Empty / non-string → not LaTeX.
+        if (h.isLatexNotesContent('')) throw new Error('empty must be false');
+        if (h.isLatexNotesContent(null)) throw new Error('null must be false');
+        if (h.isLatexNotesContent(undefined)) throw new Error('undef must be false');
+        if (h.isLatexNotesContent({})) throw new Error('non-string must be false');
+
+        // Pure markdown (pre-R4-6 cache) → must be rejected.
+        const md = '# Title\\n\\n## Section\\n\\n**bold** text and `code` plus a bullet:\\n- item 1\\n- item 2\\n\\n[Source: a.pdf, Page 1/10]';
+        if (h.isLatexNotesContent(md)) throw new Error('markdown must NOT pass');
+
+        // Pure LaTeX (R4-6 cache) → must pass.
+        const tex = '\\\\section{Chapter 1}\\n\\nIntro.\\n\\n\\\\subsection{Topic}\\n\\\\begin{definition}\\nA thing.\\n\\\\end{definition}';
+        if (!h.isLatexNotesContent(tex)) throw new Error('latex must pass');
+
+        // Edge case: a LaTeX doc with stray markdown-looking lines still
+        // passes (the \\section marker is what matters for routing).
+        const mixed = 'Some intro paragraph. ## not a real header.\\n\\\\section{Chapter}\\n';
+        if (!h.isLatexNotesContent(mixed)) throw new Error('latex with stray ## must still pass');
+
+        console.log('ok');
+        """
+    )
+    assert run_node(script).strip() == "ok"
+
+
+def test_notes_scroll_listener_uses_layout_effect_for_cleanup():
+    """Round 3 scroll-cache fix (Notes→Reader→Notes regression):
+
+    The save effect that attaches the scroll listener AND captures the
+    final scrollTop in its cleanup MUST be a `useLayoutEffect`, not a
+    `useEffect`. Layout-effect cleanups run synchronously during the
+    mutation phase (before DOM removal), so `rootRef.current.scrollTop`
+    still reads the live value. Passive-effect cleanups run AFTER the
+    DOM is detached — `scroller.isConnected` is false and the previous
+    `isConnected`-gated flush silently no-op'd, which is why the user
+    could scroll → click a citation → return to Notes → land at top.
+
+    Pin the useLayoutEffect choice so a future refactor doesn't
+    accidentally drop the timing guarantee. Also pins that the rAF
+    `detached` flag still exists (defense against rAF-after-unmount).
+    """
+    from pathlib import Path
+    src = Path(__file__).resolve().parent.parent / "frontend" / "app.jsx"
+    text = src.read_text()
+    # Match the save-listener block by anchoring on the function it
+    # attaches: `function onScroll() { ... requestAnimationFrame(...)
+    # if (detached) return ...`. The hook must be useLayoutEffect.
+    import re
+    m = re.search(
+        r"React\.(useEffect|useLayoutEffect)\(\(\)\s*=>\s*\{[^}]*?"
+        r"const scroller = rootRef\.current;[^}]*?"
+        r"let detached = false;[^}]*?"
+        r"function onScroll\(\)",
+        text,
+        re.DOTALL,
+    )
+    assert m, "could not locate the scroll-save effect in app.jsx"
+    assert m.group(1) == "useLayoutEffect", (
+        "scroll-save effect must use React.useLayoutEffect so its cleanup "
+        "fires before DOM removal (regression risk: Notes→Reader→Notes "
+        "lands at top if cleanup is passive). Found: " + m.group(1)
+    )
+    # The cleanup must NOT gate the final flush on scroller.isConnected
+    # — at layout-cleanup time the node IS connected, and the previous
+    # `isConnected &&` guard was a no-op that masked the bug.
+    cleanup_block = text[m.start():m.start() + 3000]
+    assert "scroller.isConnected" not in cleanup_block, (
+        "cleanup save no longer needs the scroller.isConnected guard "
+        "(it was always false in passive cleanup, which is why the bug "
+        "existed); leaving it in is misleading."
+    )
 
 
 def test_hidden_courses_roundtrip():

@@ -202,3 +202,30 @@ def test_ingest_rejects_missing_directory(client):
     r = client.post("/api/ingest", json={"course_dir": "/nope/this/does/not/exist"})
     assert r.status_code == 404
     assert r.json()["request_id"]
+
+
+def test_exam_prep_view_empty_course_returns_empty_bank(client):
+    r = client.get("/api/exam-prep/testcourse")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["view"]["topic_count"] == 0
+    assert body["bank"]["topics"] == []
+
+
+def test_exam_prep_view_rejects_traversal(client):
+    r = client.get("/api/exam-prep/..hack")
+    assert r.status_code == 400
+    assert "request_id" in r.json()
+
+
+def test_exam_prep_submit_rejects_oversized_answers(client):
+    """answers cap is 50 entries — submit with 51 must 422."""
+    big = {f"q_{i}": "A" for i in range(51)}
+    r = client.post("/api/exam-prep/quiz/submit", json={"course_id": "testcourse", "answers": big})
+    assert r.status_code == 422
+
+
+def test_exam_prep_quiz_next_without_topics_returns_502(client):
+    """No bank yet → skill returns no_topics error → API surfaces 502."""
+    r = client.post("/api/exam-prep/quiz/next", json={"course_id": "testcourse", "size": 5})
+    assert r.status_code == 502

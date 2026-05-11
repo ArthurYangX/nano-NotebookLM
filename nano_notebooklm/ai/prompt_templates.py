@@ -418,6 +418,69 @@ Output a JSON object:
   "recommendations": ["study recommendation 1", "..."]
 }}"""
 
+# ── Exam Prep (closed-loop exam preparation) ─────────────────────────
+EXAM_PREP_SYSTEM = (
+    "You are an exam preparation assistant. Output strictly valid JSON. "
+    "Stay grounded in the supplied source material — do not invent facts "
+    "beyond what the chunks support."
+)
+
+EXAM_PREP_TOPIC_PROMPT = """Extract the most exam-relevant topics from this course material.
+
+Course: {course_name}
+Max topics: {max_topics}
+
+Source material:
+{source_text}
+
+Output a JSON object:
+{{
+  "topics": [
+    {{
+      "name": "concise topic name (≤60 chars)",
+      "weight": 0.0,
+      "source_chunks": ["chunk_id_1", "chunk_id_2"],
+      "rationale": "why this is exam-critical"
+    }}
+  ]
+}}
+
+Rules:
+- `weight` ∈ [0,1] reflects exam importance (frequency × difficulty × foundational).
+- Pick 5–{max_topics} topics that cover the breadth of the syllabus.
+- `source_chunks` must reference chunk_ids that appear in the supplied source material; pick 1–4 per topic.
+- If the system prompt contains a user-language binding, follow it strictly; otherwise default to the dominant language of the source material."""
+
+EXAM_PREP_QUESTIONS_PROMPT = """Generate {num_questions} distinct exam-style questions on a single topic, mixing the requested types.
+
+Topic: {topic_name}
+Question types to mix: {question_types}
+
+Source material:
+{source_text}
+{avoid_block}
+
+Output a JSON object:
+{{
+  "questions": [
+    {{
+      "prompt": "the question text",
+      "type": "multiple_choice|short_answer|calculation",
+      "options": ["A. ...", "B. ...", "C. ...", "D. ..."],
+      "answer": "letter like 'B' for multi-choice, OR the expected short answer/calculation result",
+      "explanation": "1–2 sentence solution rationale",
+      "difficulty": "easy|medium|hard",
+      "concepts": ["sub-concept tag 1", "..."]
+    }}
+  ]
+}}
+
+Rules:
+- For `multiple_choice`: provide exactly 4 options as "X. text", and `answer` MUST be a single uppercase letter A/B/C/D.
+- For `short_answer`/`calculation`: omit `options`; `answer` is the canonical short response (≤30 words).
+- Each question must probe a DIFFERENT angle of the topic (definition, application, comparison, edge case, derivation, etc.).
+- If the system prompt contains a user-language binding, follow it strictly for prompt + options + explanation; otherwise default to the source-material language."""
+
 # ── R3-3: Mind-map node deep-dive ────────────────────────────────────
 # Used by `/api/mindmap/{cid}/explain-node`. The agent loop runs with a
 # strict tool subset (search_kb + read_chunk only) for at most 4 turns,
