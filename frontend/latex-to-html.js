@@ -253,10 +253,17 @@
     var re = new RegExp("\\\\(section|subsection)\\s*" + BRACE_GROUP, "g");
     var m;
     while ((m = re.exec(source)) !== null) {
+      // LaTeX-output fix-all v3 #3: strip inline macros from TOC titles —
+      // the LLM happily emits `\subsection{\texttt{leaq}: ...}` and the
+      // sidebar would otherwise show literal `\texttt{leaq}: ...`. Reduce
+      // \texttt/\textbf/\emph/\textit/\code wrappers to their inner text.
+      var clean = m[2]
+        .replace(/\\(textbf|textit|emph|texttt|textsf|textrm)\s*\{([^{}]*)\}/g, "$2")
+        .replace(/\\[a-zA-Z]+\s*\{([^{}]*)\}/g, "$1");
       items.push({
         level: m[1] === "section" ? 1 : 2,
-        text: m[2],
-        id: slugify(m[2]),
+        text: clean,
+        id: slugify(clean),
       });
     }
     return items;
