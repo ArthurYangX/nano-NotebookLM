@@ -23,8 +23,13 @@ the others are still running.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
-from dataclasses import dataclass
+import os
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
 
 from typing import TYPE_CHECKING, Any
 
@@ -55,7 +60,15 @@ REVIEW_TEMPERATURE = 0.2
 
 @dataclass(frozen=True)
 class FilePlan:
-    """Prepared inputs for one per-file LLM call."""
+    """Prepared inputs for one per-file LLM call.
+
+    Incremental cache (2026-05-11): when ``cached_content`` is non-None,
+    the per-file LLM call SHOULD be skipped — the endpoint emits a
+    ``file_cached`` event and uses ``cached_content`` as the merge input.
+    ``cache_key`` is the content hash of the file's chunks; the endpoint
+    writes ``{cache_key, content}`` back to per_file_cache.json after a
+    fresh successful generation.
+    """
     idx: int
     source_file: str
     chunk_count: int
@@ -64,6 +77,8 @@ class FilePlan:
     task_type: str
     temperature: float
     max_tokens: int
+    cache_key: str = ""
+    cached_content: str | None = None
 
 
 @dataclass(frozen=True)
@@ -75,6 +90,126 @@ class FileResult:
     chunk_count: int
     content: str | None
     error: str | None
+
+
+# ── Incremental per-file cache ─────────────────────────────────────
+#
+# Store: artifacts/courses/<course_id>/notes/per_file_cache.json
+# Shape: {
+#   "<source_file>": {
+#     "chunk_hash": "<sha256 hex>",
+#     "content": "<LaTeX body for this file>",
+#     "generated_at": "<iso8601 UTC>",
+#     "model": "<router model name>"
+#   }
+# }
+#
+# Invalidation: SHA256 over `chunk_id + "\n" + text` per chunk, joined with
+# `|` separators. Catches both re-upload (chunk_ids re-issued) and content
+# drift (text changes inside the same chunks).
+#
+# Concurrency: load_cache + save_cache are not internally locked. The
+# /api/notes/full-course/stream endpoint serialises read/write because
+# the same global semaphore that gates the LLM-heavy span also gates the
+# cache mutation; two concurrent requests for the SAME course never write
+# the cache at the same time. Different courses write different files.
+
+
+def _cache_path(course_id: str) -> Path:
+    """Resolve the per-file cache JSON path; refuses paths that escape
+    ARTIFACTS_DIR/courses (defense in depth — course_id values like
+    "../etc" otherwise let a future caller read arbitrary disk)."""
+    from nano_notebooklm import config
+    base = (config.ARTIFACTS_DIR / "courses" / course_id / "notes").resolve()
+    allowed = (config.ARTIFACTS_DIR / "courses").resolve()
+    if not base.is_relative_to(allowed):
+        raise ValueError(f"course_id {course_id!r} resolves outside artifacts root")
+    return base / "per_file_cache.json"
+
+
+def load_cache(course_id: str) -> dict[str, dict]:
+    """Read per_file_cache.json. Returns {} on missing / corrupt file —
+    the caller treats a missing cache the same as an empty one (everything
+    needs regen). Corrupt-file path logs at WARNING so an operator notices."""
+    try:
+        p = _cache_path(course_id)
+    except ValueError:
+        return {}
+    if not p.exists():
+        return {}
+    try:
+        with p.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        logger.warning("per_file_cache.json corrupt for %s — treating as empty",
+                       course_id)
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return data
+
+
+def save_cache(course_id: str, cache: dict[str, dict]) -> None:
+    """Atomic write of the entire cache dict — temp file + os.replace.
+    Caller passes the FULL desired post-state; we don't read-modify-write
+    here. Use write_cache_entry / prune_stale_cache for incremental
+    updates so two pieces of mutation logic don't drift."""
+    try:
+        p = _cache_path(course_id)
+    except ValueError:
+        return
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(".json.tmp")
+    payload = json.dumps(cache, ensure_ascii=False, indent=2, sort_keys=True)
+    with tmp.open("w", encoding="utf-8") as fh:
+        fh.write(payload)
+    os.replace(tmp, p)
+
+
+def chunk_hash(chunks: list[Chunk]) -> str:
+    """Stable content hash for a file's chunks.
+
+    Combines chunk_id (catches re-ingest where the text is identical but
+    chunk boundaries shifted) AND text (catches content edits to the
+    underlying source file). Separator bytes are non-text so a chunk text
+    that happens to contain `|` cannot collide with another arrangement.
+    """
+    h = hashlib.sha256()
+    for c in chunks:
+        h.update(b"\x1f")  # ASCII unit separator
+        h.update((c.chunk_id or "").encode("utf-8", "replace"))
+        h.update(b"\x1e")  # ASCII record separator
+        h.update((c.text or "").encode("utf-8", "replace"))
+    return h.hexdigest()
+
+
+def write_cache_entry(course_id: str, source_file: str, *,
+                      chunk_hash_value: str, content: str,
+                      model: str = "") -> None:
+    """Update one entry, atomically rewriting the whole cache file. Cheap
+    for typical course sizes (10–30 entries × a few KB each)."""
+    cache = load_cache(course_id)
+    cache[source_file] = {
+        "chunk_hash": chunk_hash_value,
+        "content": content,
+        "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "model": model,
+    }
+    save_cache(course_id, cache)
+
+
+def prune_stale_cache(course_id: str, active_source_files: set[str]) -> int:
+    """Drop cache entries for source_files no longer present in the course
+    (e.g. user deleted a file and re-ingested). Returns the number of
+    entries removed. No-op when nothing changed."""
+    cache = load_cache(course_id)
+    stale = [k for k in cache if k not in active_source_files]
+    if not stale:
+        return 0
+    for k in stale:
+        del cache[k]
+    save_cache(course_id, cache)
+    return len(stale)
 
 
 def _group_chunks_by_file(chunks: list[Chunk]) -> dict[str, list[Chunk]]:
@@ -92,17 +227,41 @@ def plan_for_course(
     kb: "KBStore | Any",
     course_id: str,
     user_lang: str | None = None,
+    *,
+    force_refresh: bool = False,
 ) -> list[FilePlan]:
     """Build one FilePlan per source_file in the course. Returns [] when
-    the course has no chunks — caller surfaces this as an error event."""
+    the course has no chunks — caller surfaces this as an error event.
+
+    Incremental cache: when ``force_refresh`` is False (default), each
+    plan's ``cached_content`` is populated from per_file_cache.json if
+    the file's current chunk_hash matches the cached one. The endpoint
+    then short-circuits the LLM call. ``force_refresh=True`` ignores the
+    cache entirely — used by the explicit "regenerate from scratch" UI.
+
+    The hash is computed over the CAPPED chunk list (post-MAX_CHUNKS_PER_FILE
+    truncation) so changing the cap invalidates every cache entry — which
+    is the safe behavior, since the prompt that produced the cached body
+    saw a different chunk set.
+    """
     chunks = kb.get_chunks(course_id)
     if not chunks:
         return []
     groups = _group_chunks_by_file(chunks)
+    cache = {} if force_refresh else load_cache(course_id)
 
     plans: list[FilePlan] = []
     for idx, (source_file, file_chunks) in enumerate(groups.items()):
         capped = file_chunks[:MAX_CHUNKS_PER_FILE]
+        cache_key = chunk_hash(capped)
+        cached_content: str | None = None
+        entry = cache.get(source_file)
+        if entry and isinstance(entry, dict):
+            stored_hash = entry.get("chunk_hash")
+            stored_body = entry.get("content")
+            if stored_hash == cache_key and isinstance(stored_body, str) and stored_body.strip():
+                cached_content = stored_body
+
         # LaTeX-output fix-all v3 #1: prime LLM with `\cite{}` not `[Source:]`.
         # Same fix as note_generator.prepare_inputs — without it the LLM
         # mirrored the markdown-flavoured [Source:] marker straight into the
@@ -130,6 +289,8 @@ def plan_for_course(
             task_type="note_generation",
             temperature=PER_FILE_TEMPERATURE,
             max_tokens=PER_FILE_MAX_TOKENS,
+            cache_key=cache_key,
+            cached_content=cached_content,
         ))
     return plans
 

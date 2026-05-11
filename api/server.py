@@ -561,6 +561,16 @@ class NoteFullCourseRequest(BaseModel):
         description="Max parallel per-file LLM calls. Capped at 8 to stay "
                     "well under codex rate limits.",
     )
+    # Incremental cache (2026-05-11): default False reuses cached per-file
+    # outputs from artifacts/courses/<id>/notes/per_file_cache.json when
+    # the file's chunk_hash matches. Pass `true` from the UI's "Regenerate
+    # all (force)" button to ignore the cache and re-run every file.
+    force: bool = Field(
+        False,
+        description="When true, ignore per_file_cache.json and re-run "
+                    "every per-file LLM call. Default false uses cached "
+                    "entries whose chunk_hash matches the current chunks.",
+    )
 
 
 class NotePdfExportRequest(BaseModel):
@@ -852,12 +862,19 @@ async def get_source_file(course_id: str, doc_id: str):
           summary="RAG chat with source citations",
           response_model=ChatResponse, response_model_exclude_none=True)
 async def chat(req: ChatRequest):
+    # R4-5 part 2: guard the qwen_raft path behind explicit env config.
+    # Without this, a stale frontend chip selection (or a curl with the
+    # backend kwarg) would surface deep inside ModelRouter as a generic
+    # RuntimeError. 422 mirrors the rest of the input-validation surface.
+    if req.backend == "qwen_raft" and not config.QWEN_RAFT_URL:
+        raise HTTPException(422, detail="qwen_raft backend not configured")
     result = await orchestrator.skills["qa"].execute({
         "question": req.question,
         "course_filter": req.course_id,
         "top_k": req.top_k,
         "checked_files": req.checked_files,
         "user_lang": req.user_lang,
+        "backend": req.backend,
     })
     if not result.success:
         raise HTTPException(status_code=502, detail=result.error or "qa skill failed")
@@ -1026,7 +1043,8 @@ async def stream_full_course_notes(req: NoteFullCourseRequest, request: Request)
     # that's 100-500ms of sync work before the first `plan` event can
     # ship. Push it to a thread so the event loop stays responsive.
     plans = await asyncio.to_thread(
-        notes_full_course.plan_for_course, kb, course_id, user_lang=user_lang
+        notes_full_course.plan_for_course, kb, course_id,
+        user_lang=user_lang, force_refresh=req.force,
     )
 
     global_sem = _get_full_course_semaphore()
@@ -1047,24 +1065,66 @@ async def stream_full_course_notes(req: NoteFullCourseRequest, request: Request)
         # shared router. async with ensures release even on early return
         # / cancellation / exception.
         async with global_sem:
+            # Prune cache entries for source_files no longer present (e.g.
+            # user deleted a PDF) before announcing the plan. Best-effort:
+            # if the artifacts dir is missing for some reason, ignore.
+            try:
+                active_files = {p.source_file for p in plans}
+                await asyncio.to_thread(
+                    notes_full_course.prune_stale_cache, course_id, active_files,
+                )
+            except Exception:  # noqa: BLE001 — never block generation on cache cleanup
+                logger.warning("prune_stale_cache failed for %s",
+                               course_id, exc_info=True)
+
+            # Partition plans: cached ones short-circuit (no LLM call),
+            # non-cached ones flow through the worker pool. Report cache
+            # stats in the plan event so the frontend can pre-light the
+            # progress bar.
+            cached_plans = [p for p in plans if p.cached_content is not None]
+            fresh_plans = [p for p in plans if p.cached_content is None]
+
             try:
                 yield json.dumps({
                     "type": "plan",
                     "files": [
                         {"idx": p.idx, "source_file": p.source_file,
-                         "chunk_count": p.chunk_count}
+                         "chunk_count": p.chunk_count,
+                         "cached": p.cached_content is not None}
                         for p in plans
                     ],
                     "total": len(plans),
                     "concurrency": concurrency,
+                    "cached_count": len(cached_plans),
+                    "fresh_count": len(fresh_plans),
+                    "force": req.force,
                 }, ensure_ascii=False) + "\n"
+
+                results: list[notes_full_course.FileResult] = [None] * len(plans)  # type: ignore[list-item]
+
+                # Cache hits: emit synthesized file_cached events and seed
+                # `results` so the merge pass sees them. No event ordering
+                # constraint — fire them all up front so the UI lights the
+                # cached files instantly.
+                for p in cached_plans:
+                    results[p.idx] = notes_full_course.FileResult(
+                        idx=p.idx, source_file=p.source_file,
+                        chunk_count=p.chunk_count,
+                        content=p.cached_content, error=None,
+                    )
+                    yield json.dumps({
+                        "type": "file_cached",
+                        "idx": p.idx,
+                        "source_file": p.source_file,
+                        "content": p.cached_content,
+                        "chunks_used": p.chunk_count,
+                    }, ensure_ascii=False) + "\n"
 
                 semaphore = asyncio.Semaphore(concurrency)
                 # Bounded queue: per-file work produces 2 events (start + done/error).
                 # 4× plans gives slack for the merging/reviewing/done tail without
                 # an unbounded queue that could mask backpressure bugs.
-                queue: asyncio.Queue = asyncio.Queue(maxsize=max(64, len(plans) * 4))
-                results: list[notes_full_course.FileResult] = [None] * len(plans)  # type: ignore[list-item]
+                queue: asyncio.Queue = asyncio.Queue(maxsize=max(64, len(fresh_plans) * 4))
 
                 async def run_one(plan):
                     # Acquire the semaphore first so file_start reflects "a
@@ -1080,6 +1140,22 @@ async def stream_full_course_notes(req: NoteFullCourseRequest, request: Request)
                         result = await notes_full_course.generate_file(router, plan)
                         results[plan.idx] = result
                         if result.content:
+                            # Write fresh result to the cache. Best-effort:
+                            # cache write failure (disk full, etc.) shouldn't
+                            # break the generation — log and continue.
+                            try:
+                                await asyncio.to_thread(
+                                    notes_full_course.write_cache_entry,
+                                    course_id, plan.source_file,
+                                    chunk_hash_value=plan.cache_key,
+                                    content=result.content,
+                                    model=getattr(router, "current_model", ""),
+                                )
+                            except Exception:  # noqa: BLE001
+                                logger.warning(
+                                    "write_cache_entry failed course=%s file=%s",
+                                    course_id, plan.source_file, exc_info=True,
+                                )
                             await queue.put({
                                 "type": "file_done",
                                 "idx": result.idx,
@@ -1095,7 +1171,7 @@ async def stream_full_course_notes(req: NoteFullCourseRequest, request: Request)
                                 "error": result.error or "unknown",
                             })
 
-                tasks = [asyncio.create_task(run_one(p)) for p in plans]
+                tasks = [asyncio.create_task(run_one(p)) for p in fresh_plans]
                 queue_waiter: asyncio.Task | None = None
                 try:
                     # Drive the drain off task completion, NOT a done_count we

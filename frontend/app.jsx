@@ -228,8 +228,12 @@ function App() {
       return out;
     }
     function rebuildDraftFromFiles() {
+      // Incremental cache (2026-05-11): both `done` (fresh from LLM)
+      // and `cached` (replayed from per_file_cache.json) contribute to
+      // the merged draft. Order is plan-index order, matching backend's
+      // concat_draft.
       return fileSections
-        .filter(f => f && f.status === "done" && f.content)
+        .filter(f => f && (f.status === "done" || f.status === "cached") && f.content)
         .map(f => `\\section{${escapeLatexTitle(f.source_file)}}\n${f.content}`)
         .join("\n\n");
     }
@@ -252,6 +256,18 @@ function App() {
             fileSections[event.idx].status = "running";
             fileSections[event.idx].source_file = event.source_file || fileSections[event.idx].source_file;
           }
+        } else if (event.type === "file_cached") {
+          // Incremental cache (2026-05-11): backend short-circuits the
+          // LLM call when per_file_cache.json has a matching chunk_hash.
+          // Same payload shape as file_done; track the `cached: true`
+          // flag so the UI can ⚡-flag the section.
+          if (fileSections[event.idx]) {
+            fileSections[event.idx].status = "cached";
+            fileSections[event.idx].content = event.content;
+            fileSections[event.idx].source_file = event.source_file || fileSections[event.idx].source_file;
+          }
+          if (!inReview) setRealNotes(rebuildDraftFromFiles());
+          setStreamProgress(p => p + 1);
         } else if (event.type === "file_done") {
           if (fileSections[event.idx]) {
             fileSections[event.idx].status = "done";
