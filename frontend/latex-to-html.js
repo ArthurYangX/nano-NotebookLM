@@ -192,10 +192,26 @@
       return "<pre class=\"latex-unknown\">" + escapeHtml(raw) + "</pre>";
     });
 
-    // Stage 8: restore whitelisted envs.
+    // Stage 8: restore whitelisted envs. List envs (itemize/enumerate)
+    // split on the RAW \item. Math envs emit $$...$$ for KaTeX. Theorem-
+    // family envs wrap the inner with the appropriate box class.
+    //
+    // LaTeX-output fix-all v3 #4: renderInnerFragment used to recursively
+    // call latexToHtml(inner). That spawned a fresh local citeBuf in the
+    // recursion, which eagerly consumed CITE_n / MATH_n placeholders left
+    // by the OUTER stash pass — looking them up in the (empty) recursive
+    // buffer and emitting empty chips (`[Source: ]`). Symptom: every cite
+    // inside a theorem/definition env jumped to the first slide because
+    // resolveCitationNavigation matched "" via title.includes(""). Fix:
+    // the inner fragment is rendered INLINE only (escape + inline macros),
+    // preserving every placeholder verbatim so the outer Stage 9 / 10 / 11
+    // sweep restores them correctly.
     function renderInnerFragment(inner) {
-      var recur = latexToHtml(inner);
-      return recur.replace(/^<p>([\s\S]*)<\/p>$/, "$1");
+      var escaped = escapeHtml(inner);
+      escaped = renderInline(escaped);
+      // Blank lines → soft break inside the box; single newlines collapse.
+      escaped = escaped.replace(/\n\s*\n/g, "<br/><br/>").replace(/\n/g, " ");
+      return escaped;
     }
     function renderListInner(rawInner) {
       return rawInner.split(/\\item\b\s*/)
@@ -228,10 +244,30 @@
     });
 
     // Stage 9: restore cite chips.
+    //
+    // LaTeX-output fix-all v3 #5: normalise the cite payload from
+    // `file:loc` (the format the LLM emits) into `file, loc` (the format
+    // resolveCitationNavigation in study-state.js parses — it splits on
+    // `,` to extract the source filename from the location). Without the
+    // normalisation, sourcePart was the full `file:loc` string and the
+    // matcher fell back to a substring `title.includes(sourcePart)` /
+    // `sourcePart.includes(title)` check, which still works but is fragile
+    // and loses the chunk_id route. Comma-form is the canonical contract.
+    function normaliseCite(raw) {
+      var i = raw.indexOf(":");
+      if (i <= 0 || i >= raw.length - 1) return raw;  // no usable split
+      // First-colon split — location text may itself contain colons (e.g.
+      // "Section 2.1: Intro" is rare but defensible) so don't be greedy.
+      var file = raw.slice(0, i).trim();
+      var loc = raw.slice(i + 1).trim();
+      if (!file || !loc) return raw;
+      return file + ", " + loc;
+    }
     html = html.replace(/\s?CITE(\d+)\s?/g, function (_m, idx) {
-      var inner = citeBuf[Number(idx)] || "";
-      var safeInner = escapeHtml(inner);
-      var safeFull  = escapeHtml("[Source: " + inner + "]");
+      var rawInner = citeBuf[Number(idx)] || "";
+      var displayInner = normaliseCite(rawInner);
+      var safeInner = escapeHtml(displayInner);
+      var safeFull  = escapeHtml("[Source: " + displayInner + "]");
       return "<button type=\"button\" class=\"ref-chip mono\" data-cite=\"" + safeFull + "\">" + safeInner + "</button>";
     });
 
