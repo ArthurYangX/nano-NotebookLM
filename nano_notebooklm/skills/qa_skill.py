@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import html
 import logging
+import os
 import re
 from typing import Iterable
 
@@ -32,6 +33,41 @@ logger = logging.getLogger(__name__)
 # Wrap the translation LLM call so a stalled provider can't double our chat
 # latency budget. 5s is generous: codex GPT-5.5 typically translates in <1s.
 TRANSLATION_TIMEOUT_SECONDS = 5.0
+
+# fix-all v1 #A3 / #B6 (R4-4 review-swarm): graphrag admission gate. Plain
+# cosine ranking against the KG concept embeddings yields api_scores roughly
+# in the [-1, 1] cosine range; 0.15 puts "moderate semantic overlap" as the
+# floor (rules out queries with no real conceptual overlap that nonetheless
+# pick up 2+ topics just by chance). Tunable via GRAPHRAG_SCORE_GATE_TOP1.
+# GRAPHRAG_ENABLED is the kill-switch — operators can disable graphrag
+# without redeploying when a particular KG shape causes regressions.
+DEFAULT_GRAPHRAG_TOP1_THRESHOLD = 0.15
+
+
+def _graphrag_score_floor() -> float:
+    raw = os.getenv("GRAPHRAG_SCORE_GATE_TOP1")
+    if raw is None or raw == "":
+        return DEFAULT_GRAPHRAG_TOP1_THRESHOLD
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning(
+            "GRAPHRAG_SCORE_GATE_TOP1=%r is not a float; using default %s",
+            raw, DEFAULT_GRAPHRAG_TOP1_THRESHOLD,
+        )
+        return DEFAULT_GRAPHRAG_TOP1_THRESHOLD
+    if value != value or value in (float("inf"), float("-inf")):  # NaN / Inf
+        return DEFAULT_GRAPHRAG_TOP1_THRESHOLD
+    return value
+
+
+def _graphrag_enabled() -> bool:
+    """Kill switch. Operator sets GRAPHRAG_ENABLED=0 (or false/no/off) to
+    disable graphrag globally without removing knowledge_graph.json files."""
+    raw = (os.getenv("GRAPHRAG_ENABLED") or "").strip().lower()
+    if raw in ("0", "false", "no", "off", "disabled"):
+        return False
+    return True  # default on
 
 # Quote / wrapper characters the translation LLM sometimes returns despite
 # being told not to. We strip them so RAG doesn't search for `"memory"` etc.
@@ -123,9 +159,18 @@ class QASkill(Skill):
         #     materially degrading the neighbourhood signal.
         # Skip → fall through to existing RAG → translation → cross-course
         # → general chain.
-        if course_filter and not checked_files:
+        if course_filter and not checked_files and _graphrag_enabled():
             graphrag_results = await self._maybe_graphrag(question, course_filter)
-            if graphrag_results and len(graphrag_results) >= 2:
+            # fix-all v1 #A3: admission gate uses passes_score_gate with a
+            # graphrag-specific cosine floor (default 0.15) instead of the
+            # original `len >= 2` check. The latter let every chat on a
+            # course with ≥2 topic nodes hit graphrag regardless of how
+            # unrelated the query was, pre-empting the RAG path with a
+            # noisy retrieval.
+            if graphrag_results and router_intent.passes_score_gate(
+                graphrag_results,
+                top1_threshold=_graphrag_score_floor(),
+            ):
                 logger.info("qa.path=graphrag course=%s top1=%.4f hits=%d",
                             course_filter, graphrag_results[0].score,
                             len(graphrag_results))

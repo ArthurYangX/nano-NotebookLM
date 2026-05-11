@@ -82,3 +82,12 @@ def disable_network():
     for key in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY"):
         os.environ.pop(key, None)
     yield
+
+
+# fix-all v1 #B7 (R4-4 review-swarm): the FastAPI startup hook in
+# api/server.py warms kb.embed_fn at boot. TestClient triggers it on every
+# `with TestClient(server_mod.app)` enter, which would cost 3-10s per
+# reload across the suite — multiplying pytest wall time without
+# exercising any production behavior. Disable globally for tests; the
+# hook is verified by tests/test_r4_4_fix_all_v1.py source-pin grep.
+os.environ.setdefault("NANO_NLM_DISABLE_EMBED_WARMUP", "1")

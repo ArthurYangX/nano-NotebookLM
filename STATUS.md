@@ -354,6 +354,33 @@
   5. **path chip 颜色**：用 oklch 绿色（与 plum/amber/crimson 同 family），无新 CSS 变量；GOAL.md 说"绿色图检索"对齐。
 - **conflict notes**: graph_search 是新文件；qa_skill / router_intent / api/server.py / extractor / types / frontend 都改动量小，与 R4-5（占 ChatRequest 模型段 + /api/status 端点）物理隔离。R4-2 fake_extract 测试 fixture 加 **kwargs 是单向兼容（接受未来更多 kwarg），不影响 R4-5 后续在 ChatRequest 加 backend 字段。
 
+#### R4-4 review-swarm v1 + fix-all v1（2026-05-11，reviewer: claude）
+
+4 路 review-swarm（intent+regression / security+privacy / performance+reliability / contracts+coverage）汇出 ~25 项 finding。fix-now 3 项（A1-A3，HIGH/CRITICAL）+ fix-soon 4 项（B4-B7，MEDIUM）+ low 3 项（C8-C10）共 10 条落地，**新增 12 条回归测试**。
+
+**A 批 fix-now（核心正确性）**：
+
+- **A1 CRITICAL: `concept_embedding` 从未真正落盘** — `KnowledgeGraph.add_concepts`（nano_notebooklm/kg/graph.py:45-57）的显式 kwarg 白名单缺 `concept_embedding`，extract_from_chunks 算出来的缓存被 networkx 节点序列化时静默丢弃，`kg.save()` 落盘的 JSON 不含此字段 → 每次 /api/chat 走 graphrag 都跑 lazy 路径。修：add_node + merge 两路加 `concept_embedding=c.concept_embedding`；merge 走"first-seen 保留"策略对齐 parent_topic / learning_order。
+- **A2 HIGH: 同步 `embed_fn(texts)` 阻塞 event loop** — `extract_from_chunks` 是 async，但 line 428 `embs = embed_fn(texts)` 直接同步调（sentence-transformer 300-1000ms forward），卡 R4-2 NDJSON queue drain 在 Stage B 100% → done 之间。修：`embs = await asyncio.to_thread(embed_fn, texts)` 单行改。
+- **A3 HIGH: graphrag admission gate 太宽** — 原检查 `len(graphrag_results) >= 2`，任何课 KG 有 ≥2 节点就**永远命中** graphrag pre-empt RAG；cosine=0.05（无关 query）也算 hit。修：改用 `router_intent.passes_score_gate(graphrag_results, top1_threshold=_graphrag_score_floor())`，新增 `GRAPHRAG_SCORE_GATE_TOP1` env（默认 0.15）。
+
+**B 批 fix-soon（防御深度 / 性能）**：
+
+- **B4: graph_search lazy embed 批量化** — 原 `_node_embedding` 对每个 cache-miss 节点单独调 `embed_fn([text])`（200-node legacy KG → 200 次序列调用，~1-2s 首查）。修：重构为 `_resolve_node_embeddings` 单 pass 扫描 → 收集 missing 节点 → **一次** `embed_fn(list_of_texts)` 批量。
+- **B5: 编辑节点 name/definition 清 concept_embedding 缓存** — apply_edit_ops_with_results update_node 分支：name/definition 变了但 embedding 不变 → stale；graph_search 用老 embedding 排新 text。修：patch 含 name/definition 时把 `concept_embedding` 置 None，下次 graph_search lazy 重算。
+- **B6: `GRAPHRAG_ENABLED` env kill switch** — 加 `_graphrag_enabled()` helper（接受 0/false/no/off/disabled），admission 入口判一道，operator 不删 KG 就能 disable graphrag。
+- **B7: FastAPI startup hook 预热 `kb.embed_fn`** — sentence-transformer 200MB 模型首访下载 5-30s；`@app.on_event("startup")` 用 `asyncio.to_thread` 调 `kb.embed_fn(["__warmup__"])` 把成本移到 boot 期。失败仅 warn，不阻断启动。
+
+**C 批 low 修整**：
+
+- **C8: `_concept_embed_text` 单源 import** — 原本 extractor.py 和 graph_search.py 各有一份拷贝（"kept in sync" 注释承诺），现 graph_search 用 shim 包装节点 dict 后委托给 extractor 版本，单源避漂移。
+- **C9: 4 个 fake `extract_from_chunks` 签名 `**kwargs` → `embed_fn=None`** — 显式参数，让未来 production 函数签名漂移立即触发 TypeError 而不是被 **kwargs 吃掉。
+- **C10: ChatResponse docstring "four `path` values" → "five"** — OpenAPI / `/docs` 客户端代码生成不再撞 stale 文案。
+
+**files touched**: nano_notebooklm/kg/{graph.py, extractor.py} / nano_notebooklm/kb/graph_search.py / nano_notebooklm/skills/qa_skill.py / tests/{conftest.py, test_upload_stream.py, test_r4_2_fix_all_v1.py} + **新增** tests/test_r4_4_fix_all_v1.py（12 条回归）。**api/server.py 的 fix-all v1 改动**（B7 startup hook、ChatResponse docstring "four→five"、update_node 编辑后 pop concept_embedding）**意外在 e60bca3 R4-6 commit 中一并 land** — 用户上一会话 commit R4-6 LaTeX pipeline 时 stage 了 working tree 的全部 server.py 改动，这部分等同已 land 但 attribution 在 R4-6。**pytest**: **729 passed in 1171s**（R4-4 + R4-6 baseline + fix-all v1 12 新回归 + conftest disable embed-warmup 让 TestClient 重启不再阻塞）。
+
+**review_notes**: 未处理的 review-swarm finding（下一轮再看）：(a) Reviewer 3 #3 KG/chunks.json 每次 chat 重读（mtime LRU cache，独立成 fix-all v2）；(b) Reviewer 3 #4 api_score 与 sort_key 不一致（架构性，影响 UI score chip 可比性，独立 v2）；(c) Reviewer 2 五条 hardening（path traversal 内嵌防御、NaN/Inf check、node count cap、日志去 absolute path、query length bound — 防御深度，独立 v2）；(d) Reviewer 4 #4 mindmap GET 响应 concept_embedding 隔离 assert 测试（防 future spread refactor 退化）；(e) graphrag-zero → cross-course 链 / user_lang × graphrag prompt 注入端到端测试（需要更完整的 chat_capture fixture，独立 v2 补）。
+
 ### #R4-5 Backend backend 切换 chip：codex GPT-5.4 / Qwen2.5-7B-RAFT — [claude]
 
 - **goal ref**: GOAL.md Round 4 #R4-5

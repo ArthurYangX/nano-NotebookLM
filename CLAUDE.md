@@ -223,6 +223,27 @@ nano_notebooklm/   Python backend modules
   filtering). <2 hits → silent fall-through to existing RAG → translation
   → cross-course → general chain. Frontend chip: green `🕸️ 图检索` via
   `.path-chip.path-graphrag` oklch styling.
+- R4-4 review-swarm fix-all v1 (2026-05-11): 4-route review caught a
+  CRITICAL data-path bug + two HIGH performance regressions in the R4-4
+  patch. Fixes: (A1) `KnowledgeGraph.add_concepts` now persists
+  `concept_embedding` through its add_node kwargs and merge branch —
+  before, networkx silently dropped the field on save so every chat hit
+  the lazy-embed path despite the caching design. (A2) `extract_from_chunks`
+  awaits `embed_fn(texts)` via `asyncio.to_thread` so R4-2's NDJSON queue
+  drain stays responsive during the post-Stage-B embedding pass. (A3)
+  graphrag admission now uses `router_intent.passes_score_gate` with a
+  graphrag-specific cosine floor (`GRAPHRAG_SCORE_GATE_TOP1`, default
+  0.15) instead of a permissive `len >= 2` check — prevents low-relevance
+  queries from pre-empting RAG. (B4) graph_search resolves cache-miss
+  node embeddings in a single batched `embed_fn(list)` call. (B5)
+  Mindmap update_node ops drop the cached `concept_embedding` when name
+  or definition changes so the next graph_search lazy-recomputes. (B6)
+  `GRAPHRAG_ENABLED` env kill-switch lets operators disable graphrag
+  globally without deleting KG files. (B7) FastAPI `@app.on_event("startup")`
+  warms `kb.embed_fn` via `asyncio.to_thread` so the first /api/mindmap,
+  /api/upload, or graphrag chat doesn't pay a 5-30s sentence-transformer
+  model load on the request hot path. Adds 12 regression tests in
+  tests/test_r4_4_fix_all_v1.py.
 - Still missing for production: auth / multi-tenant, request rate limits,
   background-task ingestion, OpenAPI client codegen, structured metrics
   (Prometheus). Mastery is still read-only (KG editing landed in M3).

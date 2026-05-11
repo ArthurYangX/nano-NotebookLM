@@ -25,6 +25,14 @@ class KnowledgeGraph:
         F6 (review-swarm): the explicit kwarg list previously dropped
         `parent_topic`, so the field round-tripped as None through
         save/load. Now it persists.
+
+        fix-all v1 #A1 (R4-4 review-swarm): the same drop happened to
+        `concept_embedding` — extract_from_chunks would compute it and
+        merge_concepts.model_copy() would preserve it, but this method's
+        explicit kwarg list silently stripped it before kg.save(), so the
+        on-disk `knowledge_graph.json` carried NO concept_embedding and
+        every /api/chat that took the graphrag branch ran the lazy
+        per-node embed path. Now persists.
         """
         for c in concepts:
             if self.graph.has_node(c.concept_id):
@@ -41,6 +49,11 @@ class KnowledgeGraph:
                     existing["parent_topic"] = c.parent_topic
                 if existing.get("learning_order") is None and c.learning_order is not None:
                     existing["learning_order"] = c.learning_order
+                # fix-all v1 #A1: keep the first non-null concept_embedding.
+                # If existing already cached one, leave it (same first-seen
+                # discipline as parent_topic above); only fill on absence.
+                if existing.get("concept_embedding") is None and c.concept_embedding is not None:
+                    existing["concept_embedding"] = c.concept_embedding
             else:
                 self.graph.add_node(
                     c.concept_id,
@@ -54,6 +67,9 @@ class KnowledgeGraph:
                     source_chunks=c.source_chunks,
                     parent_topic=c.parent_topic,
                     learning_order=c.learning_order,
+                    # fix-all v1 #A1: persist the cached embedding so
+                    # graph_search hits the fast path on every chat.
+                    concept_embedding=c.concept_embedding,
                 )
 
     def add_relations(self, relations: list[Relation]):

@@ -124,7 +124,7 @@ def test_error_event_carries_current_stage(monkeypatch, upload_client):
     from nano_notebooklm.kg import extractor as extractor_mod
 
     async def _boom(chunks, course_name, router, max_chunks=30,
-                    progress_callback=None, **kwargs):  # R4-4: accept embed_fn kwarg
+                    progress_callback=None, embed_fn=None):  # R4-4 fix-all v1 #C9
         if progress_callback is not None:
             progress_callback("kg_stage_a", 0)
             progress_callback("kg_stage_a", 100)
@@ -147,7 +147,7 @@ def test_done_event_carries_duration_ms(monkeypatch, upload_client):
     from nano_notebooklm.kg import extractor as extractor_mod
 
     async def _fake(chunks, course_name, router, max_chunks=30,
-                    progress_callback=None, **kwargs):  # R4-4: accept embed_fn kwarg
+                    progress_callback=None, embed_fn=None):  # R4-4 fix-all v1 #C9
         if progress_callback is not None:
             progress_callback("kg_stage_a", 100)
             progress_callback("kg_stage_b", 100)

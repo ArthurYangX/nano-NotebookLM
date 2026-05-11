@@ -40,7 +40,7 @@ def upload_client(monkeypatch, tmp_path, fake_embed_fn):
     # upload handler (which `from ... import extract_from_chunks` would
     # capture).
     async def _fake_extract(chunks, course_name, router, max_chunks=30,
-                            progress_callback=None, **kwargs):  # R4-4: accept embed_fn kwarg
+                            progress_callback=None, embed_fn=None):  # R4-4 fix-all v1 #C9: explicit kwarg pins signature drift
         if progress_callback is not None:
             progress_callback("kg_stage_a", 0)
             await asyncio.sleep(0)
@@ -170,7 +170,7 @@ def test_upload_stream_extractor_failure_emits_error_event(monkeypatch, upload_c
     ending in `{type:"error", error:"upload_pipeline_failed"}` — embeddings
     and chunks already on disk are preserved."""
     async def _boom(chunks, course_name, router, max_chunks=30,
-                    progress_callback=None, **kwargs):  # R4-4: accept embed_fn kwarg
+                    progress_callback=None, embed_fn=None):  # R4-4 fix-all v1 #C9
         if progress_callback is not None:
             progress_callback("kg_stage_a", 0)
         raise RuntimeError("AuthenticationError sk-secretKey1234567890 ysaikeji.cn")

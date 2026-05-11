@@ -421,11 +421,16 @@ async def extract_from_chunks(
     # embedding pass runs in the silence between Stage B 100% and the `done`
     # event. Lazy fallback in graph_search covers any concepts that miss this
     # pass (legacy KGs, embed_fn failures, dimension mismatches).
+    #
+    # fix-all v1 #A2 (R4-4 review-swarm): the embed_fn call is synchronous
+    # (sentence-transformer forward or HTTP /embeddings) and was running on
+    # the event loop, stalling R4-2's NDJSON queue-drain for 300–1000 ms.
+    # Off-load to a worker thread so other concurrent requests keep moving.
     targets: list[Concept] = [*topics, *all_concepts]
     if embed_fn is not None and targets:
         try:
             texts = [_concept_embed_text(c) for c in targets]
-            embs = embed_fn(texts)
+            embs = await asyncio.to_thread(embed_fn, texts)
             # embed_fn returns either np.ndarray (shape [n, d]) or list[list[float]].
             for c, emb in zip(targets, embs):
                 c.concept_embedding = [float(x) for x in emb]

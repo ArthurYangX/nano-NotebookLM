@@ -33,6 +33,7 @@ from typing import Any, Callable, Iterable
 import numpy as np
 
 from nano_notebooklm import config
+from nano_notebooklm.kg.extractor import _concept_embed_text as _extractor_embed_text
 from nano_notebooklm.types import SearchResult
 
 logger = logging.getLogger(__name__)
@@ -47,13 +48,17 @@ DEFAULT_MAX_CHUNKS = 30
 
 
 def _concept_embed_text(node: dict[str, Any]) -> str:
-    """Mirror nano_notebooklm.kg.extractor._concept_embed_text — kept in sync
-    so a node's lazy embed matches its cached embed when the extractor was
-    run with the same embed_fn."""
-    name = (node.get("name") or "").strip()
-    definition = (node.get("definition") or "").strip()
-    text = f"{name}。{definition}" if definition else name
-    return text[:600]
+    """fix-all v1 #C8 (R4-4 review-swarm): adapter around the extractor's
+    canonical helper so lazy-recompute embeddings can never drift from the
+    cached batch-compute embeddings. Build a synthetic Concept-like object
+    that exposes the two fields the extractor reads (`name`, `definition`)
+    and delegate."""
+    class _Shim:
+        pass
+    shim = _Shim()
+    shim.name = (node.get("name") or "")
+    shim.definition = (node.get("definition") or "")
+    return _extractor_embed_text(shim)
 
 
 def _load_kg(course_id: str, artifacts_dir: Path) -> dict[str, Any] | None:
@@ -83,54 +88,79 @@ def _load_chunks_index(course_id: str, artifacts_dir: Path) -> dict[str, dict[st
     return {row["chunk_id"]: row for row in data if isinstance(row, dict) and row.get("chunk_id")}
 
 
-def _node_embedding(
-    node: dict[str, Any],
+def _resolve_node_embeddings(
+    nodes: list[dict[str, Any]],
     embed_fn: Callable[[list[str]], Any],
     expected_dim: int,
-    cache: dict[str, np.ndarray],
-) -> np.ndarray | None:
-    """Return an L2-normalised embedding for `node`. Prefers the cached
-    `concept_embedding` field; falls back to a single-text embed_fn call
-    when missing or when the cached dimension disagrees with `expected_dim`
-    (the query's dimension is the source of truth).
+) -> dict[str, np.ndarray]:
+    """fix-all v1 #B4 (R4-4 review-swarm): single-pass embedding resolver.
 
-    `cache` is the per-call lazy-recompute store keyed by node id, so the
-    cost is paid at most once per node per query.
+    Original implementation called embed_fn([single_text]) once per cache-
+    miss node, so a 200-concept legacy KG paid ~200 sequential embed
+    calls (~1-2s on warm sentence-transformer). Now: scan once to pull
+    every cached-and-dimension-matching embedding into the cache, collect
+    every cache-miss node's text into one list, then make a SINGLE
+    batched embed_fn(list) call. sentence-transformer internally batches at
+    32; the OpenAI-compatible API client batches at 64; either way one
+    call amortises tokenizer/HTTP overhead.
+
+    Returns {node_id: ndarray} only for nodes whose embedding could be
+    obtained (cached + shape OK, or batch result + shape OK). Missing
+    entries → graph_search skips that node from cosine ranking.
     """
-    nid = node.get("id") or ""
-    if nid in cache:
-        return cache[nid]
+    cache: dict[str, np.ndarray] = {}
+    to_compute: list[tuple[str, str]] = []  # (node_id, text)
 
-    cached = node.get("concept_embedding")
-    if cached is not None:
-        try:
-            arr = np.asarray(cached, dtype=np.float32)
-            if arr.shape == (expected_dim,):
-                cache[nid] = arr
-                return arr
-            # Dimension mismatch → drop the stale cache, lazy-recompute below.
-        except (TypeError, ValueError):
-            pass
+    for node in nodes:
+        nid = node.get("id") or ""
+        if not nid:
+            continue
+        cached = node.get("concept_embedding")
+        if cached is not None:
+            try:
+                arr = np.asarray(cached, dtype=np.float32)
+                if arr.shape == (expected_dim,):
+                    cache[nid] = arr
+                    continue
+                # Dimension mismatch → drop the stale cache, batch-recompute.
+            except (TypeError, ValueError):
+                pass
+        text = _concept_embed_text(node)
+        if text:
+            to_compute.append((nid, text))
 
-    text = _concept_embed_text(node)
-    if not text:
-        return None
+    if not to_compute:
+        return cache
+
     try:
-        out = embed_fn([text])
-        arr = np.asarray(out, dtype=np.float32)
-        if arr.ndim == 2 and arr.shape[0] == 1:
-            arr = arr[0]
-        if arr.shape != (expected_dim,):
-            logger.debug(
-                "graph_search: lazy embed for %s returned shape %s != expected (%d,)",
-                nid, arr.shape, expected_dim,
+        batch_out = embed_fn([t for _, t in to_compute])
+        batch_arr = np.asarray(batch_out, dtype=np.float32)
+        # embed_fn may return shape (n, d) or (d,) when n==1.
+        if batch_arr.ndim == 1 and len(to_compute) == 1:
+            batch_arr = batch_arr.reshape(1, -1)
+        if batch_arr.ndim != 2:
+            logger.warning(
+                "graph_search: batched embed returned rank %d (expected 2); "
+                "skipping %d lazy nodes", batch_arr.ndim, len(to_compute),
             )
-            return None
-        cache[nid] = arr
-        return arr
-    except Exception:  # noqa: BLE001 — one bad node must not abort the whole query
-        logger.warning("graph_search: lazy embed failed for node %s", nid, exc_info=True)
-        return None
+            return cache
+    except Exception:  # noqa: BLE001 — partial cache still ranks the cached nodes
+        logger.warning(
+            "graph_search: batched lazy embed failed for %d nodes; "
+            "ranking will use cached-only subset",
+            len(to_compute), exc_info=True,
+        )
+        return cache
+
+    for (nid, _), emb in zip(to_compute, batch_arr):
+        if emb.shape == (expected_dim,):
+            cache[nid] = emb
+        else:
+            logger.debug(
+                "graph_search: batch embed for %s shape %s != expected (%d,)",
+                nid, emb.shape, expected_dim,
+            )
+    return cache
 
 
 def _bfs_neighbors(
@@ -200,14 +230,18 @@ def graph_search(
 
     expected_dim = int(q_emb.shape[0])
 
-    # 2. Score every non-root node by cosine against the query (embed_fn
-    #    outputs are L2-normalised so dot ≡ cosine).
-    embed_cache: dict[str, np.ndarray] = {}
+    # 2. Resolve every non-root node's embedding in one pass (cached +
+    #    batched lazy recompute). Score by cosine (dot = cosine on L2-
+    #    normalised vectors).
+    non_root = [
+        n for n in nodes
+        if (n.get("concept_type") or "").lower() != "root"
+    ]
+    embed_cache = _resolve_node_embeddings(non_root, embed_fn, expected_dim)
     scored: list[tuple[float, dict[str, Any]]] = []
-    for node in nodes:
-        if (node.get("concept_type") or "").lower() == "root":
-            continue
-        emb = _node_embedding(node, embed_fn, expected_dim, embed_cache)
+    for node in non_root:
+        nid = node.get("id") or ""
+        emb = embed_cache.get(nid)
         if emb is None:
             continue
         score = float(np.dot(q_emb, emb))
