@@ -156,6 +156,26 @@ nano_notebooklm/   Python backend modules
   smoke, streaming endpoints, subagents, session log rotation, and frontend
   state helpers (no LLM keys or downloaded models required; uses deterministic
   hash-based fake embeddings and monkeypatched search/LLM paths).
+- Mind map R4-3 (2026-05-11): default render is now d3-force directed
+  graph via `prepareMindmapForce` (returns `{nodes, links, edges,
+  relationTypes, rootId, empty}` — `edges` is a back-compat alias for
+  `links`). Legacy radial `prepareMindmap` preserved as alias for
+  `prepareMindmapTree`. d3-dispatch/d3-quadtree/d3-timer/d3-force loaded
+  from `cdn.jsdelivr.net` at exact-version pins (SRI debt across all
+  CDN scripts is a separate cleanup). Sim tick → `setSimNodes` is
+  rAF-coalesced so 60Hz d3 ticks produce at most one React render per
+  frame; `childrenByParent` `Map` replaces O(N²) parent filter walks in
+  `visibleIds`. Drag interaction: when sim is live, drag writes only
+  `fx`/`fy` (sim's pin), NOT the legacy `offsets` dict, so mouseup
+  doesn't double-count the delta. `alphaTarget(0.2).restart()` fires
+  once at mousedown (not per mousemove). Marker IDs (`kg-arrow-*`)
+  scoped per-instance via `React.useId` so multiple `<MindMap>` mounts
+  don't collide. Relation filter chips: per-component state preserves
+  user's disabled selections across KG re-extracts (newcomer relations
+  default to enabled; previously-disabled ones stay disabled). Empty
+  KG returns `{links: [], edges: [], relationTypes: []}` on every path.
+  All R3-3 affordances (dblclick edit / N add child / Del delete /
+  shift+drag connect / alt+click NodeDeepDivePanel / commitOps) intact.
 - Round 4 R4-1 + R4-2 (2026-05-10): direction switched to upload-only +
   KG-driven retrieval. `/api/courses` accepts `mode: Literal["all","user"] |
   None` defaulting to `"user"`; user mode filters `config.PRESET_COURSE_IDS`

@@ -274,7 +274,7 @@
 
 **files touched**: api/server.py / nano_notebooklm/kg/extractor.py / frontend/api.js / frontend/app.jsx / CLAUDE.md + **新增** tests/test_r4_2_fix_all_v1.py（13 条回归）。**pytest**: **617 passed in 436s**（v4 580 + R4-1 8 + R4-2 9 + R4-3 codex 新增 + fix-all v1 13 = 617，零 regression）。
 
-### #R4-3 思维导图换成知识图谱视图（force-directed + relation labels）— [review]
+### #R4-3 思维导图换成知识图谱视图（force-directed + relation labels）— [x]
 
 - **goal ref**: GOAL.md Round 4 #R4-3
 - **status**: [review]  ← 2026-05-10 23:30 释放给 codex（纯前端、零 server.py 冲突，最适合并行）
@@ -295,6 +295,26 @@
 - **conflict notes**: 纯前端任务，与 R4-2/R4-4/R4-5 都不冲突。**R4-3 owner（codex）只许动**：(a) `frontend/index.html`（追加 d3-force CDN script 标签）；(b) `frontend/study-state.js` 的 **`prepareMindmap` 函数及其测试**（rename 为 `prepareMindmapTree` + 新增 `prepareMindmapForce`），**不许动**文件末尾的 user-lang helpers / saveUserLang / loadUserLang；(c) `frontend/mindmap.jsx` **整个**文件（layout 重写自由，但必须保留 R3-3 的 NodeDeepDivePanel + commitOps + KGEdit popup 等编辑接口）；(d) `frontend/styles.css` **新增**末尾 `.kg-edge-*` 段（不动任何已有 selector）；(e) **新建** `tests/test_mindmap_force_layout.py`。
   - **不许动**：app.jsx / api.js / api/server.py / 任何后端 / processing.jsx / upload 链路 / qa_skill / router_intent。
   - **特别注意**：R3-3 的 explain-node 端点 + alt+click → NodeDeepDivePanel 链路必须保留，新 layout 下点击事件重接到 d3 selection.on("click")。dblclick 编辑 / N 加子 / Del 删 / shift+drag 连边的 commitOps 路径**完整保留**。
+
+#### R4-3 review-swarm v1 + fix-all v1（2026-05-11 00:30, reviewer: claude）
+
+4 路 review-swarm（intent/regression / security / perf-reliability / contracts-coverage）共 ~17 项 finding（3 HIGH / 9 MEDIUM / 4 LOW）。fix-now 7 项落地（HIGH + 关键 MEDIUM）+ 10 条新增回归测试。R4-3 verdict：APPROVED → flip [x]。
+
+**fix-now（7 项）**：
+- **A1 drag-release stale offsets**（HIGH，R1 F1）：mousemove handler 当 simRef.current 真时 **只写 fx/fy 不写 offsets**；mouseup 时 sim 自然回到 authoritative 位置。`offsets` 字典留给 d3-unavailable fallback path 用。修掉了"drag 后节点视觉跳一下 dx/dy"的 bug（codex 未实测发现）。
+- **A3 tick 风暴 + O(N²) visibleIds**（HIGH，R3 F1 + F6）：tick 回调改 rAF-coalesced `scheduleFlush` — 60Hz d3 tick 最多每帧一次 React render。`childrenByParent` Map 一次性建好（`useMemo` over `prepared.nodes`），visibleIds walk 从 O(N²) 落到 O(N)。100-node KG 收敛期 CPU 估计降 10-20×。
+- **A4 mousemove restart 风暴**（MEDIUM，R3 F3）：`alphaTarget(0.2).restart()` 从每 mousemove 移到 mousedown 一次，drag 期间 d3 timer 不再被反复重入。
+- **A8 CDN 浮动版本**（HIGH，R2 F1）：d3-{dispatch,quadtree,timer,force}@3 → 精确 `@3.0.1/0.0`；加 `crossorigin="anonymous"`。SRI 跨全站 CDN 仍是 debt（React+Babel+KaTeX 同样未加），单独 cleanup。
+- **A10 marker id collision**（MEDIUM，R2 F4）：`React.useId` per-instance 前缀，`<MindMap>` 两个实例并存不再撞 SVG `<marker>` 全局 id。
+- **A11 empty force 缺 edges key**（MEDIUM，R4 F1）：`prepareMindmapForce({nodes:[],edges:[]})` 返回 `{links: [], edges: [], relationTypes: []}` 双 key 对称——R4-1 upload-only 首次空 KG 是默认状态，crash 不可接受。
+- **A13 filter 重置覆盖用户偏好**（MEDIUM，R4 F3）：`setEnabledRelations` 改为 functional updater，KG 重抽取时**保留**用户已 disable 的 chip，仅 newcomer relation 默认 enabled。
+- **A17 CLAUDE.md Maturity Notes**（LOW，R4 F7）：append "Mind map R4-3 (2026-05-11)" 段，描述 force layout + rAF throttle + per-instance marker id + 编辑 affordance 保留。
+
+**fix-soon（下次 review-swarm）**：A2 单 relation chip 过滤（part-of-only 时不显） + A5 useEffect deps stringification 潜在 restart loop + A6 CDN defer + 4xx retry / 本地化 + A7 alphaDecay node-count-aware ramp + A9 relation label 长度 + 控制字符 clamp + A12 d3-unavailable fallback 真渲染测试 + A14 `prepareMindmap` 别名 byte-equiv test + A15 alt+click→NodeDeepDivePanel end-to-end 验证 + A16 单 node force 空 shape。
+
+**optional**：浏览器实测在有 CDN 的环境验 shift+drag / alt+click 真交互（codex 沙箱被代理拦截）。
+
+**files touched**: frontend/index.html / frontend/mindmap.jsx / frontend/study-state.js / CLAUDE.md + **新增** tests/test_r4_3_fix_all_v1.py（10 条回归）。**pytest**: **629 passed in 416s**（v4 580 + R4-1 8 + R4-2 9 + R4-2 fix-all v1 13 + R4-3 codex 7 + R4-3 fix-all v1 10 + 其他 = 629，零 regression）。
 
 ### #R4-4 GraphRAG retriever 接进 /api/chat（path="graphrag"）— **本轮最重要** — [claude]
 

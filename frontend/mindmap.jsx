@@ -1,5 +1,5 @@
 /* global React, MINDMAP, StudyState, API, d3 */
-const { useMemo: useMemoM, useState: useStateM, useRef: useRefM, useEffect: useEffectM } = React;
+const { useMemo: useMemoM, useState: useStateM, useRef: useRefM, useEffect: useEffectM, useId: useIdM } = React;
 
 // M2 (2026-05-06): the dead-code radial layout that lived here pre-M2 has
 // been removed. `StudyState.prepareMindmap` is now a real parent-aware
@@ -19,6 +19,12 @@ const { useMemo: useMemoM, useState: useStateM, useRef: useRefM, useEffect: useE
 // deep-dive affordances remain on the same DOM nodes.
 
 function MindMap({ data, layout, courseId, highlightedId, onNodeClick, onSourceClick, onPractice, onDataChange }) {
+  // fix-all v1 #A10: per-instance marker IDs so two MindMap subtrees
+  // (e.g. course-compare view, split-pane) don't fight over global
+  // SVG <marker> ids. React.useId returns a stable, unique identifier
+  // per component instance.
+  const markerUid = useIdM().replace(/:/g, "_");
+  const arrowId = (kind) => `kg-arrow-${kind}-${markerUid}`;
   const [pan, setPan] = useStateM({ x: 0, y: 0 });
   const [zoom, setZoom] = useStateM(1);
   const [collapsed, setCollapsed] = useStateM(new Set());
@@ -71,7 +77,20 @@ function MindMap({ data, layout, courseId, highlightedId, onNodeClick, onSourceC
   const relationTypes = prepared.relationTypes || [];
   const [enabledRelations, setEnabledRelations] = useStateM(() => new Set(relationTypes));
   useEffectM(() => {
-    setEnabledRelations(new Set(relationTypes));
+    // fix-all v1 #A13: when the KG re-extracts (R4-2 upload land emits
+    // new relationTypes for the same course), preserve the user's
+    // existing chip preferences instead of resetting to all-enabled.
+    // Newcomer relations default to enabled; previously-disabled ones
+    // stay disabled. Relations that disappear are dropped.
+    setEnabledRelations(prev => {
+      const known = new Set(relationTypes);
+      const next = new Set();
+      // 1) keep every previously-enabled relation that still exists.
+      prev.forEach(r => { if (known.has(r)) next.add(r); });
+      // 2) enable every newcomer (not present in prev at all).
+      relationTypes.forEach(r => { if (!prev.has(r)) next.add(r); });
+      return next;
+    });
   }, [relationTypes.join("|")]);
 
   useEffectM(() => {
@@ -91,6 +110,24 @@ function MindMap({ data, layout, courseId, highlightedId, onNodeClick, onSourceC
       return;
     }
     let sim;
+    // fix-all v1 #A3: rAF-throttle the tick → setSimNodes pump. Without
+    // this, every d3 tick (~60Hz × 37-67 ticks per layout settle) drops
+    // a fresh node-array clone into React state and re-renders the
+    // entire MindMap subtree (visibleIds walk is O(N²), visEdges is
+    // O(E)). With rAF coalescing, at most one React render per frame.
+    let pendingRaf = 0;
+    const scheduleFlush = () => {
+      if (pendingRaf) return;
+      pendingRaf = (typeof requestAnimationFrame === "function")
+        ? requestAnimationFrame(() => {
+            pendingRaf = 0;
+            setSimNodes(forceNodes.map(n => Object.assign({}, n)));
+          })
+        : (setTimeout(() => {
+            pendingRaf = 0;
+            setSimNodes(forceNodes.map(n => Object.assign({}, n)));
+          }, 16), 1);
+    };
     try {
       sim = forceApi.forceSimulation(forceNodes)
         .force("link", forceApi.forceLink(forceLinks).id(d => d.id).distance(d => {
@@ -106,40 +143,58 @@ function MindMap({ data, layout, courseId, highlightedId, onNodeClick, onSourceC
         .force("y", forceApi.forceY(0).strength(0.035))
         .alpha(0.9)
         .alphaDecay(forceNodes.length > 100 ? 0.08 : 0.045)
-        .on("tick", () => {
-          setSimNodes(forceNodes.map(n => Object.assign({}, n)));
-        });
+        .on("tick", scheduleFlush);
     } catch (err) {
       if (typeof console !== "undefined") console.warn("d3 force layout unavailable:", err);
       setSimNodes(forceNodes);
       return;
     }
     simRef.current = sim;
-    return () => sim.stop();
+    return () => {
+      sim.stop();
+      if (pendingRaf && typeof cancelAnimationFrame === "function") {
+        cancelAnimationFrame(pendingRaf);
+      }
+    };
   }, [prepared.rootId, (prepared.nodes || []).map(n => n.id).join("|"), (prepared.links || []).map(l => l.id || `${l.source}->${l.target}:${l.relation}`).join("|")]);
+
+  // fix-all v1 #A3: precompute parent→children index from the stable
+  // `prepared` payload (NOT `nodes`, which is replaced every tick).
+  // visibleIds and the walk below were doing N×O(N) filter-by-parent
+  // every render → O(N²) per tick storm. With the map it's O(N) per
+  // render and O(1) per parent lookup.
+  const childrenByParent = useMemoM(() => {
+    const idx = new Map();
+    (prepared.nodes || []).forEach(n => {
+      const p = n.parent;
+      if (!idx.has(p)) idx.set(p, []);
+      idx.get(p).push(n);
+    });
+    return idx;
+  }, [prepared.nodes]);
 
   const visibleIds = useMemoM(() => {
     const vis = new Set(nodes.map(n => n.id));
     function walk(id) {
       if (collapsed.has(id)) return;
-      nodes.filter(n => n.parent === id).forEach(n => {
+      (childrenByParent.get(id) || []).forEach(n => {
         vis.add(n.id);
         walk(n.id);
       });
     }
     collapsed.forEach(id => {
-      nodes.filter(n => n.parent === id).forEach(child => {
+      (childrenByParent.get(id) || []).forEach(child => {
         function hideDescendants(nid) {
           vis.delete(nid);
-          nodes.filter(n => n.parent === nid).forEach(n => hideDescendants(n.id));
+          (childrenByParent.get(nid) || []).forEach(n => hideDescendants(n.id));
         }
         hideDescendants(child.id);
       });
     });
-    nodes.filter(n => collapsed.has(n.id)).forEach(n => vis.add(n.id));
-    nodes.filter(n => !n.parent).forEach(n => walk(n.id));
+    nodes.forEach(n => { if (collapsed.has(n.id)) vis.add(n.id); });
+    (childrenByParent.get(null) || []).forEach(n => walk(n.id));
     return vis;
-  }, [nodes, collapsed]);
+  }, [nodes, collapsed, childrenByParent]);
 
   const visNodes = nodes.filter(n => visibleIds.has(n.id));
   const visEdges = edges.filter(e => {
@@ -353,14 +408,26 @@ function MindMap({ data, layout, courseId, highlightedId, onNodeClick, onSourceC
         // account for zoom so node follows cursor at current scale
         const dx = (e.clientX - d.sx) / zoom;
         const dy = (e.clientY - d.sy) / zoom;
-        setOffsets(prev => ({ ...prev, [d.id]: { dx: d.ox + dx, dy: d.oy + dy } }));
         if (simRef.current) {
+          // fix-all v1 #A1: when force-sim is live, the sim owns node
+          // positions; updating `offsets` here double-counts dx/dy on
+          // top of the sim's authoritative x,y on every tick → node
+          // visually jumps after mouseup. Only write to fx/fy (sim's
+          // pin mechanism) during drag, and skip the offsets state.
+          // fix-all v1 #A4: skip the alphaTarget(0.2).restart() per
+          // mousemove — it re-enters the d3 timer every frame and
+          // amplifies the tick storm. alphaTarget(0.2) once at
+          // mousedown is enough; sim keeps ticking until alphaTarget
+          // is reset on mouseup.
           const simNode = simRef.current.nodes().find(n => n.id === d.id);
           if (simNode) {
             simNode.fx = d.baseX + dx;
             simNode.fy = d.baseY + dy;
-            simRef.current.alphaTarget(0.2).restart();
           }
+        } else {
+          // d3 unavailable fallback path: legacy offsets dict drives
+          // visible position because there's no sim to write fx/fy to.
+          setOffsets(prev => ({ ...prev, [d.id]: { dx: d.ox + dx, dy: d.oy + dy } }));
         }
       } else if (d.kind === "connect") {
         // Track cursor in graph-space coordinates.
@@ -508,6 +575,11 @@ function MindMap({ data, layout, courseId, highlightedId, onNodeClick, onSourceC
       baseY: Number(nodes.find(n => n.id === id)?.y || 0),
       moved: false,
     };
+    // fix-all v1 #A4: bump alphaTarget once at mousedown so the sim
+    // stays warm during the drag without re-restarting per mousemove.
+    if (simRef.current) {
+      simRef.current.alphaTarget(0.2).restart();
+    }
   }
 
   function childCount(id) {
@@ -611,15 +683,15 @@ function MindMap({ data, layout, courseId, highlightedId, onNodeClick, onSourceC
           style={{ left: -1200, top: -900 }}
         >
           <defs>
-            <marker id="kg-arrow-prereq" viewBox="0 0 10 10" refX="8" refY="5"
+            <marker id={arrowId("prereq")} viewBox="0 0 10 10" refX="8" refY="5"
                     markerWidth="5" markerHeight="5" orient="auto-start-reverse">
               <path d="M 0 0 L 10 5 L 0 10 z" className="kg-marker-prereq" />
             </marker>
-            <marker id="kg-arrow-depends" viewBox="0 0 10 10" refX="8" refY="5"
+            <marker id={arrowId("depends")} viewBox="0 0 10 10" refX="8" refY="5"
                     markerWidth="5" markerHeight="5" orient="auto-start-reverse">
               <path d="M 0 0 L 10 5 L 0 10 z" className="kg-marker-depends" />
             </marker>
-            <marker id="kg-arrow-related" viewBox="0 0 10 10" refX="8" refY="5"
+            <marker id={arrowId("related")} viewBox="0 0 10 10" refX="8" refY="5"
                     markerWidth="4" markerHeight="4" orient="auto-start-reverse">
               <path d="M 0 0 L 10 5 L 0 10 z" className="kg-marker-related" />
             </marker>
@@ -640,10 +712,10 @@ function MindMap({ data, layout, courseId, highlightedId, onNodeClick, onSourceC
             const cls = relationClass(rel);
             const label = relationLabel(rel);
             const marker = rel === "depends-on"
-              ? "url(#kg-arrow-depends)"
+              ? `url(#${arrowId("depends")})`
               : rel === "prerequisite-of"
-                ? "url(#kg-arrow-prereq)"
-                : rel === "part-of" ? "" : "url(#kg-arrow-related)";
+                ? `url(#${arrowId("prereq")})`
+                : rel === "part-of" ? "" : `url(#${arrowId("related")})`;
             return (
               <g key={e.id || i} className={`kg-edge-group ${cls}${isHot ? " hot" : ""}`}>
                 <path

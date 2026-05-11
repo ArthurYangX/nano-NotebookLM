@@ -18,10 +18,15 @@
 
   <script src="https://unpkg.com/react@18.3.1/umd/react.development.js" crossorigin="anonymous"></script>
   <script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" crossorigin="anonymous"></script>
-  <script src="https://cdn.jsdelivr.net/npm/d3-dispatch@3"></script>
-  <script src="https://cdn.jsdelivr.net/npm/d3-quadtree@3"></script>
-  <script src="https://cdn.jsdelivr.net/npm/d3-timer@3"></script>
-  <script src="https://cdn.jsdelivr.net/npm/d3-force@3"></script>
+  <!-- R4-3 fix-all v1 #A8: exact version pins so the CDN can't serve a
+       supply-chain-attacked minor/patch. SRI hashes are pending across all
+       CDN scripts (React + Babel also lack them — separate cleanup item);
+       at minimum the @3 major-only floating tag is gone. crossorigin so
+       error events propagate, matching React/Babel. -->
+  <script src="https://cdn.jsdelivr.net/npm/d3-dispatch@3.0.1" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/d3-quadtree@3.0.1" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/d3-timer@3.0.1" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/d3-force@3.0.0" crossorigin="anonymous"></script>
   <script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" crossorigin="anonymous"></script>
 </head>
 <body>

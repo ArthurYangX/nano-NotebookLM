@@ -298,7 +298,11 @@
     });
     const tree = prepareMindmapTree(hierarchySeed, options);
     if (tree.empty) {
-      return Object.assign({}, tree, { links: [], relationTypes: [] });
+      // R4-3 fix-all v1 #A11: keep `links` AND `edges` present on every
+      // return path so callers iterating `prepared.edges` don't crash
+      // with `cannot read length of undefined` on first-run empty KGs
+      // (the R4-1 upload-only default state for fresh users).
+      return Object.assign({}, tree, { links: [], edges: [], relationTypes: [] });
     }
     const nodeIds = new Set((tree.nodes || []).map(n => n.id));
     const relationTypes = [];
