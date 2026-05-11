@@ -305,30 +305,121 @@
     return html;
   }
 
-  // Extract a TOC from raw LaTeX source. Used by the Notes panel to
-  // populate its sidebar before the latex-to-html pass completes.
-  // Returns items with `text` (not `title`) so the consumer matches the
-  // legacy StudyState.extractHeadingTOC shape — NotesTOC reads `it.text`.
-  function extractTOC(source) {
+  // Filename heuristic — full-course Note generation wraps each source
+  // file in `\section{<filename>}` (concat_draft + _escape_latex_title on
+  // the Python side). For the hierarchical TOC, any \section{} whose title
+  // looks like a real upload (ends in a supported file extension) becomes
+  // an L1 "file" node; everything else nests inside the most recent file.
+  // Catches both raw (`lecture3.pdf`) and underscore-escaped (`lecture\_3.pdf`)
+  // forms that the LaTeX-special escape pass emits.
+  var FILE_EXT_RE = /\.(pdf|pptx?|docx?|md|markdown|txt)$/i;
+
+  function looksLikeFilename(rawTitle) {
+    if (!rawTitle) return false;
+    // Drop the underscore-escape that _escape_latex_title injects so the
+    // extension test sees the actual filename.
+    var probe = String(rawTitle).replace(/\\([_&%$#{}])/g, "$1").trim();
+    return FILE_EXT_RE.test(probe);
+  }
+
+  function cleanHeadingTitle(raw) {
+    // LaTeX-output fix-all v3 #3: strip inline macros from TOC titles —
+    // the LLM happily emits `\subsection{\texttt{leaq}: ...}` and the
+    // sidebar would otherwise show literal `\texttt{leaq}: ...`.
+    return String(raw == null ? "" : raw)
+      .replace(/\\(textbf|textit|emph|texttt|textsf|textrm)\s*\{([^{}]*)\}/g, "$2")
+      .replace(/\\[a-zA-Z]+\s*\{([^{}]*)\}/g, "$1")
+      // Drop the LaTeX-special escape backslashes for display only — the
+      // id is still computed from the cleaned form so anchor lookup
+      // matches the heading's slug (markdownToHtml escapes the same way).
+      .replace(/\\([_&%$#{}])/g, "$1");
+  }
+
+  // Extract a hierarchical TOC tree from raw LaTeX source. Each node:
+  //   { level: 1|2|3, text, id, children: [...] }
+  //
+  // Build rules:
+  //  - \section whose title matches a known filename (options.fileNames)
+  //    OR matches the file-extension heuristic → L1 (file root).
+  //  - Other \section + every \subsection → L2 (nested under the most
+  //    recent L1; if no L1 exists yet, a synthetic "Untitled" L1 wraps it
+  //    so legacy notes with bare \sections still get a tree shape).
+  //  - \subsubsection → L3 (nested under the most recent L2 of its L1).
+  //
+  // options.fileNames (optional array of strings) overrides the
+  // extension heuristic for known-good filenames passed in by the host
+  // (the Notes panel passes the course's `sources` titles so renamed or
+  // extension-less uploads also get treated as L1).
+  function extractTOC(source, options) {
     if (!source) return [];
-    var items = [];
-    var re = new RegExp("\\\\(section|subsection)\\s*" + BRACE_GROUP, "g");
+    var opts = options || {};
+    var fileNameSet = new Set();
+    if (Array.isArray(opts.fileNames)) {
+      for (var i = 0; i < opts.fileNames.length; i++) {
+        var fn = opts.fileNames[i];
+        if (typeof fn === "string" && fn) fileNameSet.add(fn);
+      }
+    }
+    var tree = [];
+    var currentFile = null;
+    var currentSection = null;
+    var takenIds = Object.create(null);
+    function uniqueId(base) {
+      var id = base || "section";
+      if (!takenIds[id]) { takenIds[id] = 1; return id; }
+      var n = 1;
+      while (takenIds[id + "-" + n]) n++;
+      takenIds[id + "-" + n] = 1;
+      return id + "-" + n;
+    }
+    var re = new RegExp(
+      "\\\\(section|subsection|subsubsection)\\s*" + BRACE_GROUP,
+      "g"
+    );
     var m;
     while ((m = re.exec(source)) !== null) {
-      // LaTeX-output fix-all v3 #3: strip inline macros from TOC titles —
-      // the LLM happily emits `\subsection{\texttt{leaq}: ...}` and the
-      // sidebar would otherwise show literal `\texttt{leaq}: ...`. Reduce
-      // \texttt/\textbf/\emph/\textit/\code wrappers to their inner text.
-      var clean = m[2]
-        .replace(/\\(textbf|textit|emph|texttt|textsf|textrm)\s*\{([^{}]*)\}/g, "$2")
-        .replace(/\\[a-zA-Z]+\s*\{([^{}]*)\}/g, "$1");
-      items.push({
-        level: m[1] === "section" ? 1 : 2,
-        text: clean,
-        id: slugify(clean),
-      });
+      var kind = m[1];
+      var rawTitle = m[2];
+      var clean = cleanHeadingTitle(rawTitle);
+      var id = uniqueId(slugify(clean));
+      var isFile = (kind === "section") && (
+        fileNameSet.has(clean) ||
+        fileNameSet.has(rawTitle) ||
+        looksLikeFilename(rawTitle)
+      );
+      if (isFile) {
+        currentFile = { level: 1, text: clean, id: id, children: [] };
+        currentSection = null;
+        tree.push(currentFile);
+        continue;
+      }
+      // For subsubsection nest under the most recent subsection (L2).
+      if (kind === "subsubsection") {
+        if (!currentSection) {
+          // Promote to L2 if no L2 anchor yet — happens when the LLM
+          // emits \subsubsection without an enclosing \subsection.
+          if (!currentFile) {
+            currentFile = { level: 1, text: "(untitled)", id: uniqueId("untitled"), children: [] };
+            tree.push(currentFile);
+          }
+          currentSection = { level: 2, text: clean, id: id, children: [] };
+          currentFile.children.push(currentSection);
+          continue;
+        }
+        currentSection.children.push({ level: 3, text: clean, id: id, children: [] });
+        continue;
+      }
+      // \subsection OR a non-file \section → L2 under the current file
+      // (synthesise a file root if we haven't seen one yet, so legacy
+      // notes without filename wrappers still produce a tree).
+      if (!currentFile) {
+        currentFile = { level: 1, text: "(untitled)", id: uniqueId("untitled"), children: [] };
+        tree.push(currentFile);
+      }
+      currentSection = { level: 2, text: clean, id: id, children: [] };
+      currentFile.children.push(currentSection);
     }
-    return items;
+    return tree;
   }
 
   if (typeof window !== "undefined") {

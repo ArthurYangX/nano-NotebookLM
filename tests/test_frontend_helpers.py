@@ -685,6 +685,125 @@ def test_checked_source_files_legacy_title_fallback():
     assert run_node(script).strip() == "ok"
 
 
+def test_toc_tree_extraction_file_wrappers():
+    """extractTOC builds a hierarchical tree:
+      - \\section{<filename>}     → L1 file root
+      - \\section{Topic} (no ext) → L2 nested under prev L1
+      - \\subsection{Sub}         → L2 nested under prev L1
+      - \\subsubsection{Detail}   → L3 nested under prev L2
+    The filename heuristic catches `.pdf` titles even without an explicit
+    fileNames whitelist.
+    """
+    script = textwrap.dedent(
+        r"""
+        const tex = require('./frontend/latex-to-html.js');
+        const src = '\\section{lecture3.pdf}\n' +
+                    '\\subsection{Backprop}\n' +
+                    '\\subsubsection{Chain rule}\n' +
+                    '\\section{Other thoughts}\n' +
+                    '\\section{lecture4.pdf}\n' +
+                    '\\subsection{Conv layer}\n';
+        const tree = tex.extractTOC(src);
+        if (tree.length !== 2) throw new Error('expected 2 L1 file roots, got: ' + tree.length);
+        if (tree[0].text !== 'lecture3.pdf') throw new Error('L1[0] mislabelled: ' + tree[0].text);
+        if (tree[1].text !== 'lecture4.pdf') throw new Error('L1[1] mislabelled: ' + tree[1].text);
+        // L3 should sit under L2 (Backprop), L2 should sit under L1 (lecture3.pdf).
+        const l3 = tree[0].children[0].children[0];
+        if (!l3 || l3.text !== 'Chain rule') throw new Error('L3 chain failed: ' + JSON.stringify(tree[0]));
+        // "Other thoughts" is a non-filename \section → must nest under
+        // the most recent L1 (lecture3.pdf), not start a new L1.
+        const otherIdx = tree[0].children.findIndex(c => c.text === 'Other thoughts');
+        if (otherIdx < 0) throw new Error('non-file section did not nest: ' + JSON.stringify(tree[0]));
+        // ids should be unique and slug-like.
+        const ids = new Set();
+        function walk(n) { ids.add(n.id); (n.children||[]).forEach(walk); }
+        tree.forEach(walk);
+        if (ids.size !== 6) throw new Error('expected 6 unique ids, got: ' + ids.size);
+        console.log('ok');
+        """
+    )
+    assert run_node(script).strip() == "ok"
+
+
+def test_toc_tree_filename_whitelist_overrides_heuristic():
+    """When fileNames is supplied, a title matching it becomes L1 even
+    without a recognised extension (handles user uploads named e.g.
+    `Lecture 03 - Intro` with no suffix)."""
+    script = textwrap.dedent(
+        r"""
+        const tex = require('./frontend/latex-to-html.js');
+        const src = '\\section{Lecture 03 - Intro}\n' +
+                    '\\subsection{Background}\n' +
+                    '\\section{Random topic}\n';
+        const tree = tex.extractTOC(src, { fileNames: ['Lecture 03 - Intro'] });
+        if (tree.length !== 1) throw new Error('expected 1 L1 file root: ' + tree.length);
+        if (tree[0].text !== 'Lecture 03 - Intro') throw new Error('wrong L1');
+        // Both children nest under it (one \subsection + one non-file \section).
+        if (tree[0].children.length !== 2) throw new Error('children: ' + tree[0].children.length);
+        console.log('ok');
+        """
+    )
+    assert run_node(script).strip() == "ok"
+
+
+def test_toc_collapsed_roundtrip():
+    """loadTocCollapsed / saveTocCollapsed / setTocCollapsed round-trip
+    via localStorage, dedup + sort + drop non-strings."""
+    script = textwrap.dedent(
+        """
+        const h = require('./frontend/study-state.js');
+        const s = h.createMemoryStorage();
+
+        if (h.loadTocCollapsed(s, 'CS182').length !== 0) throw new Error('default not empty');
+
+        let next = h.setTocCollapsed(s, 'CS182', 'lecture3-pdf', true);
+        if (next.length !== 1) throw new Error('collapse add failed');
+
+        next = h.setTocCollapsed(s, 'CS182', 'lecture4-pdf', true);
+        if (JSON.stringify(next) !== '["lecture3-pdf","lecture4-pdf"]')
+          throw new Error('sort failed: ' + JSON.stringify(next));
+
+        next = h.setTocCollapsed(s, 'CS182', 'lecture3-pdf', false);
+        if (JSON.stringify(next) !== '["lecture4-pdf"]') throw new Error('uncollapse failed');
+
+        // Per-course isolation.
+        h.setTocCollapsed(s, 'CS285', 'foo', true);
+        if (h.loadTocCollapsed(s, 'CS182').length !== 1) throw new Error('CS182 leaked');
+
+        // Bad input filtered out.
+        h.saveTocCollapsed(s, 'CS182', ['ok', 99, null, 'dup', 'dup']);
+        const cleaned = h.loadTocCollapsed(s, 'CS182');
+        if (JSON.stringify(cleaned) !== '["dup","ok"]') throw new Error('non-string filter: ' + JSON.stringify(cleaned));
+
+        console.log('ok');
+        """
+    )
+    assert run_node(script).strip() == "ok"
+
+
+def test_adapt_flat_toc_to_tree():
+    """adaptFlatTocToTree wraps the markdown-fallback flat list into a
+    tree so the new tree-rendering NotesTOC can consume both shapes."""
+    script = textwrap.dedent(
+        """
+        const h = require('./frontend/study-state.js');
+        const flat = [
+          {level: 1, text: 'Intro', id: 'intro'},
+          {level: 2, text: 'Setup', id: 'setup'},
+          {level: 2, text: 'Pitfalls', id: 'pitfalls'},
+          {level: 3, text: 'Edge case', id: 'edge'},
+        ];
+        const tree = h.adaptFlatTocToTree(flat);
+        if (tree.length !== 1) throw new Error('expected synthetic root');
+        if (tree[0].children.length !== 3) throw new Error('L2 count: ' + tree[0].children.length);
+        if (tree[0].children[2].children.length !== 1) throw new Error('L3 nesting failed');
+        if (tree[0].children[2].children[0].text !== 'Edge case') throw new Error('L3 text');
+        console.log('ok');
+        """
+    )
+    assert run_node(script).strip() == "ok"
+
+
 def test_notes_scroll_roundtrip():
     """Notes scroll-position cache: per-course localStorage roundtrip,
     integer coercion, garbage-input rejection, and clear."""
@@ -820,17 +939,21 @@ def test_latex_nested_env_renders_with_styles():
 def test_latex_extract_toc_strips_inline_macros():
     """extractTOC must reduce `\\subsection{\\texttt{leaq}：地址计算指令}` to
     plain text `leaq：地址计算指令` so the sidebar shows readable titles
-    instead of literal LaTeX macros."""
+    instead of literal LaTeX macros. After the tree refactor a bare
+    \\subsection without an enclosing file-wrapper section gets a
+    synthetic L1 parent, so the cleaned title lives at tree[0].children[0]."""
     script = textwrap.dedent(
         """
         const NL = require('./frontend/latex-to-html.js');
-        const toc = NL.extractTOC('\\\\subsection{\\\\texttt{leaq}：地址计算指令}');
-        if (toc.length !== 1) throw new Error('expected 1 entry, got ' + toc.length);
-        if (toc[0].text !== 'leaq：地址计算指令') {
-          throw new Error('inline macro not stripped: ' + JSON.stringify(toc[0]));
+        const tree = NL.extractTOC('\\\\subsection{\\\\texttt{leaq}：地址计算指令}');
+        if (tree.length !== 1) throw new Error('expected 1 synthetic L1, got ' + tree.length);
+        const leaf = tree[0].children[0];
+        if (!leaf) throw new Error('synthetic L1 missing child: ' + JSON.stringify(tree[0]));
+        if (leaf.text !== 'leaq：地址计算指令') {
+          throw new Error('inline macro not stripped: ' + JSON.stringify(leaf));
         }
-        if (toc[0].text.startsWith('\\\\texttt')) {
-          throw new Error('leading \\\\texttt survived: ' + toc[0].text);
+        if (leaf.text.startsWith('\\\\texttt')) {
+          throw new Error('leading \\\\texttt survived: ' + leaf.text);
         }
         console.log('ok');
         """

@@ -1077,6 +1077,69 @@
     catch (e) { return false; }
   }
 
+  // ── Notes TOC collapsed-state (per-course) ──────────────────────────
+  // Stores an array of section ids that the user has explicitly
+  // collapsed. Default behaviour is "everything expanded", so an empty /
+  // missing entry means show all children. Using collapsed-ids (instead
+  // of expanded-ids) keeps the storage tiny when the user only collapses
+  // a handful of files in a 20-file course.
+  function _tocCollapsedKey(courseId) {
+    return `${PREFIX}:${courseId}:notes-toc-collapsed`;
+  }
+
+  function loadTocCollapsed(storage, courseId) {
+    if (!courseId) return [];
+    try {
+      const raw = storage.getItem(_tocCollapsedKey(courseId));
+      if (!raw) return [];
+      const parsed = JSON.parse(raw);
+      return Array.isArray(parsed) ? parsed.filter(s => typeof s === "string") : [];
+    } catch (e) { return []; }
+  }
+
+  function saveTocCollapsed(storage, courseId, ids) {
+    if (!courseId) return false;
+    try {
+      const list = Array.isArray(ids)
+        ? Array.from(new Set(ids.filter(s => typeof s === "string"))).sort()
+        : [];
+      storage.setItem(_tocCollapsedKey(courseId), JSON.stringify(list));
+      return true;
+    } catch (e) { return false; }
+  }
+
+  function setTocCollapsed(storage, courseId, sectionId, collapsed) {
+    if (!courseId || !sectionId) return loadTocCollapsed(storage, courseId);
+    const current = new Set(loadTocCollapsed(storage, courseId));
+    if (collapsed) current.add(sectionId);
+    else current.delete(sectionId);
+    const next = Array.from(current).sort();
+    saveTocCollapsed(storage, courseId, next);
+    return next;
+  }
+
+  // Flat-list-to-tree adapter for the legacy markdown TOC path. Used
+  // when the LaTeX shim isn't available — wraps every item under a
+  // synthetic untitled root so the tree-rendering NotesTOC component
+  // can consume both shapes uniformly.
+  function adaptFlatTocToTree(flatItems) {
+    if (!Array.isArray(flatItems) || flatItems.length === 0) return [];
+    const root = { level: 1, text: "(untitled)", id: "untitled-root", children: [] };
+    let currentL2 = null;
+    flatItems.forEach(it => {
+      if (it.level <= 2) {
+        currentL2 = { level: 2, text: it.text, id: it.id, children: [] };
+        root.children.push(currentL2);
+      } else if (currentL2) {
+        currentL2.children.push({ level: 3, text: it.text, id: it.id, children: [] });
+      } else {
+        currentL2 = { level: 2, text: it.text, id: it.id, children: [] };
+        root.children.push(currentL2);
+      }
+    });
+    return [root];
+  }
+
   return {
     createMemoryStorage,
     createSkillEntries,
@@ -1133,5 +1196,9 @@
     loadNotesScroll,
     saveNotesScroll,
     clearNotesScroll,
+    loadTocCollapsed,
+    saveTocCollapsed,
+    setTocCollapsed,
+    adaptFlatTocToTree,
   };
 });

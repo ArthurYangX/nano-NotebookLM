@@ -1555,13 +1555,40 @@ body::before {
 .side-close:hover { color: var(--ink); background: var(--paper-2); }
 .notes-toc ul { list-style: none; padding: 0; margin: 0; }
 .notes-toc li { margin: 0; }
-.notes-toc li button {
-  display: block;
-  width: 100%;
+
+/* Multi-level tree: each row is a flex-aligned [triangle + jump-button] pair.
+   The triangle toggles collapse for L1 (file) rows; L2/L3 rows show a spacer
+   to keep the indentation aligned across the column. */
+.notes-toc .toc-row {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+.notes-toc .toc-toggle,
+.notes-toc .toc-toggle-spacer {
+  flex: 0 0 16px;
+  width: 16px;
+  height: 22px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 10px;
+  color: var(--ink-4);
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  padding: 0;
+  user-select: none;
+}
+.notes-toc .toc-toggle:hover { color: var(--ink-2); }
+.notes-toc .toc-toggle.collapsed { color: var(--ink-3); }
+
+.notes-toc .toc-jump {
+  flex: 1 1 auto;
   text-align: left;
   background: transparent;
   border: none;
-  padding: 4px 8px 4px 6px;
+  padding: 4px 8px 4px 4px;
   border-left: 2px solid transparent;
   color: inherit;
   cursor: pointer;
@@ -1571,11 +1598,18 @@ body::before {
   text-overflow: ellipsis;
   border-radius: 0 4px 4px 0;
 }
-.notes-toc li button:hover { background: var(--paper-2); color: var(--ink); }
-.notes-toc li.toc-l1 button { font-weight: 600; color: var(--ink-2); }
-.notes-toc li.toc-l2 button { padding-left: 18px; }
-.notes-toc li.toc-l3 button { padding-left: 30px; color: var(--ink-4); }
-.notes-toc li.active button {
+.notes-toc .toc-jump:hover { background: var(--paper-2); color: var(--ink); }
+
+.notes-toc li.toc-l1 > .toc-row .toc-jump { font-weight: 600; color: var(--ink-2); }
+.notes-toc li.toc-l2 > .toc-row .toc-jump { color: var(--ink-3); }
+.notes-toc li.toc-l3 > .toc-row .toc-jump { color: var(--ink-4); font-size: 12px; }
+
+/* Indent children — nested <ul> sits under the parent row, offset so the
+   triangle column of children sits inside the parent's title space. */
+.notes-toc li.toc-l1 > ul { padding-left: 14px; }
+.notes-toc li.toc-l2 > ul { padding-left: 14px; }
+
+.notes-toc li.active > .toc-row .toc-jump {
   border-left-color: var(--accent);
   background: var(--accent-soft);
   color: var(--accent-ink);

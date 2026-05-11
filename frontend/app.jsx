@@ -856,6 +856,7 @@ function App() {
                   content={realNotes}
                   streaming={streaming}
                   activeCourse={activeCourse}
+                  sources={sources}
                   onContentChange={(content) => {
                     setRealNotes(content);
                     saveCached(activeCourse, "notes", content);
@@ -1465,21 +1466,72 @@ function applyHighlightsToDom(root, highlights) {
   });
 }
 
-function NotesTOC({ items, activeId, onJump, onClose }) {
-  if (!items.length) return null;
+// Multi-level TOC: each node is { level, text, id, children: [...] }.
+// L1 is the source-file wrapper, L2 is in-file section, L3 is
+// subsubsection. L1 rows show a ▼ / ▶ triangle the user can click to
+// collapse the file's children — collapse state is per-course and
+// persists across mounts via StudyState.loadTocCollapsed.
+function NotesTOC({ items, activeId, onJump, onClose, collapsedIds, onToggleCollapse }) {
+  if (!items || !items.length) return null;
+  const collapsedSet = new Set(collapsedIds || []);
+  function expandTo(id) {
+    // When the active section is hidden inside a collapsed L1, force-
+    // expand its parent so the user can see what's active. We walk the
+    // tree to find the chain of ancestors and uncollapse all of them.
+    const trail = [];
+    function dfs(nodes, path) {
+      for (const n of nodes) {
+        if (n.id === id) { trail.push(...path); return true; }
+        if (n.children && n.children.length) {
+          if (dfs(n.children, path.concat(n.id))) return true;
+        }
+      }
+      return false;
+    }
+    dfs(items, []);
+    trail.forEach(parentId => {
+      if (collapsedSet.has(parentId)) onToggleCollapse(parentId, false);
+    });
+  }
+  function handleJump(id) {
+    expandTo(id);
+    onJump(id);
+  }
+  function renderNode(node) {
+    const hasChildren = !!(node.children && node.children.length);
+    const isCollapsed = collapsedSet.has(node.id);
+    const isActive = node.id === activeId;
+    return (
+      <li key={node.id} className={`toc-l${node.level}` + (isActive ? " active" : "")}>
+        <div className="toc-row">
+          {hasChildren && node.level === 1 ? (
+            <button
+              type="button"
+              className={"toc-toggle" + (isCollapsed ? " collapsed" : "")}
+              onClick={() => onToggleCollapse(node.id, !isCollapsed)}
+              title={isCollapsed ? "Expand" : "Collapse"}
+              aria-expanded={!isCollapsed}
+            >{isCollapsed ? "▶" : "▼"}</button>
+          ) : (
+            <span className="toc-toggle-spacer" />
+          )}
+          <button className="toc-jump" onClick={() => handleJump(node.id)} title={node.text}>
+            {node.text}
+          </button>
+        </div>
+        {hasChildren && !isCollapsed && (
+          <ul>{node.children.map(renderNode)}</ul>
+        )}
+      </li>
+    );
+  }
   return (
     <nav className="notes-toc" aria-label="Table of contents">
       <div className="toc-head mono">
         <span>Contents</span>
         {onClose && <button className="side-close" onClick={onClose} title="Hide TOC" aria-label="Hide TOC">×</button>}
       </div>
-      <ul>
-        {items.map(it => (
-          <li key={it.id} className={`toc-l${it.level}` + (it.id === activeId ? " active" : "")}>
-            <button onClick={() => onJump(it.id)} title={it.text}>{it.text}</button>
-          </li>
-        ))}
-      </ul>
+      <ul className="toc-tree">{items.map(renderNode)}</ul>
     </nav>
   );
 }
@@ -1508,13 +1560,16 @@ function HighlightDrawer({ highlights, onJump, onRemove, onClose }) {
   );
 }
 
-function RealNotesView({ content, streaming, activeCourse, onContentChange, generationState, onRetry, onCitation }) {
+function RealNotesView({ content, streaming, activeCourse, sources, onContentChange, generationState, onRetry, onCitation }) {
   const [draft, setDraft] = React.useState(content || "");
   const [editing, setEditing] = React.useState(false);
   const [highlights, setHighlights] = React.useState([]);
   const [tocItems, setTocItems] = React.useState([]);
   const [activeTocId, setActiveTocId] = React.useState(null);
   const [showToc, setShowToc] = React.useState(true);
+  // Per-course collapsed-section ids. Loaded from localStorage on
+  // course switch; toggle handler writes through immediately.
+  const [tocCollapsedIds, setTocCollapsedIds] = React.useState([]);
   const [showDrawer, setShowDrawer] = React.useState(true);
   const [selMenu, setSelMenu] = React.useState(null); // {x, y, text, before, after}
   const [popover, setPopover] = React.useState(null); // {x, y, hl}
@@ -1527,6 +1582,7 @@ function RealNotesView({ content, streaming, activeCourse, onContentChange, gene
     setEditing(false);
     const cached = activeCourse ? StudyState.loadNoteDraft(localStorage, activeCourse) : "";
     setDraft(cached || content || "");
+    setTocCollapsedIds(activeCourse ? StudyState.loadTocCollapsed(localStorage, activeCourse) : []);
   }, [activeCourse]);
 
   // Streaming chunks — overwrite draft only while streaming, so a regenerate
@@ -1547,14 +1603,28 @@ function RealNotesView({ content, streaming, activeCourse, onContentChange, gene
   // older content (legacy partial drafts).
   React.useEffect(() => {
     if (!activeCourse) { setHighlights([]); setTocItems([]); return; }
-    const toc = (typeof NanoLatex !== "undefined" && NanoLatex.extractTOC)
-      ? NanoLatex.extractTOC(draft)
-      : StudyState.extractHeadingTOC(draft);
+    // Hand the TOC extractor the course's source filenames so it can
+    // identify which `\section{...}` are file-wrappers (L1 in the tree)
+    // vs in-file section headings (L2). Catches uploads without a known
+    // extension and content where the LLM dropped the extension during
+    // review. Falls back to a filename-extension heuristic when sources
+    // is empty.
+    const fileNames = Array.isArray(sources)
+      ? sources.map(s => (s && (s.sourceFile || s.title)) || null).filter(Boolean)
+      : [];
+    let toc;
+    if (typeof NanoLatex !== "undefined" && NanoLatex.extractTOC) {
+      toc = NanoLatex.extractTOC(draft, { fileNames });
+    } else {
+      // Markdown legacy path returns a flat list — wrap into the
+      // tree-shape NotesTOC consumes so both paths use the same renderer.
+      toc = StudyState.adaptFlatTocToTree(StudyState.extractHeadingTOC(draft));
+    }
     setTocItems(toc);
     if (streaming) return;
     const result = StudyState.pruneStaleHighlights(localStorage, activeCourse, draft);
     setHighlights(result.kept);
-  }, [activeCourse, draft, streaming]);
+  }, [activeCourse, draft, streaming, sources]);
 
   // Re-apply highlights to DOM whenever preview html or highlights change.
   // Skip during streaming — DOM is being rewritten per-token so any wrap is
@@ -1996,7 +2066,22 @@ function RealNotesView({ content, streaming, activeCourse, onContentChange, gene
         </div>
       ) : (
         <div className="notes-stage">
-          {showToc && <NotesTOC items={tocItems} activeId={activeTocId} onJump={jumpToHeading} onClose={() => setShowToc(false)} />}
+          {showToc && (
+            <NotesTOC
+              items={tocItems}
+              activeId={activeTocId}
+              onJump={jumpToHeading}
+              onClose={() => setShowToc(false)}
+              collapsedIds={tocCollapsedIds}
+              onToggleCollapse={(id, nextCollapsed) => {
+                if (!activeCourse) return;
+                const next = StudyState.setTocCollapsed(
+                  localStorage, activeCourse, id, nextCollapsed
+                );
+                setTocCollapsedIds(next);
+              }}
+            />
+          )}
           <div
             ref={previewRef}
             className="notes-preview"
