@@ -84,12 +84,18 @@ const API = {
   // Full-course note generation: per-file parallel LLM calls (concurrency
   // capped at 4 by default), programmatic merge, single LLM review pass.
   // Event vocabulary (see api/server.py /api/notes/full-course/stream):
-  //   plan / file_start / file_done / file_error / merging /
-  //   reviewing / review_chunk / done / error
-  async streamFullCourseNotes(courseId, onEvent = null, { userLang = null, concurrency = null } = {}) {
+  //   plan / file_start / file_done / file_error / file_cached /
+  //   merging / reviewing / review_chunk / done / error
+  //
+  // Incremental cache (2026-05-11): files whose chunk_hash matches the
+  // entry in per_file_cache.json short-circuit to a `file_cached` event
+  // without an LLM call. Pass `force: true` to ignore the cache and
+  // re-run every file.
+  async streamFullCourseNotes(courseId, onEvent = null, { userLang = null, concurrency = null, force = false } = {}) {
     const body = { course_id: courseId };
     if (userLang) body.user_lang = userLang;
     if (concurrency != null) body.concurrency = concurrency;
+    if (force) body.force = true;
     return _stream("/notes/full-course/stream", body, onEvent);
   },
 

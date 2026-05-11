@@ -150,16 +150,30 @@ def load_cache(course_id: str) -> dict[str, dict]:
 
 
 def save_cache(course_id: str, cache: dict[str, dict]) -> None:
-    """Atomic write of the entire cache dict — temp file + os.replace.
+    """Atomic write of the entire cache dict — unique temp file + os.replace.
+
+    The temp filename includes a uuid4 suffix so two concurrent workers
+    writing the SAME cache file don't fight over a shared `.json.tmp`
+    path (which would otherwise produce a race: W1 writes tmp, W2 writes
+    tmp [clobbering W1], W1 os.replace ✓, W2 os.replace ✗ FileNotFound).
+    The `os.replace` itself is atomic on POSIX, so whoever runs it last
+    wins — write_cache_entry's read-modify-write protects single-entry
+    updates from being lost (load → mutate → save_cache rewrites all).
+
     Caller passes the FULL desired post-state; we don't read-modify-write
     here. Use write_cache_entry / prune_stale_cache for incremental
-    updates so two pieces of mutation logic don't drift."""
+    updates so two pieces of mutation logic don't drift.
+    """
     try:
         p = _cache_path(course_id)
     except ValueError:
         return
     p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_suffix(".json.tmp")
+    # uuid4 hex makes contention between concurrent workers benign — each
+    # owns its own tmp file; only the final os.replace contends, and that
+    # is atomic.
+    import uuid as _uuid
+    tmp = p.with_suffix(f".json.tmp.{_uuid.uuid4().hex[:8]}")
     payload = json.dumps(cache, ensure_ascii=False, indent=2, sort_keys=True)
     with tmp.open("w", encoding="utf-8") as fh:
         fh.write(payload)

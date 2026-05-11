@@ -217,11 +217,17 @@ function App() {
   // user sees progress immediately; once the review pass starts streaming
   // we swap the draft for the streamed partial; on done we install the
   // final reviewed body.
-  async function handleGenerateNotes() {
+  // Incremental cache UI (2026-05-11): set by the `plan` event so the
+  // toolbar can show "⚡ 10 cached · 1 fresh" stats during streaming.
+  // Cleared when streaming starts and on course switch.
+  const [noteCacheStats, setNoteCacheStats] = useState(null);
+
+  async function handleGenerateNotes({ force = false } = {}) {
     if (!activeCourse) { alert("Please select a specific course first (not 'All Courses')"); return; }
     setMode("notes");
     setStreaming(true);
     setStreamProgress(0);
+    setNoteCacheStats(null);
     setGenerationState(StudyState.createGenerationState());
     const fileSections = [];
     // fix-all v1 #19: mirror backend's _escape_latex_title (in
@@ -264,9 +270,19 @@ function App() {
               status: "pending",
               content: null,
               error: null,
+              cached: !!(event.files && event.files[i] && event.files[i].cached),
             };
           }
           setStreamProgress(0);
+          // Incremental cache stats: backend reports cached_count + fresh_count
+          // plus the `force` echo. Frontend toolbar uses this to render
+          // "⚡ 10 cached · ⏳ 1 fresh" so the user knows why generation is fast.
+          setNoteCacheStats({
+            total: event.total,
+            cached: event.cached_count || 0,
+            fresh: event.fresh_count || event.total,
+            force: !!event.force,
+          });
         } else if (event.type === "file_start") {
           if (fileSections[event.idx]) {
             fileSections[event.idx].status = "running";
@@ -317,7 +333,7 @@ function App() {
             (s.failures || 0) + 1,
           ));
         }
-      }, { userLang });
+      }, { userLang, force });
       if (final && final.type === "error") throw new Error(final.error || "stream_failed");
       const content = (final && final.content) || reviewPartial || rebuildDraftFromFiles() || "Notes generation failed.";
       setRealNotes(content);
@@ -529,7 +545,7 @@ function App() {
   const tabs = [
     { id: "reader", label: "Reader", num: activeCourse ? "§" : "—" },
     { id: "notes", label: "Notes", num: realNotes ? "✓" : "—" },
-    { id: "mindmap", label: "Mind map", num: realMindmap ? "✓" : "—" },
+    { id: "mindmap", label: "Knowledge Graph", num: realMindmap ? "✓" : "—" },
     { id: "quiz", label: "Quiz", num: realQuiz && realQuiz.length ? `Q·${realQuiz.length}` : "—" },
     { id: "skills", label: "Skills", num: [examAnalysis, reportData, masteryData].filter(Boolean).length || "—" },
     { id: "history", label: "History", num: Object.keys(sessionDays || {}).length || "—" },
@@ -593,7 +609,23 @@ function App() {
           >
             {backend === "qwen_raft" ? "🎓 Qwen" : "🤖 GPT-5.4"}
           </button>
-          <button className="icon-btn" title="Generate Notes" onClick={handleGenerateNotes} disabled={streaming}>📝</button>
+          <button className="icon-btn" title="Generate Notes (uses cache when available)" onClick={() => handleGenerateNotes()} disabled={streaming}>📝</button>
+          <button
+            className="icon-btn"
+            title="Force regenerate all sections (ignore per-file cache)"
+            onClick={() => handleGenerateNotes({ force: true })}
+            disabled={streaming}
+          >🔄</button>
+          {noteCacheStats && (noteCacheStats.cached > 0 || streaming) && (
+            <span
+              className={"cache-chip mono" + (noteCacheStats.cached > 0 ? " cache-hit" : " cache-miss")}
+              title={noteCacheStats.force
+                ? "Force regenerate — cache ignored"
+                : `${noteCacheStats.cached} cached · ${noteCacheStats.fresh} fresh`}
+            >
+              {noteCacheStats.force ? "🔄" : "⚡"}{noteCacheStats.cached}/{noteCacheStats.total}
+            </span>
+          )}
           <button className="icon-btn" title="Generate Quiz" onClick={handleGenerateQuiz} disabled={streaming}>❓</button>
           <button className="icon-btn" title="Build Knowledge Graph" onClick={handleGenerateMindmap} disabled={streaming}>🧠</button>
           <button className="icon-btn" title="Exam Analysis" onClick={() => handleSkillEntry("exam-analysis")} disabled={streaming}>⌁</button>
@@ -820,7 +852,7 @@ function App() {
               { value: "cards", label: "Cards" },
             ]} />
         </TweakSection>
-        <TweakSection title="Mind map">
+        <TweakSection title="Knowledge Graph">
           <TweakRadio tweaks={tweaks} tweakKey="mindmapLayout" label="Layout"
             options={[
               { value: "radial", label: "Radial" }, { value: "tree", label: "Tree (L→R)" },

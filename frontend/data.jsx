@@ -19,7 +19,7 @@ const READER_DOC = {
     { kind: "h2", num: "1.1", text: "Getting Started" },
     { kind: "p", text: "1. Upload course materials via the Library panel. 2. Ask questions in the Assistant sidebar. 3. Generate notes, mind maps, and quizzes from the tabs above." },
     { kind: "h2", num: "1.2", text: "Supported Features" },
-    { kind: "p", text: "Reader — browse extracted content with interactive highlights. Notes — generate structured study notes in Outline, Cornell, or Card format. Mind Map — visualize knowledge relationships. Quiz — auto-generated practice tests with AI grading." },
+    { kind: "p", text: "Reader — browse extracted content with interactive highlights. Notes — generate structured study notes in Outline, Cornell, or Card format. Knowledge Graph — visualize knowledge relationships. Quiz — auto-generated practice tests with AI grading." },
   ]
 };
 
@@ -53,7 +53,7 @@ const MINDMAP = {
     { id: "study", label: "Study Tools", children: [
       { id: "notes", label: "Notes" },
       { id: "quiz", label: "Quiz" },
-      { id: "mindmap", label: "Mind Map" },
+      { id: "mindmap", label: "Knowledge Graph" },
     ]},
     { id: "ai", label: "AI Backends", children: [
       { id: "claude", label: "Claude" },

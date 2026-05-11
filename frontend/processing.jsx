@@ -88,7 +88,7 @@ function Processing({ fileName, activeStep, stages, errorStage, errorMsg, done, 
           </div>
         )}
         {done && !errorStage && (
-          <div className="processing-done mono">✓ Ready · Notes · Mind map · Quiz now available</div>
+          <div className="processing-done mono">✓ Ready · Notes · Knowledge Graph · Quiz now available</div>
         )}
       </div>
     </div>

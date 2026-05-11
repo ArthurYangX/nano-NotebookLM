@@ -613,7 +613,7 @@ function MindMap({ data, layout, courseId, highlightedId, onNodeClick, onSourceC
 
   return (
     <div className="mindmap-wrap"
-      data-screen-label="Mind map"
+      data-screen-label="Knowledge Graph"
       onMouseDown={startCanvasPan}
     >
       {prepared.empty && <div className="mindmap-empty">{prepared.placeholder}</div>}
