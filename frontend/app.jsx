@@ -2500,20 +2500,12 @@ function RealNotesView({ content, streaming, activeCourse, sources, onContentCha
 }
 
 /* ── Real Quiz View ── */
-// Backend quiz_generator emits the canonical answer as `q.answer` =
-// "B. <full text>" (LLM-generated), not as a bare letter. Legacy / demo
-// fixtures use `q.correct = "B"` instead. Extract the letter once so the
-// render-time isCorrect check actually fires — without this, every picked
-// option was framed red because `q.correct` was undefined and `isCorrect`
-// was permanently false.
-function correctLetter(q) {
-  if (q && q.correct) return String(q.correct).trim();
-  if (q && typeof q.answer === "string") {
-    const m = q.answer.trim().match(/^([A-Za-z])[.\s)]/);
-    if (m) return m[1].toUpperCase();
-  }
-  return "";
-}
+// fix-all v1 H5 + M4: `correctLetter` now lives in study-state.js so the
+// Wrong-Only review filter and this view share the same helper. The local
+// copy's regex `/^([A-Za-z])[.\s)]/` also missed bare-letter answers (the
+// EXAM_PREP_QUESTIONS_PROMPT explicitly mandates `"B"` for multi-choice);
+// the shared version uses `/^([A-Za-z])(?:$|[.\s)])/` to accept both.
+const correctLetter = StudyState.correctLetter;
 
 function RealQuizView({ questions, activeCourse, onRegenerate, regenerating }) {
   const loaded = StudyState.loadQuizAnswers(localStorage, activeCourse, questions);

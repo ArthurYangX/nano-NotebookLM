@@ -205,7 +205,9 @@ def test_ingest_rejects_missing_directory(client):
 
 
 def test_exam_prep_view_empty_course_returns_empty_bank(client):
-    r = client.get("/api/exam-prep/testcourse")
+    # fix-all v1 M8: GET/DELETE moved to /state/{course_id} so the verb
+    # names (plan/seed/quiz) can't shadow course IDs.
+    r = client.get("/api/exam-prep/state/testcourse")
     assert r.status_code == 200
     body = r.json()
     assert body["view"]["topic_count"] == 0
@@ -213,9 +215,17 @@ def test_exam_prep_view_empty_course_returns_empty_bank(client):
 
 
 def test_exam_prep_view_rejects_traversal(client):
-    r = client.get("/api/exam-prep/..hack")
+    r = client.get("/api/exam-prep/state/..hack")
     assert r.status_code == 400
     assert "request_id" in r.json()
+
+
+def test_exam_prep_view_rejects_reserved_verb_names(client):
+    """fix-all v1 M8: a course literally named 'plan'/'seed'/'quiz' would
+    silently shadow the POST routes if we didn't reject it at validation."""
+    for reserved in ("plan", "seed", "quiz"):
+        r = client.get(f"/api/exam-prep/state/{reserved}")
+        assert r.status_code == 400, f"{reserved} should 400, got {r.status_code}"
 
 
 def test_exam_prep_submit_rejects_oversized_answers(client):
@@ -225,7 +235,17 @@ def test_exam_prep_submit_rejects_oversized_answers(client):
     assert r.status_code == 422
 
 
-def test_exam_prep_quiz_next_without_topics_returns_502(client):
-    """No bank yet → skill returns no_topics error → API surfaces 502."""
+def test_exam_prep_quiz_next_without_topics_returns_400(client):
+    """No bank yet → skill returns 'no_topics — ...' → API surfaces 400
+    (precondition, caller can fix by calling /plan first). Pre-fix this
+    was a generic 502."""
     r = client.post("/api/exam-prep/quiz/next", json={"course_id": "testcourse", "size": 5})
-    assert r.status_code == 502
+    assert r.status_code == 400
+
+
+def test_exam_prep_seed_rejects_oversized_topic_ids_list(client):
+    """fix-all v1 L2: bound `topic_ids` to 32 entries × 64 chars per item
+    so a flood client can't waste server time on linear scans."""
+    big = {"course_id": "testcourse", "topic_ids": ["t"] * 50}
+    r = client.post("/api/exam-prep/seed", json=big)
+    assert r.status_code == 422

@@ -271,6 +271,61 @@ def test_quiz_persistence_happy():
     assert run_node(script).strip() == "ok"
 
 
+def test_correct_letter_helper_handles_all_answer_formats():
+    """fix-all v1 H5 + M4: pin the shared helper so the regex regression
+    (bare-letter answers like 'A' being missed) can't come back. Five cases
+    cover legacy `correct:'A'`, LLM 'B. text', 'C) text', lowercase, bare
+    letter, and missing fields."""
+    script = textwrap.dedent(
+        """
+        const h = require('./frontend/study-state.js');
+        const tests = [
+          [{correct: 'A'}, 'A'],
+          [{answer: 'B. printf is part of the standard I/O library'}, 'B'],
+          [{answer: 'C) explanation'}, 'C'],
+          [{answer: 'd. lowercase'}, 'D'],
+          [{answer: 'A'}, 'A'],   // <-- this is the bare-letter regression
+          [{answer: 'just an essay answer with leading lowercase'}, ''],
+          [{}, ''],
+          [null, ''],
+        ];
+        for (const [q, want] of tests) {
+          const got = h.correctLetter(q);
+          if (got !== want) {
+            throw new Error('correctLetter(' + JSON.stringify(q) + ') = ' + JSON.stringify(got) + ' want ' + JSON.stringify(want));
+          }
+        }
+        console.log('ok');
+        """
+    )
+    assert run_node(script).strip() == "ok"
+
+
+def test_wrong_only_filter_uses_letter_for_multi_choice():
+    """fix-all v1 H5: the LLM-emitted answer field is 'B. full text' but
+    the user picks store as a bare letter 'B'. Pre-fix, filterWrongQuestions
+    compared 'B' !== 'B. full text' → every answered multi-choice question
+    fell out as wrong. Verify the letter-based comparison."""
+    script = textwrap.dedent(
+        """
+        const h = require('./frontend/study-state.js');
+        const quiz = [
+          {question: 'q1', type: 'multiple_choice', answer: 'B. printf is the right call', options: ['A','B','C','D']},
+          {question: 'q2', type: 'multiple_choice', answer: 'A. the wrong one', options: ['A','B','C','D']},
+          {question: 'q3', type: 'short_answer', answer: 'backpropagation'},
+        ];
+        // User answered q1 correctly ('B'), q2 wrong ('B' but answer is A),
+        // q3 correctly with substring match.
+        const answers = {'0': 'B', '1': 'B', '2': 'backpropagation'};
+        const wrong = h.filterWrongQuestions(quiz, answers);
+        if (wrong.length !== 1) throw new Error('expected 1 wrong, got ' + wrong.length);
+        if (wrong[0].question !== 'q2') throw new Error('expected q2 wrong, got ' + wrong[0].question);
+        console.log('ok');
+        """
+    )
+    assert run_node(script).strip() == "ok"
+
+
 def test_quiz_persistence_invalid():
     script = textwrap.dedent(
         """

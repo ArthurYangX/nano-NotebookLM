@@ -163,13 +163,16 @@ const API = {
     if (userLang) body.user_lang = userLang;
     return _post("/exam-prep/quiz/submit", body);
   },
+  // GET/DELETE moved to /state/{course_id} so a verb typo (e.g.
+  // GET /api/exam-prep/plan) can't fall through to here and silently create
+  // a course literally named "plan" (fix-all v1 M8).
   async examPrepView(courseId) {
-    const res = await fetch(`${API_BASE}/exam-prep/${encodeURIComponent(courseId)}`);
+    const res = await fetch(`${API_BASE}/exam-prep/state/${encodeURIComponent(courseId)}`);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     return res.json();
   },
   async examPrepReset(courseId) {
-    const res = await fetch(`${API_BASE}/exam-prep/${encodeURIComponent(courseId)}`, { method: "DELETE" });
+    const res = await fetch(`${API_BASE}/exam-prep/state/${encodeURIComponent(courseId)}`, { method: "DELETE" });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     return res.json();
   },

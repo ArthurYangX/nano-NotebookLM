@@ -33,6 +33,8 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
+import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -53,12 +55,51 @@ TOTAL_VARIANT_CAP = 20
 PER_TOPIC_VARIANT_CAP = 5
 DEFAULT_SEEDS_PER_TYPE = 2
 QUIZ_DEFAULT_SIZE = 8
-# Per-LLM-call timeout for plan + variant generation. Without it a stuck
-# codex connection silently hangs the entire submit endpoint (asyncio.gather
-# waits for ALL tasks → frontend fetch has no default timeout → user sees a
-# permanent spinner with no feedback). 45 s comfortably covers a healthy
-# codex round-trip; anything longer is dead time worth surfacing as an error.
-EXAM_PREP_LLM_TIMEOUT_S = 45.0
+# fix-all v1 M9: env-tunable, matching QWEN_BACKEND_TIMEOUT_SECONDS /
+# GRAPHRAG_TIMEOUT_SECONDS / NANO_NLM_MAX_TECTONIC_CONCURRENCY conventions.
+# Without an env hook, operators on slow codex deployments can't raise the
+# 45 s ceiling without editing source.
+EXAM_PREP_LLM_TIMEOUT_S = float(os.getenv("EXAM_PREP_LLM_TIMEOUT_SECONDS", "45.0"))
+# fix-all v1 H3: cap concurrent variant-generation LLM calls. Notes pipeline
+# uses _FULL_COURSE_SEMAPHORE=2 for the analogous burst; here we sit at 4 to
+# match the shared ThreadPoolExecutor(max_workers=4) so we don't oversubscribe
+# the backend's executor pool. Without this, a 20-wrong-topic submit fans out
+# 20 concurrent codex calls → proxy rate-limits + starves notes/qa/report.
+EXAM_PREP_VARIANT_CONCURRENCY = int(os.getenv("EXAM_PREP_VARIANT_CONCURRENCY", "4"))
+
+
+# Module-level lazy-init semaphore. Built on first use inside the running
+# event loop so test fixtures with their own loops don't race a global init.
+_VARIANT_SEMAPHORE: "asyncio.Semaphore | None" = None
+
+
+def _get_variant_semaphore() -> asyncio.Semaphore:
+    global _VARIANT_SEMAPHORE
+    if _VARIANT_SEMAPHORE is None:
+        _VARIANT_SEMAPHORE = asyncio.Semaphore(EXAM_PREP_VARIANT_CONCURRENCY)
+    return _VARIANT_SEMAPHORE
+
+
+# fix-all v1 H2: per-course async lock keyed by (running_loop_id, course_id).
+# Without this, two concurrent submits both load_bank → both mutate → both
+# save_bank → last-writer-wins discards the other's grading history + any
+# successful variants. Mirrors the _COURSE_CACHE_LOCKS pattern in
+# notes_full_course (R4-6 fix-all v4) — loop_id keys handle test fixtures
+# that spin fresh loops via asyncio.run().
+_COURSE_LOCKS: dict[tuple[int, str], asyncio.Lock] = {}
+
+
+def _lock_for(course_id: str) -> asyncio.Lock:
+    try:
+        loop_id = id(asyncio.get_running_loop())
+    except RuntimeError:
+        loop_id = 0
+    key = (loop_id, course_id)
+    lock = _COURSE_LOCKS.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _COURSE_LOCKS[key] = lock
+    return lock
 
 
 # ── persistence ───────────────────────────────────────────────────────
@@ -83,7 +124,25 @@ def _empty_bank(course_id: str) -> dict:
     }
 
 
+class BankVersionTooNewError(Exception):
+    """The bank on disk was written by a newer client than this code knows
+    how to read. We refuse to overwrite it — fix-all v1 H6: previously
+    `load_bank` silently returned an empty bank for ANY version mismatch
+    and the next mutating action would overwrite the file, wiping all data
+    when a user temporarily ran an older binary against a newer bank.
+    """
+
+
 def load_bank(course_id: str) -> dict:
+    """Load + validate + migrate an exam bank for a course.
+
+    - Missing file → empty bank.
+    - Unreadable / malformed JSON → empty bank (with a warn log; recoverable).
+    - Version *older* than current: future-proofing seam; route through
+      `_migrate_bank` (currently no-op since version=1 is the only one).
+    - Version *newer* than current: raise BankVersionTooNewError so callers
+      can surface 503/409 to the user instead of silently wiping data.
+    """
     path = _bank_path(course_id)
     if not path.exists():
         return _empty_bank(course_id)
@@ -92,10 +151,32 @@ def load_bank(course_id: str) -> dict:
     except (OSError, json.JSONDecodeError) as e:
         logger.warning("exam_bank load failed for %s: %s", course_id, type(e).__name__)
         return _empty_bank(course_id)
-    if data.get("version") != EXAM_BANK_VERSION:
-        logger.warning("exam_bank version mismatch for %s", course_id)
+    raw_version = data.get("version")
+    try:
+        version_int = int(raw_version) if raw_version is not None else None
+    except (TypeError, ValueError):
+        version_int = None
+    if version_int is None:
+        logger.warning("exam_bank missing version for %s", course_id)
         return _empty_bank(course_id)
+    if version_int > EXAM_BANK_VERSION:
+        # Refuse to read OR overwrite. Caller decides UX (503 with message).
+        raise BankVersionTooNewError(
+            f"bank version {version_int} > supported {EXAM_BANK_VERSION}"
+        )
+    if version_int < EXAM_BANK_VERSION:
+        data = _migrate_bank(data, version_int)
     data.setdefault("topics", [])
+    return data
+
+
+def _migrate_bank(data: dict, from_version: int) -> dict:
+    """Forward-migration shell. version=1 is the only schema today; future
+    bumps add branches here. Keeps `load_bank` non-destructive: it produces a
+    valid current-version bank without overwriting the on-disk file (the next
+    save_bank call will eventually persist the migrated shape)."""
+    # No migrations to apply yet — placeholder so future versions have a hook.
+    data["version"] = EXAM_BANK_VERSION
     return data
 
 
@@ -116,14 +197,25 @@ def question_mastered(q: dict) -> bool:
 
 
 def topic_mastery(topic: dict) -> tuple[int, int, float, bool]:
-    """Return (mastered_count, total_count, ratio, is_mastered)."""
+    """Return (mastered_count, total_count, display_ratio, is_mastered).
+
+    fix-all v1 M5: the display ratio is `mastered/total` (or 0 when empty),
+    NOT the padded ratio that determines mastery. Pre-fix, `denom = max(total,
+    3)` meant a 1-of-1-mastered topic rendered "1/1 mastered" + "33% bar"
+    simultaneously — visually confusing. The padded denom still gates
+    `is_mastered` so a 1-question topic can't claim full mastery (intent
+    preserved), but the bar shows what the user actually sees.
+    """
     qs = [q for q in topic.get("questions", []) if not q.get("archived")]
     total = len(qs)
     mastered = sum(1 for q in qs if question_mastered(q))
-    denom = max(total, TOPIC_MASTERY_MIN_QUESTIONS)
-    ratio = mastered / denom if denom else 0.0
-    is_mastered = total >= TOPIC_MASTERY_MIN_QUESTIONS and ratio >= TOPIC_MASTERY_RATIO
-    return mastered, total, ratio, is_mastered
+    display_ratio = (mastered / total) if total else 0.0
+    mastery_denom = max(total, TOPIC_MASTERY_MIN_QUESTIONS)
+    is_mastered = (
+        total >= TOPIC_MASTERY_MIN_QUESTIONS
+        and (mastered / mastery_denom) >= TOPIC_MASTERY_RATIO
+    )
+    return mastered, total, display_ratio, is_mastered
 
 
 def variant_budget(wrong_topic_count: int) -> int:
@@ -149,8 +241,17 @@ def _new_question_id() -> str:
     return f"q_{uuid.uuid4().hex[:12]}"
 
 
+_TRAILING_PUNCT_RE = re.compile(r"[\s\.\?!,;:。？！，；：]+$")
+
+
 def _norm_signature(text: str) -> str:
-    return " ".join(str(text or "").lower().split())
+    """Normalize a prompt for dedup. fix-all v1 M13: pre-fix only lowercase +
+    whitespace-collapse, so "What is X?" / "What is X." / "What is X!" all
+    counted as distinct → variant accumulation degraded "fresh angle" promise.
+    Now also strip trailing punctuation (including Chinese full-width) so
+    near-duplicates collapse."""
+    norm = " ".join(str(text or "").lower().split())
+    return _TRAILING_PUNCT_RE.sub("", norm)
 
 
 def _extract_letter(text: str) -> str:
@@ -203,35 +304,55 @@ class ExamPrepSkill(Skill):
     )
 
     async def execute(self, params: dict) -> SkillResult:
+        """Dispatch an action. fix-all v1 H1: user_lang is no longer stashed
+        on `self` — `ExamPrepSkill` is a singleton in the orchestrator and a
+        shared attribute races across concurrent requests (zh user gets en
+        questions if an en request lands during the zh request's await). It's
+        passed as an explicit parameter to each handler instead, matching the
+        QASkill / NoteGeneratorSkill pattern.
+        """
         action = params.get("action", "")
         course_id = params.get("course_id", "")
         if not course_id:
             return SkillResult(success=False, error="course_id required")
-        # user_lang is threaded into every LLM call via the system binding so
-        # generated topics + questions respect the student's language choice
-        # rather than echoing the source-material language.
-        self._user_lang = params.get("user_lang")
+        user_lang = params.get("user_lang")
         try:
             if action == "plan":
-                return await self.plan_topics(course_id, params)
+                return await self.plan_topics(course_id, params, user_lang)
             if action == "seed":
-                return await self.seed_questions(course_id, params)
+                return await self.seed_questions(course_id, params, user_lang)
             if action == "next_quiz":
-                return await self.next_quiz(course_id, params)
+                return await self.next_quiz(course_id, params, user_lang)
             if action == "submit":
-                return await self.submit_answers(course_id, params)
+                return await self.submit_answers(course_id, params, user_lang)
             if action == "view":
                 return self.view(course_id)
             if action == "reset":
-                return self.reset(course_id)
+                return await self.reset(course_id)
             return SkillResult(success=False, error=f"unknown action: {action}")
-        except Exception:
-            logger.exception("exam_prep action %s failed", action)
+        except BankVersionTooNewError as e:
+            # H6: surface to caller as a typed error so the API can 409/503
+            # instead of silently wiping the on-disk bank.
+            logger.warning("exam_bank version too new for %s: %s", course_id, e)
+            return SkillResult(success=False, error="bank_version_too_new")
+        except Exception as exc:
+            # M1: drop logger.exception to avoid serializing exception body
+            # (openai-python exceptions can carry user query / sk-... bits).
+            # Matches the qa_skill v2 fix.
+            logger.warning("exam_prep action %s failed: %s", action, type(exc).__name__)
             return SkillResult(success=False, error="exam_prep_failed")
 
     # ── Phase 1: extract topics ────────────────────────────────────
 
-    async def plan_topics(self, course_id: str, params: dict) -> SkillResult:
+    async def plan_topics(
+        self, course_id: str, params: dict, user_lang: str | None,
+    ) -> SkillResult:
+        async with _lock_for(course_id):
+            return await self._plan_topics_locked(course_id, params, user_lang)
+
+    async def _plan_topics_locked(
+        self, course_id: str, params: dict, user_lang: str | None,
+    ) -> SkillResult:
         max_topics = int(params.get("max_topics", 8))
         force = bool(params.get("force", False))
 
@@ -268,7 +389,7 @@ class ExamPrepSkill(Skill):
             source_text=source_text,
         )
         system = prompts.EXAM_PREP_SYSTEM
-        binding = prompts.USER_LANG_BINDING(getattr(self, "_user_lang", None))
+        binding = prompts.USER_LANG_BINDING(user_lang)
         if binding:
             system = f"{system}\n\n{binding}"
         try:
@@ -284,17 +405,32 @@ class ExamPrepSkill(Skill):
         except asyncio.TimeoutError:
             logger.warning("exam_prep plan LLM call timed out after %ss", EXAM_PREP_LLM_TIMEOUT_S)
             return SkillResult(success=False, error="topic_extraction_timeout")
-        except Exception:
-            logger.exception("exam_prep plan LLM call failed")
+        except Exception as exc:
+            # M1: type-name only, no exception body in logs.
+            logger.warning("exam_prep plan LLM call failed: %s", type(exc).__name__)
             return SkillResult(success=False, error="topic_extraction_failed")
 
         topics_raw = data.get("topics") if isinstance(data, dict) else data
         if not isinstance(topics_raw, list):
             return SkillResult(success=False, error="topic_extraction_malformed")
 
+        # H4: when force=True, preserve old topic.questions for any new topic
+        # whose normalized name matches an old topic. Pre-fix, a slight name
+        # drift ("Backpropagation" → "Back-propagation" after a zh→en re-extract)
+        # changed topic_id and silently dropped all mastery history.
+        old_questions_by_norm_name: dict[str, list[dict]] = {}
+        if force:
+            for old_t in bank.get("topics", []):
+                key = _norm_signature(old_t.get("name", ""))
+                if key:
+                    # If multiple old topics normalize to same key (unlikely),
+                    # last wins — they would have been deduped on the prior plan.
+                    old_questions_by_norm_name[key] = list(old_t.get("questions", []))
+
         chunk_index = {r.chunk_id: r for r in results}
         topics: list[dict] = []
         seen_ids: set[str] = set()
+        migrated_names: set[str] = set()
         for t in topics_raw[:max_topics]:
             if not isinstance(t, dict):
                 continue
@@ -316,58 +452,88 @@ class ExamPrepSkill(Skill):
                         "source_file": hit.source_file,
                         "location": hit.location,
                     })
+            preserved_questions: list[dict] = []
+            norm_key = _norm_signature(name)
+            if force and norm_key in old_questions_by_norm_name:
+                preserved_questions = old_questions_by_norm_name[norm_key]
+                migrated_names.add(norm_key)
             topics.append({
                 "id": tid,
                 "name": name[:100],
                 "weight": weight,
                 "source_chunks": source_chunks,
-                "questions": [],
+                "questions": preserved_questions,
                 "created_at": _now_iso(),
             })
             seen_ids.add(tid)
+
+        # Orphan old topics whose names didn't survive re-extraction: their
+        # questions move to an archive bucket so a user who suspects a
+        # regression can `examPrepReset` AFTER inspecting what they lost.
+        orphan_questions: list[dict] = []
+        for key, qs in old_questions_by_norm_name.items():
+            if key not in migrated_names:
+                orphan_questions.extend(qs)
+        if orphan_questions:
+            archive_id = f"archive_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
+            topics.append({
+                "id": archive_id,
+                "name": f"[archive] orphaned questions from previous re-extract",
+                "weight": 0.0,
+                "source_chunks": [],
+                "questions": orphan_questions,
+                "created_at": _now_iso(),
+                "archived_topic": True,
+            })
 
         bank["topics"] = topics
         save_bank(course_id, bank)
         return SkillResult(success=True, data={
             "bank": bank, "reused": False, "view": self._compute_view(bank),
+            "migrated_topic_count": len(migrated_names),
+            "orphan_question_count": len(orphan_questions),
         })
 
     # ── Phase 2: seed questions for a topic ────────────────────────
 
-    async def seed_questions(self, course_id: str, params: dict) -> SkillResult:
-        bank = load_bank(course_id)
-        if not bank.get("topics"):
-            return SkillResult(success=False, error="no_topics — call action=plan first")
+    async def seed_questions(
+        self, course_id: str, params: dict, user_lang: str | None,
+    ) -> SkillResult:
+        async with _lock_for(course_id):
+            bank = load_bank(course_id)
+            if not bank.get("topics"):
+                return SkillResult(success=False, error="no_topics — call action=plan first")
 
-        topic_ids = params.get("topic_ids") or [t["id"] for t in bank["topics"]]
-        seeds_per_type = int(params.get("seeds_per_type", DEFAULT_SEEDS_PER_TYPE))
+            topic_ids = params.get("topic_ids") or [t["id"] for t in bank["topics"]]
+            seeds_per_type = int(params.get("seeds_per_type", DEFAULT_SEEDS_PER_TYPE))
 
-        topic_by_id = {t["id"]: t for t in bank["topics"]}
-        tasks = []
-        targets = []
-        for tid in topic_ids:
-            topic = topic_by_id.get(tid)
-            if topic is None:
-                continue
-            tasks.append(self._generate_questions(
-                course_id, topic, count=seeds_per_type,
-                kinds=("multiple_choice", "short_answer"),
-                variant_of=None,
-            ))
-            targets.append(topic["id"])
+            topic_by_id = {t["id"]: t for t in bank["topics"]}
+            tasks = []
+            targets = []
+            for tid in topic_ids:
+                topic = topic_by_id.get(tid)
+                if topic is None:
+                    continue
+                tasks.append(self._generate_questions(
+                    course_id, topic, count=seeds_per_type,
+                    kinds=("multiple_choice", "short_answer"),
+                    variant_of=None,
+                    user_lang=user_lang,
+                ))
+                targets.append(topic["id"])
 
-        added_per_topic: dict[str, int] = {}
-        if tasks:
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            for tid, r in zip(targets, results):
-                if isinstance(r, int):
-                    added_per_topic[tid] = r
+            added_per_topic: dict[str, int] = {}
+            if tasks:
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                for tid, r in zip(targets, results):
+                    if isinstance(r, int):
+                        added_per_topic[tid] = r
 
-        save_bank(course_id, bank)
-        return SkillResult(success=True, data={
-            "added": added_per_topic,
-            "view": self._compute_view(bank),
-        })
+            save_bank(course_id, bank)
+            return SkillResult(success=True, data={
+                "added": added_per_topic,
+                "view": self._compute_view(bank),
+            })
 
     async def _generate_questions(
         self,
@@ -376,6 +542,7 @@ class ExamPrepSkill(Skill):
         count: int,
         kinds: tuple[str, ...],
         variant_of: str | None,
+        user_lang: str | None = None,
     ) -> int:
         """Append `count` questions per kind to topic. Returns total added."""
         if count <= 0 or not kinds:
@@ -417,27 +584,35 @@ class ExamPrepSkill(Skill):
             avoid_block=avoid_block,
         )
         system = prompts.EXAM_PREP_SYSTEM
-        binding = prompts.USER_LANG_BINDING(getattr(self, "_user_lang", None))
+        binding = prompts.USER_LANG_BINDING(user_lang)
         if binding:
             system = f"{system}\n\n{binding}"
+        # H3: gate concurrent variant generation through a module-level
+        # semaphore so a 20-wrong-topic submit can't fan out 20× codex calls
+        # in parallel.
         try:
-            data = await asyncio.wait_for(
-                self.router.complete_structured(
-                    prompt,
-                    task_type="exam_prep_questions",
-                    system=system,
-                    temperature=0.6,
-                ),
-                timeout=EXAM_PREP_LLM_TIMEOUT_S,
-            )
+            async with _get_variant_semaphore():
+                data = await asyncio.wait_for(
+                    self.router.complete_structured(
+                        prompt,
+                        task_type="exam_prep_questions",
+                        system=system,
+                        temperature=0.6,
+                    ),
+                    timeout=EXAM_PREP_LLM_TIMEOUT_S,
+                )
         except asyncio.TimeoutError:
             logger.warning(
                 "exam_prep question gen timed out after %ss for topic %s",
                 EXAM_PREP_LLM_TIMEOUT_S, topic.get("id"),
             )
             return 0
-        except Exception:
-            logger.exception("exam_prep question gen failed for topic %s", topic.get("id"))
+        except Exception as exc:
+            # M1: log exception type only, never body.
+            logger.warning(
+                "exam_prep question gen failed for topic %s: %s",
+                topic.get("id"), type(exc).__name__,
+            )
             return 0
 
         raw_qs = data.get("questions") if isinstance(data, dict) else data
@@ -483,7 +658,15 @@ class ExamPrepSkill(Skill):
 
     # ── Phase 3a: sample next quiz ─────────────────────────────────
 
-    async def next_quiz(self, course_id: str, params: dict) -> SkillResult:
+    async def next_quiz(
+        self, course_id: str, params: dict, user_lang: str | None,
+    ) -> SkillResult:
+        async with _lock_for(course_id):
+            return await self._next_quiz_locked(course_id, params, user_lang)
+
+    async def _next_quiz_locked(
+        self, course_id: str, params: dict, user_lang: str | None,
+    ) -> SkillResult:
         bank = load_bank(course_id)
         if not bank.get("topics"):
             return SkillResult(success=False, error="no_topics — call action=plan first")
@@ -491,9 +674,17 @@ class ExamPrepSkill(Skill):
         size = int(params.get("size", QUIZ_DEFAULT_SIZE))
         size = max(1, min(20, size))
         requested_topic_ids = params.get("topic_ids") or None
+        # M7: when user explicitly drilled into a topic, allow re-quizzing
+        # already-mastered questions (they may want to review). Without an
+        # explicit topic_ids, exclude mastered to focus on weak areas.
+        include_mastered = bool(requested_topic_ids)
 
         candidates = []
         for t in bank["topics"]:
+            if t.get("archived_topic"):
+                # H4: archive bucket from a prior force-replan is never
+                # sampled for new quizzes (read-only history view).
+                continue
             if requested_topic_ids and t["id"] not in requested_topic_ids:
                 continue
             _, _, _, mastered = topic_mastery(t)
@@ -502,24 +693,37 @@ class ExamPrepSkill(Skill):
             candidates.append(t)
 
         if not candidates:
-            return SkillResult(success=True, data={"questions": [], "total_available": 0, "topic_count": 0, "view": self._compute_view(bank)})
+            return SkillResult(success=True, data={
+                "questions": [], "total_available": 0, "topic_count": 0,
+                "reason": "all_mastered",
+                "view": self._compute_view(bank),
+            })
 
+        # M6: track whether seeding failed so we can return reason=generation_failed
+        # instead of misleading "all_mastered" / empty questions.
+        seeding_attempted = False
+        seeding_succeeded = False
         unseeded = [t for t in candidates if not t.get("questions")]
         if unseeded:
+            seeding_attempted = True
             tasks = [
                 self._generate_questions(
                     course_id, t, count=DEFAULT_SEEDS_PER_TYPE,
                     kinds=("multiple_choice", "short_answer"),
                     variant_of=None,
+                    user_lang=user_lang,
                 ) for t in unseeded
             ]
-            await asyncio.gather(*tasks, return_exceptions=True)
+            seed_results = await asyncio.gather(*tasks, return_exceptions=True)
+            seeding_succeeded = any(isinstance(r, int) and r > 0 for r in seed_results)
             save_bank(course_id, bank)
 
         scored: list[tuple[float, dict, dict]] = []
         for t in candidates:
             for q in t.get("questions", []):
-                if q.get("archived") or question_mastered(q):
+                if q.get("archived"):
+                    continue
+                if not include_mastered and question_mastered(q):
                     continue
                 hist = q.get("history", []) or []
                 attempts = len(hist)
@@ -541,16 +745,35 @@ class ExamPrepSkill(Skill):
             picked.append({**q, "topic_id": t["id"], "topic_name": t["name"]})
             per_topic_seen[t["id"]] = per_topic_seen.get(t["id"], 0) + 1
 
+        # Decide the empty-result reason so the UI can show the right copy.
+        reason: str | None = None
+        if not picked:
+            if seeding_attempted and not seeding_succeeded:
+                reason = "generation_failed"
+            elif all(question_mastered(q) for t in candidates for q in t.get("questions", []) if not q.get("archived")):
+                reason = "all_mastered"
+            else:
+                reason = "no_questions"
+
         return SkillResult(success=True, data={
             "questions": picked,
             "total_available": len(scored),
             "topic_count": len(candidates),
+            "reason": reason,
             "view": self._compute_view(bank),
         })
 
     # ── Phase 3b: submit + self-evolution ──────────────────────────
 
-    async def submit_answers(self, course_id: str, params: dict) -> SkillResult:
+    async def submit_answers(
+        self, course_id: str, params: dict, user_lang: str | None,
+    ) -> SkillResult:
+        async with _lock_for(course_id):
+            return await self._submit_answers_locked(course_id, params, user_lang)
+
+    async def _submit_answers_locked(
+        self, course_id: str, params: dict, user_lang: str | None,
+    ) -> SkillResult:
         bank = load_bank(course_id)
         if not bank.get("topics"):
             return SkillResult(success=False, error="no_topics — call action=plan first")
@@ -569,9 +792,11 @@ class ExamPrepSkill(Skill):
         wrong_topic_ids: list[str] = []
         wrong_topic_seen: set[str] = set()
         graded: list[dict] = []
+        dropped_question_ids: list[str] = []  # L4: visibility into archive/stale qids
         for qid, user_ans in answers.items():
             q = q_by_id.get(qid)
             if q is None:
+                dropped_question_ids.append(qid)
                 continue
             t = topic_by_qid[qid]
             correct = check_answer(q, user_ans)
@@ -600,16 +825,20 @@ class ExamPrepSkill(Skill):
 
         budget = variant_budget(len(wrong_topic_ids))
         variants_added: dict[str, int] = {}
+        budget_capped = False  # L11: did per-topic cap (5) bite?
         if budget > 0:
+            # L6: rotate kinds across topics (not per-topic) so a single submit
+            # spans both multi-choice + short-answer variants rather than
+            # bursting one shape. Pre-fix: kinds chosen by len(questions) % 2
+            # at task-creation time → all variants in one submit share one
+            # kind, then next submit flips.
             tasks = []
             target_ids = []
-            for tid in wrong_topic_ids:
+            for idx, tid in enumerate(wrong_topic_ids):
                 topic = next((t for t in bank["topics"] if t["id"] == tid), None)
                 if topic is None:
                     continue
-                # Alternate kinds so variants don't all share the same shape.
-                kinds = (("multiple_choice",) if len(topic.get("questions", [])) % 2 == 0
-                         else ("short_answer",))
+                kinds = (("multiple_choice",) if idx % 2 == 0 else ("short_answer",))
                 source_q = next(
                     (q for q in reversed(topic.get("questions", []))
                      if q.get("history") and not q["history"][-1].get("correct")),
@@ -618,6 +847,7 @@ class ExamPrepSkill(Skill):
                 tasks.append(self._generate_questions(
                     course_id, topic, count=budget, kinds=kinds,
                     variant_of=(source_q or {}).get("id"),
+                    user_lang=user_lang,
                 ))
                 target_ids.append(tid)
             if tasks:
@@ -626,7 +856,15 @@ class ExamPrepSkill(Skill):
                     if isinstance(r, int) and r > 0:
                         variants_added[tid] = r
                     elif isinstance(r, Exception):
-                        logger.warning("variant gen failed for %s: %s", tid, r)
+                        # M1: type name only
+                        logger.warning(
+                            "variant gen failed for %s: %s",
+                            tid, type(r).__name__,
+                        )
+                # L11: did per-topic cap clip what was generated? (i.e. raw
+                # budget would have been higher if not capped at PER_TOPIC_CAP)
+                raw_per_topic = max(1, TOTAL_VARIANT_CAP // max(len(wrong_topic_ids), 1))
+                budget_capped = raw_per_topic > PER_TOPIC_VARIANT_CAP
 
         save_bank(course_id, bank)
         return SkillResult(success=True, data={
@@ -634,6 +872,8 @@ class ExamPrepSkill(Skill):
             "wrong_topic_count": len(wrong_topic_ids),
             "variant_budget_per_topic": budget,
             "variants_added": variants_added,
+            "budget_capped": budget_capped,
+            "dropped_question_ids": dropped_question_ids,
             "view": self._compute_view(bank),
         })
 
@@ -646,11 +886,14 @@ class ExamPrepSkill(Skill):
             "view": self._compute_view(bank),
         })
 
-    def reset(self, course_id: str) -> SkillResult:
-        path = _bank_path(course_id)
-        if path.exists():
-            path.unlink()
-        return SkillResult(success=True, data={"reset": True})
+    async def reset(self, course_id: str) -> SkillResult:
+        # Lock so we can't unlink mid-submit (which would crash the in-flight
+        # save_bank with a vanished parent dir).
+        async with _lock_for(course_id):
+            path = _bank_path(course_id)
+            if path.exists():
+                path.unlink()
+            return SkillResult(success=True, data={"reset": True})
 
     def _compute_view(self, bank: dict) -> dict:
         """Build the per-topic + overall mastery snapshot the UI renders.
@@ -666,14 +909,29 @@ class ExamPrepSkill(Skill):
         total_questions = 0
         total_attempts = 0
         total_correct = 0
+        total_unique_attempted = 0
         for t in bank.get("topics", []):
+            if t.get("archived_topic"):
+                # H4 archive bucket: ship as-is so the UI can render history,
+                # but exclude from mastery rollups.
+                topics_view.append({
+                    "id": t["id"], "name": t["name"], "weight": 0.0,
+                    "mastered_count": 0, "question_count": 0, "mastery_ratio": 0.0,
+                    "is_mastered": False, "attempt_count": 0,
+                    "correct_count": 0, "correct_rate": 0.0,
+                    "unique_attempted": 0, "is_archived": True,
+                })
+                continue
             m, total, ratio, is_mastered = topic_mastery(t)
             attempts = 0
             corrects = 0
+            unique_attempted = 0  # L7: separate count of questions touched ≥ 1
             for q in t.get("questions", []):
                 if q.get("archived"):
                     continue
                 hist = q.get("history") or []
+                if hist:
+                    unique_attempted += 1
                 attempts += len(hist)
                 corrects += sum(1 for h in hist if h.get("correct"))
             correct_rate = (corrects / attempts) if attempts else 0.0
@@ -688,11 +946,14 @@ class ExamPrepSkill(Skill):
                 "attempt_count": attempts,
                 "correct_count": corrects,
                 "correct_rate": correct_rate,
+                "unique_attempted": unique_attempted,
+                "is_archived": False,
             })
             total_mastered += m
             total_questions += total
             total_attempts += attempts
             total_correct += corrects
+            total_unique_attempted += unique_attempted
         topics_view.sort(key=lambda x: (-x["weight"], x["name"]))
         overall = total_mastered / total_questions if total_questions else 0.0
         overall_correct = (total_correct / total_attempts) if total_attempts else 0.0
@@ -702,8 +963,9 @@ class ExamPrepSkill(Skill):
             "total_questions": total_questions,
             "total_attempts": total_attempts,
             "total_correct": total_correct,
+            "total_unique_attempted": total_unique_attempted,
             "overall_ratio": overall,
             "overall_correct_rate": overall_correct,
-            "mastered_topics": sum(1 for tv in topics_view if tv["is_mastered"]),
-            "topic_count": len(topics_view),
+            "mastered_topics": sum(1 for tv in topics_view if tv.get("is_mastered")),
+            "topic_count": len([tv for tv in topics_view if not tv.get("is_archived")]),
         }

@@ -126,16 +126,52 @@ function DocumentTextBody({ doc, activePage, highlightedId, onCite, navEpoch }) 
 function DocumentPdfFrame({ courseId, docId, sourceFile, activePage, navEpoch }) {
   const url = API.sourceFileUrl(courseId, docId, { page: activePage });
   const iframeRef = useRefR(null);
-  // When the same citation is clicked twice in a row, `activePage` doesn't
-  // change → React skips the iframe re-render → the PDF viewer never
-  // re-jumps. We bump `navEpoch` on every dispatch and imperatively reassign
-  // `src` here so the browser re-navigates to `#page=N`. Setting src to the
-  // same value still triggers a fresh load in Chrome/Safari's PDFium
-  // (verified against macOS 14 Chrome 130) — slight flicker but the
-  // page-jump lands every time.
+  const lastUrlRef = useRefR(null);
+  // fix-all v1 M3: re-click on the same citation needs to re-jump the PDF,
+  // but a full `src = url` reassign forces PDFium to re-download + re-parse
+  // the entire file (200-2000ms + flicker). Strategy:
+  //   - First load: set `src` to load the PDF.
+  //   - Same path/query, different `#page=` hash (or repeat click): try
+  //     `contentWindow.location.hash = '#page=N'` which jumps without
+  //     reload. Falls back to full `src=url` reassign on cross-origin /
+  //     not-loaded-yet errors so behaviour stays correct even when the
+  //     fast path isn't available.
+  //   - Different URL path/query (different doc): always reload via src.
   useEffectR(() => {
     if (!iframeRef.current) return;
-    iframeRef.current.src = url;
+    const prev = lastUrlRef.current;
+    const splitUrl = (u) => {
+      try {
+        const idx = u.indexOf("#");
+        return idx < 0 ? [u, ""] : [u.slice(0, idx), u.slice(idx + 1)];
+      } catch { return [u, ""]; }
+    };
+    const [prevPath, prevHash] = prev ? splitUrl(prev) : [null, ""];
+    const [nextPath, nextHash] = splitUrl(url);
+    if (prev === null || prevPath !== nextPath) {
+      // Initial load or different doc: full src assign is correct.
+      iframeRef.current.src = url;
+    } else {
+      // Same doc, possibly same hash, possibly different — try hash-only
+      // navigation; on failure (cross-origin / PDFium quirk) fall back to
+      // full src reassign so we never lose the re-click guarantee.
+      let fastPathWorked = false;
+      try {
+        const win = iframeRef.current.contentWindow;
+        if (win && win.location) {
+          // Force hashchange even when hash is unchanged: clear then set.
+          if (nextHash) {
+            win.location.hash = "";
+            win.location.hash = "#" + nextHash;
+            fastPathWorked = true;
+          }
+        }
+      } catch { /* cross-origin or not loaded → fall through */ }
+      if (!fastPathWorked) {
+        iframeRef.current.src = url;
+      }
+    }
+    lastUrlRef.current = url;
   }, [navEpoch, url]);
   return (
     <iframe

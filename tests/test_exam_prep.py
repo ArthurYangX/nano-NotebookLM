@@ -8,6 +8,7 @@ load.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 
@@ -156,10 +157,29 @@ def test_load_bank_recovers_from_malformed_json(isolated_artifacts):
     assert bank["topics"] == []
 
 
-def test_load_bank_drops_version_mismatch(isolated_artifacts):
+def test_load_bank_future_version_raises_instead_of_wiping(isolated_artifacts):
+    """fix-all v1 H6: a bank written by a newer client must NOT be silently
+    overwritten when an older binary loads it. Pre-fix, any version mismatch
+    returned an empty bank and the next mutating action saved the empty
+    version=1 envelope on top → user data gone. Now we raise so the API
+    surfaces 502/409."""
+    from nano_notebooklm.skills.exam_prep import BankVersionTooNewError
+
     path = isolated_artifacts / "courses" / "c1" / "exam_bank.json"
     path.parent.mkdir(parents=True)
     path.write_text(json.dumps({"version": 99, "topics": [{"id": "old"}]}))
+    with pytest.raises(BankVersionTooNewError):
+        load_bank("c1")
+    # The file is untouched (we don't downgrade).
+    assert json.loads(path.read_text())["version"] == 99
+
+
+def test_load_bank_missing_version_returns_empty(isolated_artifacts):
+    """A bank without a `version` field (corrupt write?) falls back to empty
+    — recoverable, since this is most likely a pre-versioned dev file."""
+    path = isolated_artifacts / "courses" / "c1" / "exam_bank.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({"topics": [{"id": "old"}]}))
     bank = load_bank("c1")
     assert bank["topics"] == []
     assert bank["version"] == 1
@@ -519,6 +539,237 @@ async def test_unknown_action_returns_error(isolated_artifacts):
     res = await skill.execute({"action": "bogus", "course_id": "c1"})
     assert not res.success
     assert "unknown action" in res.error
+
+
+@pytest.mark.asyncio
+async def test_user_lang_threaded_into_system_prompt(isolated_artifacts):
+    """fix-all v1 H1: user_lang must reach the LLM system prompt via the
+    USER_LANG_BINDING addendum. The OLD bug was that user_lang lived on
+    `self._user_lang` and raced across concurrent requests on the singleton
+    skill. The fix is to thread it as a parameter; this test pins that the
+    parameter actually flows through to `complete_structured`'s system kwarg.
+    """
+    class _CapturingRouter:
+        def __init__(self):
+            self.calls = []
+        async def complete_structured(self, prompt, *, system="", task_type="", **kw):
+            self.calls.append({"system": system, "task_type": task_type})
+            return {"topics": [{"name": "T1", "weight": 0.5, "source_chunks": ["c0"]}]}
+
+    chunks = [_mk_chunk("c0", "content")]
+    router = _CapturingRouter()
+    skill = ExamPrepSkill(kb=_FakeKB(chunks), router=router)
+
+    res = await skill.execute({"action": "plan", "course_id": "c1", "user_lang": "zh"})
+    assert res.success
+    # The system kwarg must include the USER_LANG_BINDING zh text. The
+    # binding text starts with "User language preference: Reply ONLY in zh".
+    assert any("Reply ONLY in zh" in c["system"] for c in router.calls), \
+        f"zh binding missing from system prompts: {router.calls}"
+
+
+@pytest.mark.asyncio
+async def test_user_lang_does_not_leak_across_concurrent_requests(isolated_artifacts):
+    """fix-all v1 H1 regression: pre-fix, two concurrent calls on the same
+    singleton skill would race `self._user_lang`. We now pass it as a
+    method parameter so the captured system prompt MUST track the request's
+    own lang, regardless of interleaving.
+    """
+    class _SlowCapturingRouter:
+        def __init__(self):
+            self.calls = []
+            self.first_started = asyncio.Event()
+            self.allow_finish = asyncio.Event()
+        async def complete_structured(self, prompt, *, system="", task_type="", **kw):
+            self.calls.append({"system": system})
+            self.first_started.set()
+            await self.allow_finish.wait()
+            return {"topics": [{"name": "T1", "weight": 0.5, "source_chunks": ["c0"]}]}
+
+    chunks = [_mk_chunk("c0", "content")]
+    router = _SlowCapturingRouter()
+    skill = ExamPrepSkill(kb=_FakeKB(chunks), router=router)
+
+    # Fire request A (zh) — it'll await inside complete_structured.
+    task_a = asyncio.create_task(skill.execute({
+        "action": "plan", "course_id": "course_a", "user_lang": "zh",
+    }))
+    await router.first_started.wait()
+    # Now fire request B (en) on a different course so the lock doesn't
+    # serialise it. This is exactly the race that pre-fix corrupted
+    # self._user_lang.
+    router.first_started.clear()
+    task_b = asyncio.create_task(skill.execute({
+        "action": "plan", "course_id": "course_b", "user_lang": "en",
+    }))
+    await router.first_started.wait()
+    # Both stalled inside the LLM call. Let them complete.
+    router.allow_finish.set()
+    res_a, res_b = await asyncio.gather(task_a, task_b)
+    assert res_a.success and res_b.success
+    # The two captured systems must each carry their OWN binding.
+    assert len(router.calls) == 2
+    assert "Reply ONLY in zh" in router.calls[0]["system"]
+    assert "Reply ONLY in en" in router.calls[1]["system"]
+
+
+@pytest.mark.asyncio
+async def test_concurrent_submits_serialize_via_per_course_lock(isolated_artifacts):
+    """fix-all v1 H2: two concurrent submits on the same course MUST
+    serialise so neither's grading history is lost to last-writer-wins.
+    Pre-fix, both load_bank → mutate → save_bank with no lock → the later
+    save_bank overwrote the earlier's grading.
+    """
+    class _SlowRouter:
+        async def complete_structured(self, *a, **kw):
+            await asyncio.sleep(0)
+            return {"questions": []}
+
+    chunks = [_mk_chunk("c0", "content")]
+    skill = ExamPrepSkill(kb=_FakeKB(chunks), router=_SlowRouter())
+
+    bank = load_bank("c1")
+    bank["topics"] = [{
+        "id": "topic_a", "name": "A", "weight": 0.5, "source_chunks": [],
+        "questions": [
+            {"id": "q1", "type": "short_answer", "prompt": "p1", "answer": "alpha",
+             "history": [], "consecutive_correct": 0, "mastered": False, "archived": False},
+            {"id": "q2", "type": "short_answer", "prompt": "p2", "answer": "beta",
+             "history": [], "consecutive_correct": 0, "mastered": False, "archived": False},
+        ],
+    }]
+    save_bank("c1", bank)
+
+    # Two concurrent submits, each grading one different question.
+    t1 = skill.execute({"action": "submit", "course_id": "c1", "answers": {"q1": "alpha"}})
+    t2 = skill.execute({"action": "submit", "course_id": "c1", "answers": {"q2": "beta"}})
+    res1, res2 = await asyncio.gather(t1, t2)
+    assert res1.success and res2.success
+
+    # Both histories MUST land in the bank — neither submit's grading was
+    # overwritten by the other.
+    final = load_bank("c1")
+    qs = {q["id"]: q for q in final["topics"][0]["questions"]}
+    assert len(qs["q1"]["history"]) == 1, f"q1 grading lost: {qs['q1']['history']}"
+    assert len(qs["q2"]["history"]) == 1, f"q2 grading lost: {qs['q2']['history']}"
+
+
+@pytest.mark.asyncio
+async def test_re_extract_preserves_questions_by_normalized_name(isolated_artifacts):
+    """fix-all v1 H4: a force=True re-extract used to drop all questions
+    whose topic name shifted (even slightly). Now matching-by-normalized-name
+    carries the question history forward."""
+    chunks = [_mk_chunk("c0", "content")]
+    router = _FakeRouter([
+        {"topics": [{"name": "Backpropagation", "weight": 0.9, "source_chunks": ["c0"]}]},
+        # Second plan emits a normalized-equivalent name with trailing dot.
+        {"topics": [{"name": "Backpropagation.", "weight": 0.9, "source_chunks": ["c0"]}]},
+    ])
+    skill = ExamPrepSkill(kb=_FakeKB(chunks), router=router)
+
+    await skill.execute({"action": "plan", "course_id": "c1"})
+    bank = load_bank("c1")
+    bank["topics"][0]["questions"] = [{
+        "id": "q_preserved", "type": "short_answer", "prompt": "?", "answer": "x",
+        "history": [{"correct": True}, {"correct": True}], "consecutive_correct": 2,
+        "mastered": False, "archived": False,
+    }]
+    save_bank("c1", bank)
+
+    res = await skill.execute({"action": "plan", "course_id": "c1", "force": True})
+    assert res.success
+    final = load_bank("c1")
+    # Same topic count (no archive bucket added).
+    assert all(not t.get("archived_topic") for t in final["topics"])
+    # Questions carried forward into the new topic.
+    new_topic = final["topics"][0]
+    assert any(q["id"] == "q_preserved" for q in new_topic["questions"])
+    assert res.data["migrated_topic_count"] == 1
+    assert res.data["orphan_question_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_re_extract_archives_orphan_questions_when_name_drifts(isolated_artifacts):
+    """fix-all v1 H4: a name drift that DOESN'T normalize-match (different
+    word entirely) must archive the old questions into a `_archive_*` bucket
+    instead of silently dropping them."""
+    chunks = [_mk_chunk("c0", "content")]
+    router = _FakeRouter([
+        {"topics": [{"name": "OldName", "weight": 0.5, "source_chunks": ["c0"]}]},
+        {"topics": [{"name": "EntirelyDifferent", "weight": 0.5, "source_chunks": ["c0"]}]},
+    ])
+    skill = ExamPrepSkill(kb=_FakeKB(chunks), router=router)
+
+    await skill.execute({"action": "plan", "course_id": "c1"})
+    bank = load_bank("c1")
+    bank["topics"][0]["questions"] = [{
+        "id": "q_orphan", "type": "short_answer", "prompt": "?", "answer": "x",
+        "history": [{"correct": True}], "consecutive_correct": 1,
+        "mastered": False, "archived": False,
+    }]
+    save_bank("c1", bank)
+
+    res = await skill.execute({"action": "plan", "course_id": "c1", "force": True})
+    assert res.success
+    final = load_bank("c1")
+    archives = [t for t in final["topics"] if t.get("archived_topic")]
+    assert len(archives) == 1
+    assert any(q["id"] == "q_orphan" for q in archives[0]["questions"])
+    assert res.data["orphan_question_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_next_quiz_returns_reason_for_empty_result(isolated_artifacts):
+    """fix-all v1 M6: pre-fix, an LLM-generation-fail and an all-mastered
+    state both rendered as the same misleading "fully mastered" message.
+    Now the skill ships an explicit `reason` field."""
+    class _FailRouter:
+        async def complete_structured(self, *a, **kw):
+            raise RuntimeError("simulated LLM failure")
+
+    chunks = [_mk_chunk("c0", "content")]
+    skill = ExamPrepSkill(kb=_FakeKB(chunks), router=_FailRouter())
+    bank = load_bank("c1")
+    # One topic, NO questions yet, so next_quiz will try to seed (and fail).
+    bank["topics"] = [{
+        "id": "topic_a", "name": "A", "weight": 0.5,
+        "source_chunks": [{"chunk_id": "c0"}], "questions": [],
+    }]
+    save_bank("c1", bank)
+
+    res = await skill.execute({"action": "next_quiz", "course_id": "c1"})
+    assert res.success
+    assert res.data["questions"] == []
+    assert res.data["reason"] == "generation_failed"
+
+
+@pytest.mark.asyncio
+async def test_next_quiz_include_mastered_when_explicit_topic_ids(isolated_artifacts):
+    """fix-all v1 M7: explicit topic drill-down should re-include mastered
+    questions for review. Default sampling continues to exclude them."""
+    skill = ExamPrepSkill(kb=_FakeKB([]), router=_FakeRouter([]))
+    bank = load_bank("c1")
+    bank["topics"] = [{
+        "id": "topic_a", "name": "A", "weight": 0.5, "source_chunks": [],
+        "questions": [
+            {"id": "q_mastered", "type": "short_answer", "prompt": "p1", "answer": "a",
+             "history": [], "consecutive_correct": 3, "mastered": True, "archived": False},
+            {"id": "q_fresh", "type": "short_answer", "prompt": "p2", "answer": "b",
+             "history": [], "consecutive_correct": 0, "mastered": False, "archived": False},
+        ],
+    }]
+    save_bank("c1", bank)
+
+    default_res = await skill.execute({"action": "next_quiz", "course_id": "c1"})
+    default_qids = [q["id"] for q in default_res.data["questions"]]
+    assert "q_mastered" not in default_qids
+    assert "q_fresh" in default_qids
+
+    explicit_res = await skill.execute({
+        "action": "next_quiz", "course_id": "c1", "topic_ids": ["topic_a"],
+    })
+    explicit_qids = [q["id"] for q in explicit_res.data["questions"]]
+    assert "q_mastered" in explicit_qids
 
 
 @pytest.mark.asyncio

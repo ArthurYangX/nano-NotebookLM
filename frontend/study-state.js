@@ -769,7 +769,31 @@
     };
   }
 
+  // fix-all v1 H5: extract the same letter helper used by app.jsx's
+  // RealQuizView red/green frame renderer, so the Wrong-Only filter can
+  // compare apples-to-apples. Pre-fix the filter compared user-picked
+  // letter "B" to the LLM's full answer "B. text" → every answered
+  // question fell out as wrong.
+  function correctLetter(q) {
+    if (q && q.correct) return String(q.correct).trim();
+    if (q && typeof q.answer === "string") {
+      // Accept "A", "A.", "A)", "A text" — anything starting with a letter
+      // followed by EOS, punctuation, or whitespace.
+      const m = q.answer.trim().match(/^([A-Za-z])(?:$|[.\s)])/);
+      if (m) return m[1].toUpperCase();
+    }
+    return "";
+  }
+
   function normalizeCorrect(q) {
+    // For multi-choice questions, compare on the letter so user picks
+    // ("B") match against the LLM's free-form answer field ("B. text").
+    // For everything else (short_answer, calculation, missing-type), fall
+    // back to the prior behaviour so non-multi-choice quizzes still work.
+    if (q && q.type === "multiple_choice") {
+      const letter = correctLetter(q);
+      if (letter) return letter;
+    }
     return q.correct || q.answer || q.correct_answer || "";
   }
 
@@ -777,7 +801,14 @@
     return (quiz || []).filter((q, idx) => {
       const actual = answers[String(idx)] ?? answers[idx];
       if (actual == null || actual === "") return false;
-      return String(actual).trim() !== String(normalizeCorrect(q)).trim();
+      const expected = String(normalizeCorrect(q)).trim();
+      const got = String(actual).trim();
+      // For multi-choice, compare on letter so "B" vs "B. text" matches.
+      if (q && q.type === "multiple_choice") {
+        const userLetter = got.match(/^([A-Za-z])/);
+        return !userLetter || userLetter[1].toUpperCase() !== expected;
+      }
+      return got !== expected;
     });
   }
 
@@ -1279,6 +1310,8 @@
     saveQuizAnswers,
     loadQuizAnswers,
     filterWrongQuestions,
+    correctLetter,
+    normalizeCorrect,
     generateWeakAreaQuiz,
     formatMasteryState,
     createGenerationState,

@@ -468,6 +468,68 @@ def test_findTextRangeInRoot_injects_phantom_block_separator():
         "findTextRangeInRoot no longer routes through getBlockAwareDomText"
 
 
+def test_nav_epoch_threaded_into_pdf_frame_and_text_body():
+    """R5-2 + R5-2 fix-all v1: clicking the same citation twice in the
+    Reader used to no-op because `setActivePage(N)` with N unchanged is a
+    React state no-op → iframe.src and scrollIntoView never re-fire.
+
+    The fix bumps `navEpoch` on every `dispatchNavToReader` and the value
+    threads down to:
+      - DocumentTextBody's useEffect deps so scrollIntoView re-fires
+      - DocumentPdfFrame's useEffect so iframe re-navigates (hash-first,
+        src fallback after fix-all v1 M3)
+
+    Pin all three so a future refactor that drops the nonce can't silently
+    regress the re-click guarantee.
+    """
+    app_src = Path("frontend/app.jsx").read_text(encoding="utf-8")
+    reader_src = Path("frontend/reader.jsx").read_text(encoding="utf-8")
+    # 1. dispatchNavToReader must bump the epoch.
+    assert "setNavEpoch(e => e + 1)" in app_src, \
+        "dispatchNavToReader no longer bumps navEpoch — repeat citation clicks will silently no-op"
+    # 2. <Reader> must receive the prop.
+    assert "navEpoch={navEpoch}" in app_src, \
+        "<Reader> no longer receives navEpoch prop"
+    # 3. DocumentTextBody must include navEpoch in its scroll-effect deps.
+    text_body_match = re.search(
+        r"function DocumentTextBody\([\s\S]+?\}\, \[activePage, doc\.doc_id, navEpoch\]",
+        reader_src,
+    )
+    assert text_body_match, \
+        "DocumentTextBody scrollIntoView useEffect deps no longer include navEpoch"
+    # 4. DocumentPdfFrame must include navEpoch in its iframe-nav effect deps.
+    pdf_frame_match = re.search(
+        r"function DocumentPdfFrame\([\s\S]+?\}\, \[navEpoch, url\]",
+        reader_src,
+    )
+    assert pdf_frame_match, \
+        "DocumentPdfFrame iframe-nav useEffect deps no longer include navEpoch"
+
+
+def test_correct_letter_lives_in_study_state_not_app_jsx():
+    """fix-all v1 H5: correctLetter must live in study-state.js (not as a
+    local duplicate in app.jsx) so RealQuizView's render-time letter
+    extraction and study-state's Wrong-Only filter share one source of
+    truth. Pre-fix only the render path had it; the filter compared
+    user-picked 'B' to 'B. full text' → all-correct quizzes showed every
+    answered question as wrong."""
+    study_src = Path("frontend/study-state.js").read_text(encoding="utf-8")
+    app_src = Path("frontend/app.jsx").read_text(encoding="utf-8")
+    # Helper definition lives in study-state.js
+    assert "function correctLetter(q)" in study_src, \
+        "correctLetter helper missing from study-state.js"
+    # study-state.js exports it
+    assert "correctLetter," in study_src or "correctLetter\n" in study_src, \
+        "correctLetter not in study-state.js exports"
+    # app.jsx no longer defines its own copy — it aliases StudyState's.
+    assert "const correctLetter = StudyState.correctLetter" in app_src, \
+        "app.jsx no longer routes through StudyState.correctLetter"
+    # And no local function definition of correctLetter survives.
+    local_def = re.search(r"^function correctLetter\(", app_src, re.MULTILINE)
+    assert not local_def, \
+        "app.jsx still has a local correctLetter function — Wrong-Only filter will drift again"
+
+
 def test_ingest_validates_fallback_cid(secure_client, tmp_path):
     """When course_id is omitted and course_dir basename violates the
     pattern, /api/ingest must 400 — not write into artifacts/courses/<bad>/."""

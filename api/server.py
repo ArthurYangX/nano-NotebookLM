@@ -656,32 +656,52 @@ class ExamAnalysisRequest(BaseModel):
 class ExamPrepPlanRequest(BaseModel):
     model_config = {"extra": "forbid"}
     course_id: ReqCourseId
-    max_topics: int = Field(8, ge=3, le=15)
-    force: bool = False
-    user_lang: Literal["zh", "en"] | None = None
+    max_topics: int = Field(8, ge=3, le=15, description="Target number of exam topics to extract (3-15)")
+    force: bool = Field(False, description="If true, re-run LLM and merge with existing bank by normalized topic name (preserves question history for matching names; orphans go to an archive bucket).")
+    user_lang: Literal["zh", "en"] | None = Field(None, description="Reply language for generated topics + questions; None = follow source material.")
 
 
 class ExamPrepSeedRequest(BaseModel):
     model_config = {"extra": "forbid"}
     course_id: ReqCourseId
-    topic_ids: list[str] | None = None
-    seeds_per_type: int = Field(2, ge=1, le=5)
-    user_lang: Literal["zh", "en"] | None = None
+    topic_ids: list[str] | None = Field(None, description="Subset of topic ids to seed; None = all topics in the bank.", max_length=32)
+    seeds_per_type: int = Field(2, ge=1, le=5, description="Number of questions to generate per (topic × question type) pair.")
+    user_lang: Literal["zh", "en"] | None = Field(None, description="Reply language for generated questions.")
+
+    @field_validator("topic_ids")
+    @classmethod
+    def _bound_topic_ids(cls, v):
+        if v is None:
+            return v
+        for tid in v:
+            if not isinstance(tid, str) or len(tid) > 64:
+                raise ValueError("topic_id must be string ≤ 64 chars")
+        return v
 
 
 class ExamPrepNextQuizRequest(BaseModel):
     model_config = {"extra": "forbid"}
     course_id: ReqCourseId
-    size: int = Field(8, ge=1, le=20)
-    topic_ids: list[str] | None = None
-    user_lang: Literal["zh", "en"] | None = None
+    size: int = Field(8, ge=1, le=20, description="How many questions to sample for this quiz round (1-20).")
+    topic_ids: list[str] | None = Field(None, description="Restrict sampling to these topic ids; None = all non-mastered topics. Setting this also re-includes mastered questions within those topics for review.", max_length=32)
+    user_lang: Literal["zh", "en"] | None = Field(None, description="Reply language for any newly-seeded questions.")
+
+    @field_validator("topic_ids")
+    @classmethod
+    def _bound_topic_ids(cls, v):
+        if v is None:
+            return v
+        for tid in v:
+            if not isinstance(tid, str) or len(tid) > 64:
+                raise ValueError("topic_id must be string ≤ 64 chars")
+        return v
 
 
 class ExamPrepSubmitRequest(BaseModel):
     model_config = {"extra": "forbid"}
     course_id: ReqCourseId
-    answers: dict[str, str] = Field(default_factory=dict)
-    user_lang: Literal["zh", "en"] | None = None
+    answers: dict[str, str] = Field(default_factory=dict, description="Map of question_id → user answer (letter for multi-choice, free text for short answer). Capped at 50 entries per submit; question_id ≤ 64 chars, answer ≤ 2000 chars.")
+    user_lang: Literal["zh", "en"] | None = Field(None, description="Reply language for any wrong-topic variant generation triggered by this submit.")
 
     @field_validator("answers")
     @classmethod
@@ -1048,9 +1068,29 @@ async def analyze_exam(req: ExamAnalysisRequest):
 
 
 # ── Exam Prep — closed-loop exam preparation ──────────────────────────
-# Five thin wrappers around ExamPrepSkill's `action` dispatch. The skill
-# owns all persistence + LLM calls + self-evolution; the API layer just
-# validates inputs, threads the action, and logs sessions.
+# Six thin wrappers around ExamPrepSkill's `action` dispatch (4 POST +
+# GET/DELETE on /state/{course_id}). The skill owns all persistence +
+# LLM calls + self-evolution; the API layer just validates inputs, maps
+# typed skill errors to HTTP status codes, and logs sessions.
+
+
+def _exam_prep_status_for_error(error: str | None) -> int:
+    """Map skill error tokens to HTTP status. Most failures are upstream
+    (LLM timeout / malformed response) → 502; bank-version-too-new is a
+    state mismatch the operator can resolve → 409; absent topics indicates
+    a precondition the caller can fix → 400."""
+    if error == "bank_version_too_new":
+        return 409
+    if error and error.startswith("no_topics"):
+        return 400
+    return 502
+
+
+def _raise_exam_prep_error(result, default: str) -> None:
+    raise HTTPException(
+        status_code=_exam_prep_status_for_error(result.error),
+        detail=result.error or default,
+    )
 
 
 @app.post("/api/exam-prep/plan", tags=["exam-prep"], summary="Extract exam-relevant topics for a course")
@@ -1063,7 +1103,7 @@ async def exam_prep_plan(req: ExamPrepPlanRequest):
         "user_lang": req.user_lang,
     })
     if not result.success:
-        raise HTTPException(status_code=502, detail=result.error or "exam_prep_plan_failed")
+        _raise_exam_prep_error(result, "exam_prep_plan_failed")
     session_log.append(req.course_id, "generation", {"kind": "exam-prep-plan"})
     return result.data
 
@@ -1078,7 +1118,7 @@ async def exam_prep_seed(req: ExamPrepSeedRequest):
         "user_lang": req.user_lang,
     })
     if not result.success:
-        raise HTTPException(status_code=502, detail=result.error or "exam_prep_seed_failed")
+        _raise_exam_prep_error(result, "exam_prep_seed_failed")
     return result.data
 
 
@@ -1092,7 +1132,7 @@ async def exam_prep_next_quiz(req: ExamPrepNextQuizRequest):
         "user_lang": req.user_lang,
     })
     if not result.success:
-        raise HTTPException(status_code=502, detail=result.error or "exam_prep_quiz_failed")
+        _raise_exam_prep_error(result, "exam_prep_quiz_failed")
     return result.data
 
 
@@ -1105,34 +1145,55 @@ async def exam_prep_submit(req: ExamPrepSubmitRequest):
         "user_lang": req.user_lang,
     })
     if not result.success:
-        raise HTTPException(status_code=502, detail=result.error or "exam_prep_submit_failed")
+        _raise_exam_prep_error(result, "exam_prep_submit_failed")
     session_log.append(req.course_id, "generation", {
         "kind": "exam-prep-submit",
         "wrong_topic_count": result.data.get("wrong_topic_count", 0),
         "variants_added": sum(result.data.get("variants_added", {}).values()),
+        # fix-all v1 L11: did per-topic cap clip variant gen? (operators want
+        # to know how often users hit the 5/topic ceiling for tuning).
+        "budget_capped": result.data.get("budget_capped", False),
+        "dropped_question_ids_count": len(result.data.get("dropped_question_ids") or []),
     })
     return result.data
 
 
-@app.get("/api/exam-prep/{course_id}", tags=["exam-prep"], summary="Inspect the current bank + mastery view")
+# fix-all v1 M8: reserve the POST verb names so a GET typo for
+# /api/exam-prep/plan (etc.) can't fall through to {course_id} and silently
+# create a course literally named "plan". The check runs after the standard
+# course-id validation so traversal attacks still 400 first.
+_EXAM_PREP_RESERVED_PATH_NAMES = {"plan", "seed", "quiz", "state"}
+
+
+def _validate_exam_prep_course_id(value: str) -> str:
+    value = _validate_course_id_path(value)
+    if value in _EXAM_PREP_RESERVED_PATH_NAMES:
+        raise HTTPException(
+            400,
+            f"course_id '{value}' is a reserved path segment in this router",
+        )
+    return value
+
+
+@app.get("/api/exam-prep/state/{course_id}", tags=["exam-prep"], summary="Inspect the current bank + mastery view")
 async def exam_prep_view(course_id: str):
-    course_id = _validate_course_id_path(course_id)
+    course_id = _validate_exam_prep_course_id(course_id)
     result = await orchestrator.run_skill("exam_prep", {
         "action": "view", "course_id": course_id,
     })
     if not result.success:
-        raise HTTPException(status_code=502, detail=result.error or "exam_prep_view_failed")
+        _raise_exam_prep_error(result, "exam_prep_view_failed")
     return result.data
 
 
-@app.delete("/api/exam-prep/{course_id}", tags=["exam-prep"], summary="Wipe the exam bank for a course")
+@app.delete("/api/exam-prep/state/{course_id}", tags=["exam-prep"], summary="Wipe the exam bank for a course")
 async def exam_prep_reset(course_id: str):
-    course_id = _validate_course_id_path(course_id)
+    course_id = _validate_exam_prep_course_id(course_id)
     result = await orchestrator.run_skill("exam_prep", {
         "action": "reset", "course_id": course_id,
     })
     if not result.success:
-        raise HTTPException(status_code=502, detail=result.error or "exam_prep_reset_failed")
+        _raise_exam_prep_error(result, "exam_prep_reset_failed")
     return result.data
 
 

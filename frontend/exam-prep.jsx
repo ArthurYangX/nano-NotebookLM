@@ -60,66 +60,107 @@ function ExamPrep({ activeCourse, userLang }) {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeCourse]);
 
+  // fix-all v1 M10: snapshot the active course at the moment a request
+  // fires; if it changes mid-flight (user clicked a different course),
+  // discard the result so we don't render B's data against C's selection.
   const refresh = useEPCallback(async () => {
     if (!activeCourse) return;
+    const myActive = activeCourse;
     startBusy("Loading exam bank…"); setError("");
     try {
-      const data = await API.examPrepView(activeCourse);
+      const data = await API.examPrepView(myActive);
+      if (myActive !== activeCourse) return;
       setBankView(data.view || null);
     } catch (e) {
+      if (myActive !== activeCourse) return;
       setError(e.message || "Failed to load exam bank");
+    } finally {
+      if (myActive === activeCourse) stopBusy();
     }
-    stopBusy();
   }, [activeCourse]);
 
+  // fix-all v1 L9: refuse to launch a second concurrent action while one
+  // is in flight. Pre-fix, a double-click on Submit/Re-extract could fire
+  // two requests, doubling LLM cost AND racing H2's per-course lock.
+  function busy() { return loading; }
+
   async function handlePlan(force = false) {
+    if (busy()) return;
+    const myActive = activeCourse;
     startBusy("Extracting exam topics from course materials…"); setError("");
     try {
-      const data = await API.examPrepPlan(activeCourse, { force, userLang });
+      const data = await API.examPrepPlan(myActive, { force, userLang });
+      if (myActive !== activeCourse) return;
       setBankView(data.view || null);
+      // H4: surface what was preserved / archived after a re-extract.
+      if (force && (data.orphan_question_count || data.migrated_topic_count)) {
+        setError(
+          `Re-extract complete · ${data.migrated_topic_count || 0} topic(s) carried questions forward · ${data.orphan_question_count || 0} orphan questions archived (visible in a "[archive] ..." topic).`
+        );
+      }
     } catch (e) {
+      if (myActive !== activeCourse) return;
       setError(e.message || "Topic extraction failed");
+    } finally {
+      if (myActive === activeCourse) stopBusy();
     }
-    stopBusy();
   }
 
   async function startQuiz(topicId = null) {
+    if (busy()) return;
+    const myActive = activeCourse;
     startBusy("Sampling questions from the bank…"); setError(""); setAnswers({}); setGraded(null);
     try {
-      const data = await API.examPrepNextQuiz(activeCourse, {
+      const data = await API.examPrepNextQuiz(myActive, {
         size: 8,
         topicIds: topicId ? [topicId] : null,
         userLang,
       });
+      if (myActive !== activeCourse) return;
       if (!data.questions || data.questions.length === 0) {
-        setError("No questions available — this topic may already be fully mastered.");
-        stopBusy();
+        // M6: surface the distinct reason so the user knows whether to retry
+        // (generation_failed), shrug it off (all_mastered), or check ingest.
+        const reason = data.reason || "no_questions";
+        if (reason === "generation_failed") {
+          setError("Question generation failed for this topic. Please retry — the LLM may have timed out or returned malformed JSON.");
+        } else if (reason === "all_mastered") {
+          setError("All questions in scope are already mastered. Try re-extracting topics or pick a different topic.");
+        } else {
+          setError("No questions available — try seeding this topic or check the course KB has content.");
+        }
         return;
       }
       setQuizQuestions(data.questions);
       setQuizScope(topicId);
       setView("quiz");
     } catch (e) {
+      if (myActive !== activeCourse) return;
       setError(e.message || "Failed to start quiz");
+    } finally {
+      if (myActive === activeCourse) stopBusy();
     }
-    stopBusy();
   }
 
   async function handleSubmit() {
+    if (busy()) return;
     if (Object.keys(answers).length === 0) {
       setError("Please answer at least one question before submitting.");
       return;
     }
+    const myActive = activeCourse;
     startBusy("Grading + generating fresh variants for any wrong topics…"); setError("");
     try {
-      const data = await API.examPrepSubmit(activeCourse, answers, { userLang });
+      const data = await API.examPrepSubmit(myActive, answers, { userLang });
+      if (myActive !== activeCourse) return;
       setGraded(data);
       setBankView(data.view || bankView);
       setView("result");
     } catch (e) {
+      if (myActive !== activeCourse) return;
       setError(e.message || "Submit failed");
+    } finally {
+      if (myActive === activeCourse) stopBusy();
     }
-    stopBusy();
   }
 
   async function handleReset() {
@@ -172,7 +213,21 @@ function ExamPrep({ activeCourse, userLang }) {
         </div>
         <div className="exam-prep-actions">
           {hasTopics && view !== "quiz" && (
-            <button className="btn ghost" onClick={() => handlePlan(true)} disabled={loading}>
+            <button
+              className="btn ghost"
+              onClick={() => {
+                // fix-all v1 H4: re-extract may rename topics → name-drift
+                // would have dropped questions; we now preserve by normalized
+                // name and archive orphans, but the LLM cost + UX disruption
+                // still warrants a confirm.
+                const ok = window.confirm(
+                  "Re-extract exam topics? Existing questions are preserved for any topic whose name matches the new extraction (normalized). Topics whose names changed will have their questions moved to an archive bucket you can still see. Continue?"
+                );
+                if (ok) handlePlan(true);
+              }}
+              disabled={loading}
+              title="Run topic extraction again. Mastery history for renamed topics moves to an archive."
+            >
               Re-extract topics
             </button>
           )}
@@ -248,6 +303,8 @@ function ExamPrep({ activeCourse, userLang }) {
 }
 
 function ExamPrepTopics({ bankView, onStartMixed, onStartTopic }) {
+  const liveTopics = (bankView.topics || []).filter(t => !t.is_archived);
+  const archivedTopics = (bankView.topics || []).filter(t => t.is_archived);
   return (
     <div className="exam-prep-topics">
       <div className="exam-prep-cta-row">
@@ -256,7 +313,7 @@ function ExamPrepTopics({ bankView, onStartMixed, onStartTopic }) {
         </button>
       </div>
       <div className="topic-grid">
-        {(bankView.topics || []).map(t => {
+        {liveTopics.map(t => {
           const pct = Math.round((t.mastery_ratio || 0) * 100);
           return (
             <div key={t.id} className={"topic-card" + (t.is_mastered ? " mastered" : "")}>
@@ -284,15 +341,19 @@ function ExamPrepTopics({ bankView, onStartMixed, onStartTopic }) {
               <button
                 className="btn ghost topic-quiz-btn"
                 onClick={() => onStartTopic(t.id)}
-                disabled={t.is_mastered}
-                title={t.is_mastered ? "All questions here are mastered" : `Start quiz on ${t.name}`}
+                title={t.is_mastered ? "Re-quiz this topic (already mastered)" : `Start quiz on ${t.name}`}
               >
-                {t.is_mastered ? "Mastered" : "Quiz on this topic →"}
+                {t.is_mastered ? "Review mastered →" : "Quiz on this topic →"}
               </button>
             </div>
           );
         })}
       </div>
+      {archivedTopics.length > 0 && (
+        <div className="topic-archive-note">
+          <strong>Archive</strong> · {archivedTopics.length} bucket(s) of orphan questions from previous re-extracts (not sampled for new quizzes).
+        </div>
+      )}
     </div>
   );
 }
