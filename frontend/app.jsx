@@ -1620,6 +1620,72 @@ function RealNotesView({ content, streaming, activeCourse, onContentChange, gene
     return () => scroller.removeEventListener("scroll", onScroll);
   }, [draft, editing, tocItems]);
 
+  // Notes scroll cache: when the user navigates Notes → Reader → back to
+  // Notes (via citation chip click + tab switch), RealNotesView remounts
+  // and the browser resets `notes-reader-body` scrollTop to 0 — losing
+  // the user's place in a 30-section study note. Two effects:
+  //   1. Persist scrollTop on scroll (throttled via rAF). Keyed per
+  //      activeCourse so a course switch doesn't restore a stranger's
+  //      offset.
+  //   2. Restore scrollTop on mount, after the layout + KaTeX render
+  //      settle. rAF×2 gives one full paint cycle; math-heavy notes may
+  //      still land slightly off because KaTeX auto-render is async
+  //      throttled at 200ms, but that's a survivable jitter.
+  // Cleared when streaming flips back on (regeneration about to replace
+  // content), so the next mount restores 0 instead of an offset into the
+  // old document.
+  React.useEffect(() => {
+    if (!activeCourse) return;
+    if (editing) return;
+    if (streaming) return;
+    const scroller = previewRef.current && previewRef.current.closest(".notes-reader-body");
+    if (!scroller) return;
+    let cancelled = false;
+    let pendingRaf2 = 0;
+    const raf1 = requestAnimationFrame(() => {
+      if (cancelled) return;
+      pendingRaf2 = requestAnimationFrame(() => {
+        if (cancelled) return;
+        const saved = StudyState.loadNotesScroll(localStorage, activeCourse);
+        if (saved != null && scroller.scrollHeight > 0) {
+          scroller.scrollTop = Math.min(saved, scroller.scrollHeight);
+        }
+      });
+    });
+    return () => {
+      cancelled = true;
+      cancelAnimationFrame(raf1);
+      if (pendingRaf2) cancelAnimationFrame(pendingRaf2);
+    };
+  }, [activeCourse, editing, streaming]);
+
+  React.useEffect(() => {
+    if (!activeCourse) return;
+    if (editing) return;
+    const scroller = previewRef.current && previewRef.current.closest(".notes-reader-body");
+    if (!scroller) return;
+    let ticking = false;
+    function onScroll() {
+      if (ticking) return;
+      ticking = true;
+      requestAnimationFrame(() => {
+        ticking = false;
+        StudyState.saveNotesScroll(localStorage, activeCourse, scroller.scrollTop);
+      });
+    }
+    scroller.addEventListener("scroll", onScroll, { passive: true });
+    return () => scroller.removeEventListener("scroll", onScroll);
+  }, [activeCourse, editing]);
+
+  // Regeneration kicks off → drop the saved offset so the freshly
+  // streaming notes mount at top, not at the previous document's
+  // halfway-down position.
+  React.useEffect(() => {
+    if (streaming && activeCourse) {
+      StudyState.clearNotesScroll(localStorage, activeCourse);
+    }
+  }, [streaming, activeCourse]);
+
   function updateDraft(value) {
     setDraft(value);
     if (activeCourse) StudyState.saveNoteDraft(localStorage, activeCourse, value);

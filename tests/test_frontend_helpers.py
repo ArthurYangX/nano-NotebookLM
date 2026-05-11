@@ -685,6 +685,49 @@ def test_checked_source_files_legacy_title_fallback():
     assert run_node(script).strip() == "ok"
 
 
+def test_notes_scroll_roundtrip():
+    """Notes scroll-position cache: per-course localStorage roundtrip,
+    integer coercion, garbage-input rejection, and clear."""
+    script = textwrap.dedent(
+        """
+        const h = require('./frontend/study-state.js');
+        const s = h.createMemoryStorage();
+
+        // No saved value → null.
+        if (h.loadNotesScroll(s, 'CS182') !== null) throw new Error('expected null default');
+        if (h.loadNotesScroll(s, null) !== null) throw new Error('null course should be null');
+
+        // Save + load round-trips, integer-coerced.
+        if (!h.saveNotesScroll(s, 'CS182', 1234.7)) throw new Error('save failed');
+        if (h.loadNotesScroll(s, 'CS182') !== 1235) throw new Error('round failed: ' + h.loadNotesScroll(s, 'CS182'));
+
+        // Per-course isolation.
+        h.saveNotesScroll(s, 'CS285', 50);
+        if (h.loadNotesScroll(s, 'CS182') !== 1235) throw new Error('CS182 clobbered: ' + h.loadNotesScroll(s, 'CS182'));
+        if (h.loadNotesScroll(s, 'CS285') !== 50) throw new Error('CS285 read failed');
+
+        // Negative / NaN / null rejected.
+        if (h.saveNotesScroll(s, 'CS182', -5)) throw new Error('negative should reject');
+        if (h.saveNotesScroll(s, 'CS182', NaN)) throw new Error('NaN should reject');
+        if (h.saveNotesScroll(s, null, 100)) throw new Error('null course should reject');
+        // Original value preserved after rejected saves.
+        if (h.loadNotesScroll(s, 'CS182') !== 1235) throw new Error('rejected save corrupted value');
+
+        // Corrupt storage value → null.
+        s.setItem('nano-nlm:v1:CS182:notes-scroll-y', 'not-a-number');
+        if (h.loadNotesScroll(s, 'CS182') !== null) throw new Error('corrupt value should be null');
+
+        // clearNotesScroll wipes it.
+        h.saveNotesScroll(s, 'CS182', 999);
+        if (!h.clearNotesScroll(s, 'CS182')) throw new Error('clear failed');
+        if (h.loadNotesScroll(s, 'CS182') !== null) throw new Error('cleared value should be null');
+
+        console.log('ok');
+        """
+    )
+    assert run_node(script).strip() == "ok"
+
+
 def test_hidden_courses_roundtrip():
     """Hidden-course set persists in localStorage and toggles atomically."""
     script = textwrap.dedent(

@@ -1042,6 +1042,41 @@
     catch (e) { return false; }
   }
 
+  // ── Notes scroll-position cache (per-course) ────────────────────────
+  // Preserves the user's scroll spot in the Notes preview across tab
+  // switches (Notes → Reader → back to Notes). Per-course so a switch to
+  // a different course doesn't restore a wrong-document offset. Cleared
+  // when content is about to be replaced (regeneration → streaming=true).
+  function _notesScrollKey(courseId) {
+    return `${PREFIX}:${courseId}:notes-scroll-y`;
+  }
+
+  function loadNotesScroll(storage, courseId) {
+    if (!courseId) return null;
+    try {
+      const raw = storage.getItem(_notesScrollKey(courseId));
+      if (raw == null) return null;
+      const n = Number(raw);
+      return Number.isFinite(n) && n >= 0 ? n : null;
+    } catch (e) { return null; }
+  }
+
+  function saveNotesScroll(storage, courseId, scrollY) {
+    if (!courseId) return false;
+    const n = Number(scrollY);
+    if (!Number.isFinite(n) || n < 0) return false;
+    try {
+      storage.setItem(_notesScrollKey(courseId), String(Math.round(n)));
+      return true;
+    } catch (e) { return false; }
+  }
+
+  function clearNotesScroll(storage, courseId) {
+    if (!courseId) return false;
+    try { storage.removeItem(_notesScrollKey(courseId)); return true; }
+    catch (e) { return false; }
+  }
+
   return {
     createMemoryStorage,
     createSkillEntries,
@@ -1095,5 +1130,8 @@
     filterVisibleCourses,
     clearHiddenCourses,
     HIDDEN_COURSES_KEY,
+    loadNotesScroll,
+    saveNotesScroll,
+    clearNotesScroll,
   };
 });
