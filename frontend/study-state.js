@@ -108,7 +108,7 @@
   //     depth × RADIUS_PER_DEPTH
   //   - assigns one HSL hue per depth=1 topic, inherited by descendants,
   //     so the color tells the student which topic a leaf belongs to
-  function prepareMindmap(kg, options) {
+  function prepareMindmapTree(kg, options) {
     const opts = options || {};
     const nodesIn = Array.isArray(kg && kg.nodes) ? kg.nodes : flattenTree(kg);
     const edgesIn = Array.isArray(kg && kg.edges) ? kg.edges : treeEdges(kg);
@@ -276,6 +276,74 @@
       .filter(edge => nodeIds.has(edge.source) && nodeIds.has(edge.target))
       .map(edge => Object.assign(edge, { style: relationStyle[edge.relation] || relationStyle.related }));
     return { empty: false, nodes, edges, rootId };
+  }
+
+  // Back-compat alias for M1/M2/M3 tests and any older component code.
+  function prepareMindmap(kg, options) {
+    return prepareMindmapTree(kg, options);
+  }
+
+  // R4-3: node-link KG layout input for a force-directed view. This helper
+  // intentionally does not run the force simulation; it returns a stable
+  // node/link shape with deterministic initial positions so React can hand it
+  // to d3.forceSimulation asynchronously without blocking large graphs.
+  function prepareMindmapForce(kg, options) {
+    const rawEdges = Array.isArray(kg && kg.edges) ? kg.edges : treeEdges(kg);
+    function normalizeRelation(rel) {
+      const value = String(rel || "related").trim().replace(/_/g, "-") || "related";
+      return value;
+    }
+    const hierarchySeed = Object.assign({}, kg || {}, {
+      edges: rawEdges.filter(edge => normalizeRelation(edge.relation || edge.relation_type) === "part-of"),
+    });
+    const tree = prepareMindmapTree(hierarchySeed, options);
+    if (tree.empty) {
+      return Object.assign({}, tree, { links: [], relationTypes: [] });
+    }
+    const nodeIds = new Set((tree.nodes || []).map(n => n.id));
+    const relationTypes = [];
+    const seenRelations = new Set();
+    const partOfParent = new Map();
+    const links = rawEdges.map((edge, idx) => {
+      const source = String(edge.source || edge.from || "");
+      const target = String(edge.target || edge.to || "");
+      const relation = normalizeRelation(edge.relation || edge.relation_type);
+      if (!source || !target || !nodeIds.has(source) || !nodeIds.has(target)) return null;
+      if (relation === "part-of" && !partOfParent.has(source)) {
+        partOfParent.set(source, target);
+      }
+      if (!seenRelations.has(relation)) {
+        seenRelations.add(relation);
+        relationTypes.push(relation);
+      }
+      return {
+        id: `${source}->${target}:${relation}:${idx}`,
+        source,
+        target,
+        from: source,
+        to: target,
+        relation,
+        style: edge.style || {},
+      };
+    }).filter(Boolean);
+    const nodes = (tree.nodes || []).map((node, idx) => {
+      const jitter = idx === 0 ? 0 : ((idx * 37) % 17) - 8;
+      return Object.assign({}, node, {
+        parent: partOfParent.get(node.id) || null,
+        x: Number.isFinite(Number(node.x)) ? Number(node.x) + jitter : jitter,
+        y: Number.isFinite(Number(node.y)) ? Number(node.y) - jitter : -jitter,
+        vx: 0,
+        vy: 0,
+      });
+    });
+    return {
+      empty: false,
+      nodes,
+      links,
+      edges: links,
+      rootId: tree.rootId,
+      relationTypes,
+    };
   }
 
   function flattenTree(root) {
@@ -812,6 +880,8 @@
     getCheckedSourceFiles,
     resolveCitationNavigation,
     prepareMindmap,
+    prepareMindmapTree,
+    prepareMindmapForce,
     getMindmapNodeDetail,
     applyMindmapOps,
     newMindmapNodeId,

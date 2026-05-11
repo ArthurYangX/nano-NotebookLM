@@ -1,4 +1,4 @@
-/* global React, MINDMAP, StudyState, API */
+/* global React, MINDMAP, StudyState, API, d3 */
 const { useMemo: useMemoM, useState: useStateM, useRef: useRefM, useEffect: useEffectM } = React;
 
 // M2 (2026-05-06): the dead-code radial layout that lived here pre-M2 has
@@ -13,6 +13,10 @@ const { useMemo: useMemoM, useState: useStateM, useRef: useRefM, useEffect: useE
 // Edits persist to artifacts/courses/<cid>/mindmap_edits.json on the server
 // via /api/mindmap/<cid>/edit, and replay on every GET so re-extraction
 // doesn't clobber student work.
+//
+// R4-3 (2026-05-10): the same KG payload now renders as a force-directed
+// node-link graph with relation labels and relation filters. The edit and
+// deep-dive affordances remain on the same DOM nodes.
 
 function MindMap({ data, layout, courseId, highlightedId, onNodeClick, onSourceClick, onPractice, onDataChange }) {
   const [pan, setPan] = useStateM({ x: 0, y: 0 });
@@ -48,38 +52,143 @@ function MindMap({ data, layout, courseId, highlightedId, onNodeClick, onSourceC
 
   const graphData = data || MINDMAP;
   const prepared = useMemoM(
-    () => StudyState.prepareMindmap(graphData, { layout }),
+    () => StudyState.prepareMindmapForce(graphData, { layout }),
     [graphData, layout],
   );
+  const preparedTree = useMemoM(
+    () => StudyState.prepareMindmapTree(graphData, { layout }),
+    [graphData, layout],
+  );
+  const [simNodes, setSimNodes] = useStateM([]);
+  const simRef = useRefM(null);
   const { nodes, edges } = prepared.empty
     ? { nodes: [], edges: [] }
-    : { nodes: prepared.nodes, edges: prepared.edges };
+    : { nodes: (simNodes.length ? simNodes : prepared.nodes), edges: prepared.links || prepared.edges || [] };
   const selected = highlightedId
-    ? StudyState.getMindmapNodeDetail(prepared, highlightedId)
+    ? StudyState.getMindmapNodeDetail(preparedTree, highlightedId)
     : null;
 
-  const visibleIds = useMemoM(() => {
-    const vis = new Set();
-    function walk(id) {
-      vis.add(id);
-      if (collapsed.has(id)) return;
-      nodes.filter(n => n.parent === id).forEach(n => walk(n.id));
+  const relationTypes = prepared.relationTypes || [];
+  const [enabledRelations, setEnabledRelations] = useStateM(() => new Set(relationTypes));
+  useEffectM(() => {
+    setEnabledRelations(new Set(relationTypes));
+  }, [relationTypes.join("|")]);
+
+  useEffectM(() => {
+    if (prepared.empty || !(prepared.nodes || []).length) {
+      setSimNodes([]);
+      if (simRef.current) simRef.current.stop();
+      return;
     }
-    const rootId = prepared.rootId
-      || nodes.find(n => n.depth === 0)?.id
-      || graphData.id;
-    if (rootId) walk(rootId);
-    if (vis.size <= 1 && nodes.length > vis.size) nodes.forEach(n => vis.add(n.id));
+    const forceNodes = (prepared.nodes || []).map(n => Object.assign({}, n));
+    const forceLinks = (prepared.links || []).map(l => Object.assign({}, l));
+    if (simRef.current) simRef.current.stop();
+    const forceApi = (typeof d3 !== "undefined" && d3.forceSimulation) ? d3 : null;
+    if (!forceApi) {
+      // CDN fallback: keep initial node-link positions usable. The primary
+      // path above still runs through d3.forceSimulation when d3 is loaded.
+      setSimNodes(forceNodes);
+      return;
+    }
+    let sim;
+    try {
+      sim = forceApi.forceSimulation(forceNodes)
+        .force("link", forceApi.forceLink(forceLinks).id(d => d.id).distance(d => {
+          const rel = String(d.relation || "");
+          if (rel === "part-of") return 135;
+          if (rel === "depends-on" || rel === "prerequisite-of") return 180;
+          return 155;
+        }).strength(d => String(d.relation || "") === "part-of" ? 0.72 : 0.36))
+        .force("charge", forceApi.forceManyBody().strength(-420))
+        .force("collide", forceApi.forceCollide().radius(d => d.kind === "root" ? 112 : d.kind === "branch" ? 78 : 54).iterations(2))
+        .force("center", forceApi.forceCenter(0, 0))
+        .force("x", forceApi.forceX(0).strength(0.035))
+        .force("y", forceApi.forceY(0).strength(0.035))
+        .alpha(0.9)
+        .alphaDecay(forceNodes.length > 100 ? 0.08 : 0.045)
+        .on("tick", () => {
+          setSimNodes(forceNodes.map(n => Object.assign({}, n)));
+        });
+    } catch (err) {
+      if (typeof console !== "undefined") console.warn("d3 force layout unavailable:", err);
+      setSimNodes(forceNodes);
+      return;
+    }
+    simRef.current = sim;
+    return () => sim.stop();
+  }, [prepared.rootId, (prepared.nodes || []).map(n => n.id).join("|"), (prepared.links || []).map(l => l.id || `${l.source}->${l.target}:${l.relation}`).join("|")]);
+
+  const visibleIds = useMemoM(() => {
+    const vis = new Set(nodes.map(n => n.id));
+    function walk(id) {
+      if (collapsed.has(id)) return;
+      nodes.filter(n => n.parent === id).forEach(n => {
+        vis.add(n.id);
+        walk(n.id);
+      });
+    }
+    collapsed.forEach(id => {
+      nodes.filter(n => n.parent === id).forEach(child => {
+        function hideDescendants(nid) {
+          vis.delete(nid);
+          nodes.filter(n => n.parent === nid).forEach(n => hideDescendants(n.id));
+        }
+        hideDescendants(child.id);
+      });
+    });
+    nodes.filter(n => collapsed.has(n.id)).forEach(n => vis.add(n.id));
+    nodes.filter(n => !n.parent).forEach(n => walk(n.id));
     return vis;
-  }, [nodes, collapsed, prepared.rootId, graphData.id]);
+  }, [nodes, collapsed]);
 
   const visNodes = nodes.filter(n => visibleIds.has(n.id));
-  const visEdges = edges.filter(e => visibleIds.has(e.from || e.source) && visibleIds.has(e.to || e.target));
+  const visEdges = edges.filter(e => {
+    const sourceId = edgeNodeId(e.source || e.from);
+    const targetId = edgeNodeId(e.target || e.to);
+    return visibleIds.has(sourceId) && visibleIds.has(targetId)
+      && enabledRelations.has(String(e.relation || "related").replace(/_/g, "-"));
+  });
+  const allRelationsFiltered = edges.length > 0 && visEdges.length === 0;
+
+  function edgeNodeId(value) {
+    if (value && typeof value === "object") return String(value.id || value.concept_id || "");
+    return String(value || "");
+  }
+
+  function nodeById(id) {
+    return nodes.find(n => n.id === id);
+  }
 
   // resolved position including user offset
   function posOf(n) {
     const o = offsets[n.id];
-    return { x: n.x + (o?.dx || 0), y: n.y + (o?.dy || 0) };
+    return {
+      x: Number(n.x || 0) + (o?.dx || 0),
+      y: Number(n.y || 0) + (o?.dy || 0),
+    };
+  }
+
+  function relationClass(rel) {
+    const normalized = String(rel || "related").replace(/_/g, "-");
+    if (normalized === "part-of") return "kg-edge-part-of";
+    if (normalized === "prerequisite-of") return "kg-edge-prereq";
+    if (normalized === "depends-on") return "kg-edge-depends";
+    return "kg-edge-related";
+  }
+
+  function relationLabel(rel) {
+    const normalized = String(rel || "related").replace(/_/g, "-");
+    if (normalized === "prerequisite-of") return "prereq";
+    return normalized;
+  }
+
+  function setRelationEnabled(rel, checked) {
+    setEnabledRelations(prev => {
+      const next = new Set(prev);
+      if (checked) next.add(rel);
+      else next.delete(rel);
+      return next;
+    });
   }
 
   function toggleCollapse(id) {
@@ -245,6 +354,14 @@ function MindMap({ data, layout, courseId, highlightedId, onNodeClick, onSourceC
         const dx = (e.clientX - d.sx) / zoom;
         const dy = (e.clientY - d.sy) / zoom;
         setOffsets(prev => ({ ...prev, [d.id]: { dx: d.ox + dx, dy: d.oy + dy } }));
+        if (simRef.current) {
+          const simNode = simRef.current.nodes().find(n => n.id === d.id);
+          if (simNode) {
+            simNode.fx = d.baseX + dx;
+            simNode.fy = d.baseY + dy;
+            simRef.current.alphaTarget(0.2).restart();
+          }
+        }
       } else if (d.kind === "connect") {
         // Track cursor in graph-space coordinates.
         const dx = (e.clientX - d.sx) / zoom;
@@ -260,6 +377,15 @@ function MindMap({ data, layout, courseId, highlightedId, onNodeClick, onSourceC
         // treat as click
         setSelectedId(d.id);
         onNodeClick && onNodeClick(d.id);
+      } else if (d.kind === "node") {
+        if (simRef.current) {
+          const simNode = simRef.current.nodes().find(n => n.id === d.id);
+          if (simNode) {
+            simNode.fx = null;
+            simNode.fy = null;
+          }
+          simRef.current.alphaTarget(0);
+        }
       } else if (d.kind === "connect") {
         // Hit-test: did we drop over another node?
         const targetEl = document.elementFromPoint(e.clientX, e.clientY);
@@ -361,14 +487,15 @@ function MindMap({ data, layout, courseId, highlightedId, onNodeClick, onSourceC
     if (e.shiftKey) {
       const node = nodes.find(n => n.id === id);
       if (!node) return;
+      const p = posOf(node);
       dragRef.current = {
         kind: "connect", id,
         sx: e.clientX, sy: e.clientY,
-        x0: node.x + (offsets[id]?.dx || 0),
-        y0: node.y + (offsets[id]?.dy || 0),
+        x0: p.x,
+        y0: p.y,
         moved: false,
       };
-      setConnectDrag({ fromId: id, x: node.x, y: node.y });
+      setConnectDrag({ fromId: id, x: p.x, y: p.y });
       return;
     }
     const existing = offsets[id] || { dx: 0, dy: 0 };
@@ -377,6 +504,8 @@ function MindMap({ data, layout, courseId, highlightedId, onNodeClick, onSourceC
       id,
       sx: e.clientX, sy: e.clientY,
       ox: existing.dx, oy: existing.dy,
+      baseX: Number(nodes.find(n => n.id === id)?.x || 0),
+      baseY: Number(nodes.find(n => n.id === id)?.y || 0),
       moved: false,
     };
   }
@@ -409,7 +538,6 @@ function MindMap({ data, layout, courseId, highlightedId, onNodeClick, onSourceC
   }
 
   const isDraggingSomething = !!dragRef.current;
-  const rootNode = visNodes.find(n => n.kind === "root");
 
   return (
     <div className="mindmap-wrap"
@@ -424,6 +552,23 @@ function MindMap({ data, layout, courseId, highlightedId, onNodeClick, onSourceC
           onClick={() => { setZoom(1); setPan({x:0,y:0}); setCollapsed(new Set()); setOffsets({}); }}>⟲</button>
         <div className="sep"></div>
         <span style={{fontFamily:"var(--mono)",fontSize:10,color:"var(--ink-3)",padding:"0 6px",alignSelf:"center"}}>{Math.round(zoom*100)}%</span>
+        {relationTypes.length > 0 && (
+          <>
+            <div className="sep"></div>
+            <div className="kg-relation-filter" role="group" aria-label="Relation filters">
+              {relationTypes.map(rel => (
+                <label key={rel} className={"kg-filter-chip " + relationClass(rel)}>
+                  <input
+                    type="checkbox"
+                    checked={enabledRelations.has(rel)}
+                    onChange={(e) => setRelationEnabled(rel, e.target.checked)}
+                  />
+                  <span>{relationLabel(rel)}</span>
+                </label>
+              ))}
+            </div>
+          </>
+        )}
         {syncError && (
           <>
             <div className="sep"></div>
@@ -465,31 +610,57 @@ function MindMap({ data, layout, courseId, highlightedId, onNodeClick, onSourceC
           height="1800"
           style={{ left: -1200, top: -900 }}
         >
+          <defs>
+            <marker id="kg-arrow-prereq" viewBox="0 0 10 10" refX="8" refY="5"
+                    markerWidth="5" markerHeight="5" orient="auto-start-reverse">
+              <path d="M 0 0 L 10 5 L 0 10 z" className="kg-marker-prereq" />
+            </marker>
+            <marker id="kg-arrow-depends" viewBox="0 0 10 10" refX="8" refY="5"
+                    markerWidth="5" markerHeight="5" orient="auto-start-reverse">
+              <path d="M 0 0 L 10 5 L 0 10 z" className="kg-marker-depends" />
+            </marker>
+            <marker id="kg-arrow-related" viewBox="0 0 10 10" refX="8" refY="5"
+                    markerWidth="4" markerHeight="4" orient="auto-start-reverse">
+              <path d="M 0 0 L 10 5 L 0 10 z" className="kg-marker-related" />
+            </marker>
+          </defs>
           {visEdges.map((e, i) => {
-            const a = nodes.find(n => n.id === (e.from || e.source));
-            const b = nodes.find(n => n.id === (e.to || e.target));
+            const sourceId = edgeNodeId(e.source || e.from);
+            const targetId = edgeNodeId(e.target || e.to);
+            const a = nodeById(sourceId);
+            const b = nodeById(targetId);
             if (!a || !b) return null;
             const ap = posOf(a), bp = posOf(b);
             const ax = ap.x + 1200, ay = ap.y + 900;
             const bx = bp.x + 1200, by = bp.y + 900;
             const mx = (ax + bx) / 2;
+            const my = (ay + by) / 2;
             const isHot = highlightedId === b.id || highlightedId === a.id;
-            // Color edges by the child's hue so the topic-wedge reads visually.
-            const childHue = (b.kind === "branch" ? b : a).style?.hue;
-            const stroke = isHot
-              ? "var(--accent)"
-              : childHue != null
-                ? `hsl(${childHue} 40% 65%)`
-                : "var(--rule-strong)";
+            const rel = String(e.relation || "related").replace(/_/g, "-");
+            const cls = relationClass(rel);
+            const label = relationLabel(rel);
+            const marker = rel === "depends-on"
+              ? "url(#kg-arrow-depends)"
+              : rel === "prerequisite-of"
+                ? "url(#kg-arrow-prereq)"
+                : rel === "part-of" ? "" : "url(#kg-arrow-related)";
             return (
-              <path
-                key={i}
-                d={`M ${ax} ${ay} C ${mx} ${ay}, ${mx} ${by}, ${bx} ${by}`}
-                stroke={stroke}
-                strokeWidth={isHot ? 1.5 : 1}
-                strokeDasharray={e.style?.dash || ""}
-                fill="none"
-              />
+              <g key={e.id || i} className={`kg-edge-group ${cls}${isHot ? " hot" : ""}`}>
+                <path
+                  d={`M ${ax} ${ay} C ${mx} ${ay}, ${mx} ${by}, ${bx} ${by}`}
+                  markerEnd={marker}
+                  fill="none"
+                />
+                <text
+                  className="kg-edge-label"
+                  x={mx}
+                  y={my - 5}
+                  textAnchor="middle"
+                  dominantBaseline="central"
+                >
+                  {label}
+                </text>
+              </g>
             );
           })}
           {/* M3 connect-drag preview */}
@@ -612,10 +783,17 @@ function MindMap({ data, layout, courseId, highlightedId, onNodeClick, onSourceC
         })}
       </div>
 
+      {allRelationsFiltered && (
+        <div className="kg-filter-empty" role="status">
+          已过滤所有关系 · isolated nodes remain
+        </div>
+      )}
+
       <div className="mindmap-legend">
         <div className="row"><div className="sw" style={{ background: "var(--ink)", borderColor: "var(--ink)" }}></div>Course root</div>
         <div className="row"><div className="sw" style={{ background: "var(--accent-soft)", borderColor: "var(--accent)" }}></div>Topic · {visNodes.filter(n => n.kind === "branch").length}</div>
         <div className="row"><div className="sw" style={{ background: "var(--paper)", borderColor: "var(--rule-strong)" }}></div>Concept · {visNodes.filter(n => n.kind === "leaf").length}</div>
+        <div className="row"><div className="sw" style={{ background: "transparent", borderColor: "var(--rule-strong)" }}></div>Relations · {visEdges.length}/{edges.length}</div>
         <div className="row" style={{ marginTop: 4, paddingTop: 4, borderTop: "1px dashed var(--rule)" }}>
           <span style={{fontSize: 10, lineHeight: 1.4}}>
             click select · dblclick edit · <b>N</b> add child · <b>Del</b> delete · <b>shift+drag</b> connect · <b>alt+click</b> deep dive

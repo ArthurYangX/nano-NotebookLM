@@ -2627,3 +2627,101 @@ mark.hl-flash { animation: hl-flash 0.9s ease-out; }
   color: var(--accent-ink);
   letter-spacing: 0.04em;
 }
+
+/* ── R4-3: force-directed KG relation styling ── */
+.kg-edge-group path {
+  stroke: var(--rule-strong);
+  stroke-width: 1.1;
+  stroke-linecap: round;
+  opacity: 0.72;
+}
+.kg-edge-group.hot path {
+  stroke: var(--accent);
+  stroke-width: 1.8;
+  opacity: 1;
+}
+.kg-edge-part-of path {
+  stroke: var(--rule-strong);
+}
+.kg-edge-prereq path {
+  stroke: var(--amber);
+  stroke-width: 1.6;
+}
+.kg-edge-depends path {
+  stroke: var(--accent);
+  stroke-dasharray: 5 4;
+}
+.kg-edge-related path {
+  stroke: var(--ink-4);
+  stroke-width: 0.9;
+}
+.kg-edge-label {
+  fill: var(--ink-3);
+  stroke: var(--paper);
+  stroke-width: 3px;
+  paint-order: stroke;
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 0;
+  pointer-events: none;
+}
+.kg-edge-group.hot .kg-edge-label {
+  fill: var(--accent-ink);
+}
+.kg-marker-prereq { fill: var(--amber); }
+.kg-marker-depends { fill: var(--accent); }
+.kg-marker-related { fill: var(--ink-4); }
+
+.kg-relation-filter {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px;
+  max-width: 520px;
+}
+.kg-filter-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border: 1px solid var(--rule);
+  background: var(--paper-2);
+  color: var(--ink-3);
+  border-radius: 4px;
+  padding: 2px 6px;
+  font-family: var(--mono);
+  font-size: 10px;
+  line-height: 1.2;
+  cursor: pointer;
+  user-select: none;
+}
+.kg-filter-chip input {
+  width: 11px;
+  height: 11px;
+  margin: 0;
+  accent-color: var(--accent);
+}
+.kg-filter-chip.kg-edge-prereq {
+  border-color: var(--amber);
+  color: oklch(0.42 0.08 70);
+}
+.kg-filter-chip.kg-edge-depends {
+  border-color: var(--accent);
+  color: var(--accent-ink);
+}
+.kg-filter-chip.kg-edge-related {
+  border-color: var(--ink-4);
+}
+.kg-filter-empty {
+  position: absolute;
+  left: 16px;
+  top: 64px;
+  z-index: 5;
+  background: var(--paper);
+  border: 1px solid var(--amber);
+  color: oklch(0.42 0.08 70);
+  border-radius: var(--radius);
+  padding: 7px 10px;
+  font-family: var(--mono);
+  font-size: 11px;
+  box-shadow: var(--shadow);
+}
