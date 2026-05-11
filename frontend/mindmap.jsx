@@ -413,7 +413,11 @@ function MindMap({ data, layout, courseId, highlightedId, onNodeClick, onSourceC
     const node = nodes.find(n => n.id === id);
     if (!node) return;
     if (node.kind === "root") {
-      window.alert("Cannot delete the course root.");
+      // R5-1: any chapter root (depth=0) is protected, not just the
+      // primary one. The server-side overlay endpoint also refuses
+      // `delete_node` on `concept_type=="root"` so this is a UX-only
+      // guard — F13 invariant holds on the backend regardless.
+      window.alert("Cannot delete a chapter root.");
       return;
     }
     const childCount = nodes.filter(n => n.parent === id).length;
@@ -1053,7 +1057,7 @@ function MindMap({ data, layout, courseId, highlightedId, onNodeClick, onSourceC
             onClick={toggleLegend}
             aria-label="隐藏图例"
           >×</button>
-          <div className="row"><div className="sw" style={{ background: "var(--ink)", borderColor: "var(--ink)" }}></div>Course root</div>
+          <div className="row"><div className="sw" style={{ background: "var(--ink)", borderColor: "var(--ink)" }}></div>Chapter · {visNodes.filter(n => n.kind === "root").length}</div>
           <div className="row"><div className="sw" style={{ background: "var(--accent-soft)", borderColor: "var(--accent)" }}></div>Topic · {visNodes.filter(n => n.kind === "branch").length}</div>
           <div className="row"><div className="sw" style={{ background: "var(--paper)", borderColor: "var(--rule-strong)" }}></div>Concept · {visNodes.filter(n => n.kind === "leaf").length}</div>
           <div className="row"><div className="sw" style={{ background: "transparent", borderColor: "var(--rule-strong)" }}></div>Relations · {visEdges.length}/{edges.length}</div>

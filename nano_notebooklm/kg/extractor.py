@@ -1,24 +1,35 @@
 """LLM-based concept and relation extraction from text chunks.
 
-M1 (2026-05-06): two-stage extraction.
+R5-1 (2026-05-11): chapter roots. The course no longer has a single
+`course_overview` root — each uploaded source file becomes its own root
+(`concept_type="root"`, depth=0) so the student's mental model "one
+chapter = one root" matches the visual graph. Stage A runs per file
+(bounded by an `asyncio.Semaphore(3)` so a 20-file upload doesn't
+fan out 20 simultaneous LLM calls); Stage B's chunk-level extraction
+uses that file's topics as the parent_topic vocabulary.
 
   Stage A — `extract_course_overview_and_topics`
-    One LLM call sees a corpus-wide sample (file list + chunk heads) and
-    returns 5-9 macro topics + a one-line course overview. Topics become
-    depth=1 Concept nodes (concept_type="topic").
+    One LLM call sees a single file's chunk heads and returns 3-5 macro
+    topics + a one-line chapter overview. Topics become depth=1 Concept
+    nodes (concept_type="topic"); topic_id encodes both the course slug
+    and the file slug so two chapters with a same-named topic don't
+    collide in the merger.
 
   Stage B — `extract_concepts_from_chunk`
-    Per-chunk LLM call, fed the Stage A topics. Each extracted concept
-    declares which topic it belongs to via `parent_topic` (the topic's
-    concept_id, resolved client-side). Concepts that don't fit any topic
-    get parent_topic=None and are later mounted under the course root.
+    Per-chunk LLM call, fed the chunk's chapter topics. Each extracted
+    concept declares which topic it belongs to via `parent_topic` (the
+    topic's concept_id, resolved client-side from a per-file name map).
+    Concepts that don't fit any topic get parent_topic=None and are
+    later mounted under that file's chapter root.
 
   Orchestration — `extract_from_chunks`
-    Stage A → Stage B (parallel, batched) → synthesize an explicit course
-    root Concept (depth=0) plus part-of relations leaf→topic and
-    topic→root. If Stage A fails or yields no topics the function falls
-    back to legacy single-stage extraction so the user still gets *some*
-    KG instead of an empty payload.
+    Group chunks by source_file → per-file Stage A (parallel, capped) →
+    per-file Stage B (parallel batches) → synthesize one root per file
+    with part-of edges leaf→topic→chapter_root. If a file's Stage A
+    fails its chapter root still gets created with an empty overview;
+    its leaves attach as orphans. If every file's Stage A fails the
+    function falls back to legacy single-stage extraction (no roots,
+    no topics) so the user still gets *something*.
 """
 
 from __future__ import annotations
@@ -53,6 +64,12 @@ _TOPIC_MIN = 5
 _TOPIC_MAX = 9
 _STAGE_A_TIMEOUT_SECONDS = 15.0  # F3: hard ceiling so a hung codex call
                                   # can't block /api/mindmap indefinitely
+_STAGE_A_PARALLELISM = 3  # R5-1: per-file Stage A concurrency cap so a
+                          # 20-file upload doesn't fan out 20 codex
+                          # requests at once. Stage A is the only LLM
+                          # call per chapter and is small (one prompt,
+                          # ≤30 chunk heads), so 3-way concurrency keeps
+                          # latency reasonable without flooding upstream.
 _TOPIC_NAME_MAX = 80     # F9: cap topic name to bound prompt-injection
 _TOPIC_DEF_MAX = 300     # F9: cap topic definition for the same reason
 _TOPIC_BAD_CHARS = ("\n", "\r", "\t", "`")  # F9: strip control / fence chars
@@ -329,16 +346,21 @@ async def extract_from_chunks(
     progress_callback=None,
     embed_fn: Callable[[list[str]], Any] | None = None,
 ) -> tuple[list[Concept], list[Relation]]:
-    """Two-stage extraction.
+    """Two-stage extraction, chapter-rooted (R5-1).
 
-    Stage A: macro topics from a corpus-wide sample (one LLM call).
-    Stage B: per-chunk concept extraction with the Stage A topics in
-             context. Concepts attach to topics; topics attach to a
-             synthesized course root (depth=0).
+    Group chunks by source_file. For each file: Stage A (chapter overview
+    + 3-5 macro topics, one LLM call, run in parallel across files with
+    a small concurrency cap) → Stage B (per-chunk concept extraction
+    using that file's topics, batched). Synthesize one root per file
+    with concept_type="root" / depth=0, and wire part-of edges
+    leaf→topic→chapter_root + cross-topic depends-on within each file.
 
-    If Stage A fails or yields no topics, falls back to legacy single-stage
-    extraction (no root, no topics, just per-chunk concepts) so we don't
-    regress Round 1 behavior on this code path.
+    If every file's Stage A fails or yields no topics, falls back to
+    legacy single-stage extraction (no roots, no topics, just per-chunk
+    concepts) so we don't regress on a fully-degraded LLM. A partial
+    failure (some files succeed, some fail) still produces chapter
+    roots for the successful files; the failed files get a root with
+    empty overview and all their leaves attach as orphans.
 
     R4-2: ``progress_callback`` (optional) is called as
     ``progress_callback(stage, percent)`` where ``stage`` is one of
@@ -362,56 +384,99 @@ async def extract_from_chunks(
         return [], []
 
     sampled = chunks if len(chunks) <= max_chunks else random.sample(chunks, max_chunks)
-    source_files = sorted({c.source_file for c in chunks if c.source_file})
 
-    # Stage A
+    # R5-1: group chunks by source_file. Chunks without a source_file get
+    # bucketed under "(unknown)" so they still get a chapter root rather
+    # than disappearing — this only happens on legacy / malformed ingest.
+    chunks_by_file: dict[str, list[Chunk]] = {}
+    for c in sampled:
+        key = c.source_file or "(unknown)"
+        chunks_by_file.setdefault(key, []).append(c)
+    files_ordered: list[str] = sorted(chunks_by_file.keys())
+
+    # ── Stage A per file (parallel, semaphore-capped) ──────────────────
     _emit(KG_STAGE_A, 0)
-    overview, topics, prereq_edges = await extract_course_overview_and_topics(
-        course_id=course_name,
-        course_name=course_name,
-        source_files=source_files,
-        sample_chunks=sampled,
-        router=router,
+    sem = asyncio.Semaphore(_STAGE_A_PARALLELISM)
+
+    async def _stage_a_for_file(filename: str) -> tuple[str, list[Concept], list[tuple[str, str]]]:
+        async with sem:
+            # course_id passed here encodes both course slug AND file slug so
+            # topic_ids become `topic_{course}__{file}_{topic}`. Two chapters
+            # with a same-named topic stay distinct in the merger.
+            scoped_course_id = f"{course_name}__{_slug(filename)}"
+            return await extract_course_overview_and_topics(
+                course_id=scoped_course_id,
+                course_name=filename,
+                source_files=[filename],
+                sample_chunks=chunks_by_file[filename],
+                router=router,
+            )
+
+    stage_a_results = await asyncio.gather(
+        *[_stage_a_for_file(f) for f in files_ordered],
+        return_exceptions=True,
     )
     _emit(KG_STAGE_A, 100)
 
-    # R3-3: assign topological learning_order to topics. Empty prereq_edges
-    # → leave learning_order=None on every topic so the frontend doesn't
-    # draw badges; mirrors legacy fixtures and the no-prerequisite fallback.
-    if topics and prereq_edges:
-        from nano_notebooklm.kg.graph import topo_sort_topics
-        ordered = topo_sort_topics(
-            [t.concept_id for t in topics],
-            prereq_edges,
-            weights={t.concept_id: t.weight for t in topics},
-        )
-        position = {tid: i + 1 for i, tid in enumerate(ordered)}
-        for t in topics:
-            t.learning_order = position.get(t.concept_id)
+    per_file_overview: dict[str, str] = {}
+    per_file_topics: dict[str, list[Concept]] = {}
+    per_file_prereq: dict[str, list[tuple[str, str]]] = {}
+    for filename, result in zip(files_ordered, stage_a_results):
+        if isinstance(result, Exception):
+            logger.warning("Stage A failed for chapter %r: %s", filename, result)
+            per_file_overview[filename] = ""
+            per_file_topics[filename] = []
+            per_file_prereq[filename] = []
+            continue
+        overview, topics, prereq = result
+        per_file_overview[filename] = overview
+        per_file_topics[filename] = topics
+        per_file_prereq[filename] = prereq
 
-    # Stage B in batches of 5 — same concurrency profile as before.
+    # R3-3 carried over: assign learning_order per chapter from that
+    # chapter's prereq edges. Empty prereq → all topics keep learning_order
+    # =None so the frontend doesn't draw a badge.
+    from nano_notebooklm.kg.graph import topo_sort_topics
+    for filename in files_ordered:
+        topics = per_file_topics[filename]
+        prereq = per_file_prereq[filename]
+        if topics and prereq:
+            ordered = topo_sort_topics(
+                [t.concept_id for t in topics],
+                prereq,
+                weights={t.concept_id: t.weight for t in topics},
+            )
+            position = {tid: i + 1 for i, tid in enumerate(ordered)}
+            for t in topics:
+                t.learning_order = position.get(t.concept_id)
+
+    # ── Stage B per file (batched, deterministic file order) ───────────
     _emit(KG_STAGE_B, 0)
     batch_size = 5
     all_concepts: list[Concept] = []
     all_relations: list[Relation] = []
+    done = 0
 
-    for i in range(0, len(sampled), batch_size):
-        batch = sampled[i:i + batch_size]
-        tasks = [
-            extract_concepts_from_chunk(c, course_name, router, topics=topics)
-            for c in batch
-        ]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        for result in results:
-            if isinstance(result, Exception):
-                logger.warning(f"Batch extraction error: {result}")
-                continue
-            concepts, relations = result
-            all_concepts.extend(concepts)
-            all_relations.extend(relations)
-        done = min(i + batch_size, len(sampled))
-        pct = max(1, min(99, int(100 * done / max(1, len(sampled)))))
-        _emit(KG_STAGE_B, pct)
+    for filename in files_ordered:
+        file_chunks = chunks_by_file[filename]
+        file_topics = per_file_topics[filename]
+        for i in range(0, len(file_chunks), batch_size):
+            batch = file_chunks[i:i + batch_size]
+            tasks = [
+                extract_concepts_from_chunk(c, course_name, router, topics=file_topics)
+                for c in batch
+            ]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for result in results:
+                if isinstance(result, Exception):
+                    logger.warning(f"Batch extraction error: {result}")
+                    continue
+                concepts, relations = result
+                all_concepts.extend(concepts)
+                all_relations.extend(relations)
+            done += len(batch)
+            pct = max(1, min(99, int(100 * done / max(1, len(sampled)))))
+            _emit(KG_STAGE_B, pct)
     _emit(KG_STAGE_B, 100)
 
     # R4-4: cache concept_embedding on every non-root concept so graph_search
@@ -426,7 +491,8 @@ async def extract_from_chunks(
     # (sentence-transformer forward or HTTP /embeddings) and was running on
     # the event loop, stalling R4-2's NDJSON queue-drain for 300–1000 ms.
     # Off-load to a worker thread so other concurrent requests keep moving.
-    targets: list[Concept] = [*topics, *all_concepts]
+    all_topics_flat: list[Concept] = [t for f in files_ordered for t in per_file_topics[f]]
+    targets: list[Concept] = [*all_topics_flat, *all_concepts]
     if embed_fn is not None and targets:
         try:
             texts = [_concept_embed_text(c) for c in targets]
@@ -441,74 +507,100 @@ async def extract_from_chunks(
                 len(targets), exc_info=True,
             )
 
-    if not topics:
-        # Fallback path — Stage A produced nothing. Return per-chunk
-        # concepts only, exactly like the pre-M1 implementation, so the
-        # frontend still gets something. F20: bumped to warning so a
+    if not all_topics_flat:
+        # Fallback path — every file's Stage A produced nothing. Return
+        # per-chunk concepts only, exactly like the pre-M1 implementation,
+        # so the frontend still gets something. F20: bumped to warning so a
         # degraded mindmap is visible in operator triage.
         logger.warning(
-            "Stage A empty for %s; returning %d single-stage concepts "
-            "(no course root, no macro topics — investigate LLM output)",
-            course_name, len(all_concepts),
+            "Stage A empty across all %d files for %s; returning %d single-stage "
+            "concepts (no chapter roots, no macro topics — investigate LLM output)",
+            len(files_ordered), course_name, len(all_concepts),
         )
         return all_concepts, all_relations
 
-    # Stage A succeeded → synthesize root + topic-edges.
-    root_id = f"root_{course_name}"
-    doc_count = len(source_files)
-    root_label = course_name if not doc_count else f"{course_name} · {doc_count} docs"
-    root = Concept(
-        concept_id=root_id,
-        name=root_label,
-        definition=overview,
-        concept_type="root",
-        course_ids=[course_name],
-        chunk_ids=[],
-        depth=0,
-        weight=10.0,
-        source_chunks=[],
-        parent_topic=None,
-    )
-
-    # topic → root (part-of)
-    topic_edges = [
-        Relation(source=t.concept_id, target=root_id, relation_type="part-of")
-        for t in topics
-    ]
-
-    # R3-3: pedagogical precedence as depends-on edges between topics
-    # (later topic depends on earlier topic). The mindmap reuses
-    # `depends-on` styling from M1 so no new relation type is needed.
-    prereq_relations = [
-        Relation(source=dst, target=src, relation_type="depends-on")
-        for src, dst in prereq_edges
-    ]
-
-    # leaf → topic (part-of); skip leaves with parent_topic=None (they
-    # become orphans under root via a synthesized edge instead)
+    # ── Synthesize one root per file + wire edges ──────────────────────
+    roots: list[Concept] = []
+    topic_to_root_edges: list[Relation] = []
     leaf_edges: list[Relation] = []
     orphan_edges: list[Relation] = []
+    prereq_relations: list[Relation] = []
+
+    # Map topic_id → its chapter root id (lookup for parent_topic resolution)
+    topic_id_to_root: dict[str, str] = {}
+    # Map source_file → root id (lookup for orphan attachment)
+    filename_to_root: dict[str, str] = {}
+
+    for filename in files_ordered:
+        topics = per_file_topics[filename]
+        # Even files where Stage A failed get a root — so their leaves
+        # still have somewhere to land (and so the student sees all
+        # their chapters in the graph even if topic extraction sputtered).
+        if not topics and not chunks_by_file.get(filename):
+            continue
+        root_id = f"root_{course_name}__{_slug(filename)}"
+        # Strip directory prefixes from the display label so it reads as
+        # a chapter title; the underlying source_chunks still carry the
+        # full path for citation routing.
+        display_label = filename.rsplit("/", 1)[-1] or filename
+        root = Concept(
+            concept_id=root_id,
+            name=display_label,
+            definition=per_file_overview.get(filename, ""),
+            concept_type="root",
+            course_ids=[course_name],
+            chunk_ids=[],
+            depth=0,
+            weight=10.0,
+            source_chunks=[],
+            parent_topic=None,
+        )
+        roots.append(root)
+        filename_to_root[filename] = root_id
+
+        for t in topics:
+            topic_to_root_edges.append(Relation(
+                source=t.concept_id, target=root_id, relation_type="part-of",
+            ))
+            topic_id_to_root[t.concept_id] = root_id
+
+        for src_topic, dst_topic in per_file_prereq.get(filename, []):
+            prereq_relations.append(Relation(
+                source=dst_topic, target=src_topic, relation_type="depends-on",
+            ))
+
+    # Wire leaves: prefer the LLM-declared parent_topic (per-file scoped);
+    # if it's missing/unknown, fall back to the leaf's own source_file root.
     for c in all_concepts:
-        if c.parent_topic:
+        if c.parent_topic and c.parent_topic in topic_id_to_root:
             leaf_edges.append(Relation(
                 source=c.concept_id, target=c.parent_topic, relation_type="part-of",
             ))
-        else:
+            continue
+        leaf_file = None
+        if c.source_chunks:
+            leaf_file = c.source_chunks[0].get("source_file") or None
+        target_root = filename_to_root.get(leaf_file or "")
+        if not target_root and roots:
+            # Last-ditch: pick the first root rather than dropping the leaf.
+            target_root = roots[0].concept_id
+        if target_root:
             orphan_edges.append(Relation(
-                source=c.concept_id, target=root_id, relation_type="part-of",
+                source=c.concept_id, target=target_root, relation_type="part-of",
             ))
 
     logger.info(
-        "Two-stage extracted: 1 root + %d topics + %d concepts (%d orphans), "
-        "%d edges from %d chunks",
-        len(topics), len(all_concepts), len(orphan_edges),
-        len(topic_edges) + len(leaf_edges) + len(orphan_edges) + len(all_relations),
-        len(sampled),
+        "Chapter-rooted extraction: %d roots + %d topics + %d concepts (%d orphans), "
+        "%d edges from %d chunks across %d files",
+        len(roots), len(all_topics_flat), len(all_concepts), len(orphan_edges),
+        len(topic_to_root_edges) + len(leaf_edges) + len(orphan_edges)
+            + len(all_relations) + len(prereq_relations),
+        len(sampled), len(files_ordered),
     )
 
     return (
-        [root] + topics + all_concepts,
-        topic_edges + leaf_edges + orphan_edges + prereq_relations + all_relations,
+        roots + all_topics_flat + all_concepts,
+        topic_to_root_edges + leaf_edges + orphan_edges + prereq_relations + all_relations,
     )
 
 

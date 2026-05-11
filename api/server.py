@@ -2866,6 +2866,14 @@ def _kg_to_mindmap(kg_data: dict, course_id: str) -> dict:
     "in-degree=0" heuristic routinely picked orphan leaves as roots and
     is dropped here. Legacy KG files (Round 1, no explicit root) still
     work via the fallback branch below.
+
+    R5-1 (2026-05-11): KGs now ship N chapter roots (one per source_file)
+    rather than a single course root. The payload surfaces all of them
+    via `rootIds: list[str]`; `rootId` / `id` / `children` keep the
+    first chapter's view for back-compat with any caller that hasn't
+    migrated to multi-root awareness. The frontend's force layout reads
+    `nodes` / `edges` directly so it always sees all roots regardless of
+    which one is mirrored at the top level.
     """
     nodes = kg_data.get("nodes", [])
     edges = kg_data.get("edges", [])
@@ -2877,6 +2885,7 @@ def _kg_to_mindmap(kg_data: dict, course_id: str) -> dict:
             "nodes": [],
             "edges": [],
             "children": [],
+            "rootIds": [],
         }
 
     normalized_nodes = _normalize_kg_nodes(nodes)
@@ -2902,12 +2911,12 @@ def _kg_to_mindmap(kg_data: dict, course_id: str) -> dict:
     # F15 (review-swarm): accept either signal as evidence of root, not
     # both. M1 always sets both, but a partial-migration KG with depth=0
     # but a stale `concept_type` (or vice versa) should still render as a
-    # course-card root rather than fall through to the legacy heuristic.
-    explicit_root = next(
-        (n for n in normalized_nodes
-         if n.get("depth") == 0 or n.get("concept_type") == "root"),
-        None,
-    )
+    # chapter-card root rather than fall through to the legacy heuristic.
+    # R5-1: collect ALL roots (one per chapter), not just the first.
+    explicit_roots = [
+        n for n in normalized_nodes
+        if n.get("depth") == 0 or n.get("concept_type") == "root"
+    ]
 
     def build_tree(node_id: str, depth: int = 0, seen: set[str] | None = None) -> dict:
         seen = set(seen or [])
@@ -2928,16 +2937,24 @@ def _kg_to_mindmap(kg_data: dict, course_id: str) -> dict:
                 result["children"] = [build_tree(c, depth + 1, seen) for c in child_ids[:12]]
         return result
 
-    if explicit_root is not None:
-        tree = build_tree(explicit_root["id"], depth=0)
+    if explicit_roots:
+        # Stable ordering: by node name so the first-root-mirrored view
+        # doesn't flip between requests.
+        explicit_roots.sort(key=lambda n: (str(n.get("name") or ""), str(n.get("id") or "")))
+        primary = explicit_roots[0]
+        tree = build_tree(primary["id"], depth=0)
         return {
-            "id": explicit_root["id"],
-            "label": explicit_root.get("name", course_id),
-            "definition": explicit_root.get("definition", ""),
+            "id": primary["id"],
+            "label": primary.get("name", course_id),
+            "definition": primary.get("definition", ""),
             "concept_type": "root",
             "nodes": normalized_nodes,
             "edges": normalized_edges,
             "children": tree.get("children", []),
+            # R5-1: surface every chapter root so the frontend's multi-root
+            # layout can place them all. Single-root legacy KGs report a
+            # one-element list — old clients reading only `id` still work.
+            "rootIds": [n["id"] for n in explicit_roots],
         }
 
     # Legacy fallback (Round 1 KG without explicit depth=0 / concept_type
@@ -2968,6 +2985,9 @@ def _kg_to_mindmap(kg_data: dict, course_id: str) -> dict:
         "nodes": normalized_nodes,
         "edges": normalized_edges,
         "children": build_tree(chosen_root["id"]).get("children", []),
+        # R5-1: legacy fallback exposes a single rootId for the heuristic
+        # pick so the frontend's multi-root code path can treat it uniformly.
+        "rootIds": [chosen_root["id"]],
     }
 
 

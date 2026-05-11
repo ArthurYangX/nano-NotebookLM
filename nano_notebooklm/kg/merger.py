@@ -12,21 +12,33 @@ logger = logging.getLogger(__name__)
 
 
 def merge_concepts(concepts: list[Concept]) -> list[Concept]:
-    """Deduplicate concepts by (concept_type, normalized name) within a course.
+    """Deduplicate concepts within a course.
 
-    F1 (review-swarm): the dedup key is now compound. Pre-fix, a Stage A
-    topic like "Optimization" and a Stage B leaf concept also called
-    "Optimization" collapsed into one record — but their concept_ids differ
-    (`topic_<course>_optimization` vs `concept_<course>_optimization`), so
-    every part-of edge referencing the discarded id was silently dropped by
-    `KnowledgeGraph.add_relations`. By keying on concept_type as well, root /
-    topic / leaf with the same name now stay separate, and the structural
-    edges survive.
+    F1 (review-swarm): the dedup key distinguishes root / topic / leaf by
+    `concept_type` so a Stage A topic "Optimization" and a Stage B leaf
+    "Optimization" don't collapse into one record (their concept_ids
+    differ, so structural part-of edges referencing the discarded id were
+    silently dropped by `KnowledgeGraph.add_relations`).
+
+    R5-1: for `root` and `topic` types the dedup key also includes the
+    `concept_id` (which encodes the chapter slug — see
+    `kg/extractor.py:extract_from_chunks`). Two chapters with a same-named
+    macro topic ("Backpropagation" in both Lecture 3 and Lecture 7) now
+    persist as distinct nodes, each part-of its own chapter root, instead
+    of merging into a single floating topic. Leaves continue to dedup by
+    `(type, name)` because a leaf-level concept like "Gradient descent"
+    referenced from two chapters IS the same concept (the merger pools
+    their source_chunks so the student can jump to either citation).
     """
-    merged: dict[tuple[str, str], Concept] = {}
+    merged: dict[tuple, Concept] = {}
 
     for c in concepts:
-        key = (str(c.concept_type or "").lower(), _normalize_name(c.name))
+        c_type = str(c.concept_type or "").lower()
+        if c_type in {"root", "topic"}:
+            # R5-1: concept_id distinguishes per-chapter copies.
+            key: tuple = (c_type, _normalize_name(c.name), c.concept_id)
+        else:
+            key = (c_type, _normalize_name(c.name))
         if key in merged:
             existing = merged[key]
             existing.chunk_ids = list(set(existing.chunk_ids + c.chunk_ids))

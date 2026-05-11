@@ -113,7 +113,7 @@
     const nodesIn = Array.isArray(kg && kg.nodes) ? kg.nodes : flattenTree(kg);
     const edgesIn = Array.isArray(kg && kg.edges) ? kg.edges : treeEdges(kg);
     if (!nodesIn.length) {
-      return { empty: true, placeholder: "No concepts extracted yet.", nodes: [], edges: [] };
+      return { empty: true, placeholder: "No concepts extracted yet.", nodes: [], edges: [], rootIds: [] };
     }
 
     const RADIUS_PER_DEPTH = opts.radiusPerDepth || 220;
@@ -149,12 +149,15 @@
       }
     });
 
-    // Find the root: explicit depth=0 from M1, else first node.
-    let rootId = null;
+    // Find the roots: explicit depth=0 from M1 (R5-1: now N chapter
+    // roots, one per source file), else first node as fallback.
+    const rootIds = [];
     for (const n of nodesIn) {
-      if (Number(n.depth) === 0) { rootId = idOf(n, 0); break; }
+      if (Number(n.depth) === 0) rootIds.push(idOf(n, 0));
     }
-    if (!rootId) rootId = idOf(nodesIn[0], 0);
+    if (!rootIds.length) rootIds.push(idOf(nodesIn[0], 0));
+    // Primary root for back-compat with single-root callers.
+    const rootId = rootIds[0];
 
     // Memoized leaf count per subtree (used to size each node's slice).
     const leafCache = new Map();
@@ -170,24 +173,37 @@
       return n;
     }
 
-    // Hues for depth=1 topics — evenly distributed around 360°.
-    const topicChildren = childrenOf.get(rootId) || [];
+    // Hues. R5-1: one hue per chapter root (multi-root) so each chapter's
+    // subtree color-codes consistently. Single-root path keeps the M2
+    // "one hue per topic" rule by hashing topic children of the lone root.
     const hues = new Map();
-    topicChildren.forEach((tid, i) => {
-      hues.set(tid, Math.round((i / Math.max(topicChildren.length, 1)) * 360));
-    });
+    if (rootIds.length === 1) {
+      const topicChildren = childrenOf.get(rootId) || [];
+      topicChildren.forEach((tid, i) => {
+        hues.set(tid, Math.round((i / Math.max(topicChildren.length, 1)) * 360));
+      });
+    } else {
+      rootIds.forEach((rid, i) => {
+        hues.set(rid, Math.round((i / rootIds.length) * 360));
+      });
+    }
 
-    // Position assignment via recursive sub-wedge division.
+    // Position assignment via recursive sub-wedge division. R5-1: when
+    // multi-root, the depth=0 special-case (place at origin, give children
+    // the full 2π) is suppressed — each chapter root is placed on an inner
+    // ring at its assigned angle and its children fill that root's slice.
     const positions = new Map();
+    const multiRoot = rootIds.length > 1;
     function place(id, depth, angleStart, angleEnd, hue, ancestors) {
       const seen = new Set(ancestors || []);
       if (seen.has(id)) return;
       seen.add(id);
       const angle = (angleStart + angleEnd) / 2;
-      const r = depth * RADIUS_PER_DEPTH;
+      const placeAtOrigin = depth === 0 && !multiRoot;
+      const r = placeAtOrigin ? 0 : Math.max(1, depth) * RADIUS_PER_DEPTH;
       positions.set(id, {
-        x: depth === 0 ? 0 : Math.cos(angle) * r,
-        y: depth === 0 ? 0 : Math.sin(angle) * r,
+        x: placeAtOrigin ? 0 : Math.cos(angle) * r,
+        y: placeAtOrigin ? 0 : Math.sin(angle) * r,
         depth,
         angle,
       });
@@ -197,10 +213,11 @@
       if (!kids.length) return;
       const totalLeaves = kids.reduce((s, c) => s + leafCount(c, seen), 0) || 1;
 
-      // Root: children own the full circle. Below root: children stay
-      // inside parent's slice (slightly inset so neighbors don't touch).
+      // Single-root case: depth=0 children own the full circle.
+      // Multi-root case OR depth>0: children stay inside parent's slice
+      // (slightly inset so neighbors don't touch).
       let s, e;
-      if (depth === 0) {
+      if (placeAtOrigin) {
         s = -Math.PI / 2;
         e = s + Math.PI * 2;
       } else {
@@ -219,7 +236,22 @@
         cursor += slice;
       }
     }
-    place(rootId, 0, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2, null, new Set());
+
+    if (multiRoot) {
+      // R5-1: each chapter root gets an equal slice of 2π. Roots sit on the
+      // depth=1 ring (so their topics push out to depth=2, leaves to
+      // depth=3). The force layout settles all this, but a sensible
+      // starting position keeps chapters from spawning on top of each other.
+      const sliceWidth = (Math.PI * 2) / rootIds.length;
+      rootIds.forEach((rid, i) => {
+        const baseAngle = i * sliceWidth - Math.PI / 2 + sliceWidth / 2;
+        const sliceStart = baseAngle - sliceWidth / 2;
+        const sliceEnd = baseAngle + sliceWidth / 2;
+        place(rid, 0, sliceStart, sliceEnd, hues.get(rid), new Set());
+      });
+    } else {
+      place(rootId, 0, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2, null, new Set());
+    }
 
     const maxWeight = Math.max(...nodesIn.map(n => Number(n.weight || 1)), 1);
 
@@ -275,7 +307,9 @@
       }))
       .filter(edge => nodeIds.has(edge.source) && nodeIds.has(edge.target))
       .map(edge => Object.assign(edge, { style: relationStyle[edge.relation] || relationStyle.related }));
-    return { empty: false, nodes, edges, rootId };
+    // R5-1: expose `rootIds` so the force layout / delete-guard can see
+    // every chapter root, not just the primary one mirrored as `rootId`.
+    return { empty: false, nodes, edges, rootId, rootIds: rootIds.slice() };
   }
 
   // Back-compat alias for M1/M2/M3 tests and any older component code.
@@ -346,6 +380,9 @@
       links,
       edges: links,
       rootId: tree.rootId,
+      // R5-1: propagate the full list so MindMap's delete guard can
+      // protect every chapter root, not just the first one.
+      rootIds: Array.isArray(tree.rootIds) ? tree.rootIds.slice() : (tree.rootId ? [tree.rootId] : []),
       relationTypes,
     };
   }
