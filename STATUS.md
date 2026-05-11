@@ -64,10 +64,11 @@
 >
 > lock 期间另一 agent 不许编辑对方 section。任何不确定的边界先在 STATUS.md 留 review_notes 让 reviewer 仲裁。
 
-### #R3-1 Quiz/Skills/History tab 滚动修复 — [review]
+### #R3-1 Quiz/Skills/History tab 滚动修复 — [x]
 
 - **goal ref**: GOAL.md Round 3 #R3-1。`RealQuizView` (app.jsx:1148) / `SkillsDashboard` (app.jsx:1214) / `SessionHistory` (app.jsx:1247) 都用 `<div className="reader-body">`，但 `frontend/styles.css` **没有** `.reader-body` 这条规则——只有 R6 时为 Notes 加的 `.notes-reader-body`。父级 `.workspace { overflow: hidden }` 导致超出视口的题/卡片被裁，用户上下滑不动。
-- **status**: [review]
+- **status**: [x]
+- **closed_at**: 2026-05-11
 - **owner**: claude
 - **claimed_at**: 2026-05-07 13:54
 - **submitted_at**: 2026-05-07 14:02
@@ -112,10 +113,11 @@
 - **conflict notes**: 与 #R3-3 共享 `frontend/study-state.js` / `frontend/styles.css` / `api/server.py`。本项 lock 期间 **不许触碰** mindmap section（study-state.js 的 `prepareMindmap` 上下、styles.css mindmap 段、server.py 的 `/api/mindmap/*` 端点 + `_kg_to_mindmap`）。merge 前 reviewer 检查无 import 冲突 + 无函数重定义。
 - **review_notes**:
 
-### #R3-3 思维导图：学习顺序角标 + 节点深探（agent stream） — [review]
+### #R3-3 思维导图：学习顺序角标 + 节点深探（agent stream） — [x]
 
 - **goal ref**: GOAL.md Round 3 #R3-3。M1+M2+M3 完成后 mindmap 是个静态地图，缺 (a) 学习路径感（先学哪个 topic）；(b) 深度入口（点节点只有右下角 detail，没有真讲解）。本项加：(a) Stage A 同时让 LLM 输出 `prerequisite_of` 边，extractor 拓扑排序后给每个 topic 打 `learning_order: int`；前端 topic 节点加角标 "1 / 2 / 3 ..."。(b) alt+click 任意节点 → 调新端点 `/api/mindmap/{cid}/explain-node`，wrap `agent_loop.run_agent` 限 turns=4 + 工具子集（search_kb + read_chunk only），NDJSON 流出"5 行精讲 + 3 道 mini quiz" 到前端 `<NodeDeepDivePanel>`。
-- **status**: [review]
+- **status**: [x]
+- **closed_at**: 2026-05-11
 - **owner**: claude (Agent B)
 - **claimed_at**: 2026-05-07 14:00
 - **files**（**严格 section-scoped，与 #R3-2 共享文件时只动以下 section**）:
@@ -207,10 +209,11 @@
 >
 > **预置课暂保留物理文件**（不删 `artifacts/courses/{15-213,CS182,...}`），UI 默认隐藏，等 R4-4 验收过了再决定清理。回滚点：URL `?show_preset=1` 切回 mode=all 看到全部。
 
-### #R4-1 数据切换：隐藏预置课 + UI 改"我的上传"空态 — [review]
+### #R4-1 数据切换：隐藏预置课 + UI 改"我的上传"空态 — [x]
 
 - **goal ref**: GOAL.md Round 4 #R4-1
-- **status**: [review]
+- **status**: [x]
+- **closed_at**: 2026-05-11
 - **owner**: claude
 - **claimed_at**: 2026-05-10 23:00
 - **submitted_at**: 2026-05-10 23:15
@@ -228,10 +231,11 @@
 - **review_notes**: 预置 8 门课**物理文件保留**（artifacts/courses/{15-213,...}），仅 UI 默认隐藏，等 R4-4 GraphRAG 验收过后再决定是否物理删除。`courseModeRef` 用 `useRef` 而非 `useState`：URL 在 mount 时一次确定，整个 session 不变；用 ref 避免无意义 re-render。getCourses 强制带 `?mode=user`（即使是默认值）让请求一眼能在 access log 里区分 R4 模式。`PRESET_COURSE_IDS` 在 conftest 没新增 fixture — 直接 monkeypatch ARTIFACTS_DIR + reload server 模仿 v4 fix-all 模式。无新依赖。
 - **conflict notes**: 单文件后端改动 + 单文件前端改动，无并发 lock 风险。
 
-### #R4-2 upload-only 全链路 + Processing 实进度（NDJSON streaming）— [review]
+### #R4-2 upload-only 全链路 + Processing 实进度（NDJSON streaming）— [x]
 
 - **goal ref**: GOAL.md Round 4 #R4-2
-- **status**: [review]
+- **status**: [x]
+- **closed_at**: 2026-05-11
 - **owner**: claude
 - **claimed_at**: 2026-05-10 23:00
 - **submitted_at**: 2026-05-10 23:50
@@ -316,10 +320,11 @@
 
 **files touched**: frontend/index.html / frontend/mindmap.jsx / frontend/study-state.js / CLAUDE.md + **新增** tests/test_r4_3_fix_all_v1.py（10 条回归）。**pytest**: **629 passed in 416s**（v4 580 + R4-1 8 + R4-2 9 + R4-2 fix-all v1 13 + R4-3 codex 7 + R4-3 fix-all v1 10 + 其他 = 629，零 regression）。
 
-### #R4-4 GraphRAG retriever 接进 /api/chat（path="graphrag"）— **本轮最重要** — [review]
+### #R4-4 GraphRAG retriever 接进 /api/chat（path="graphrag"）— **本轮最重要** — [x]
 
 - **goal ref**: GOAL.md Round 4 #R4-4
-- **status**: [review]
+- **status**: [x]
+- **closed_at**: 2026-05-11
 - **owner**: claude
 - **claimed_at**: 2026-05-10 23:00
 - **submitted_at**: 2026-05-11 09:30
@@ -439,10 +444,11 @@
 
 **review_notes**: 仍 deferred 到 v4 / 不阻塞：(a) Reviewer 3 #3 KG/chunks.json mtime LRU cache（架构性）；(b) Reviewer 3 #4 api_score 与 sort_key 一致性（公式重设计）；(c) 6 个 preset KG 一次性 backfill script（独立 ops 任务）；(d) SentenceTransformer 首加载竞争锁（pre-existing latent，并发首调试场景少见）；(e) test 1171s vs 343s 慢 3x 调查（与 R4-2/R4-6 测试 setup 相关，独立调研）。
 
-### #R4-5 Backend backend 切换 chip：codex GPT-5.4 / Qwen2.5-7B-RAFT — [review]
+### #R4-5 Backend backend 切换 chip：codex GPT-5.4 / Qwen2.5-7B-RAFT — [x]
 
 - **goal ref**: GOAL.md Round 4 #R4-5
-- **status**: [review]
+- **status**: [x]
+- **closed_at**: 2026-05-11
 - **owner**: claude
 - **claimed_at**: 2026-05-11 00:40
 - **partial_submitted_at**: 2026-05-11 00:50（part 1：backend + router + tests，未碰 server.py / app.jsx；等 R4-4 land 后做 part 2）
