@@ -34,6 +34,18 @@ function MindMap({ data, layout, courseId, highlightedId, onNodeClick, onSourceC
   const arrowId = (kind) => `kg-arrow-${kind}-${markerUid}`;
   const [pan, setPan] = useStateM({ x: 0, y: 0 });
   const [zoom, setZoom] = useStateM(1);
+  // review-swarm fix-all v2 #2: refs mirror zoom/pan so the wheel
+  // handler can read current values synchronously without depending on
+  // React state closures. Updated in an effect after each render.
+  // Earlier the wheel handler used `setZoom(prev => { setPan(...); ... })`
+  // — calling another setter inside an updater function is brittle
+  // (works in production React 18 batching, but ambiguous under
+  // StrictMode dev double-invoke). The ref-mirror pattern lets us do
+  // both math AND both setters sequentially at the top level.
+  const zoomRef = useRefM(1);
+  const panRef = useRefM({ x: 0, y: 0 });
+  useEffectM(() => { zoomRef.current = zoom; }, [zoom]);
+  useEffectM(() => { panRef.current = pan; }, [pan]);
   const [collapsed, setCollapsed] = useStateM(new Set());
   // 2026-05-11: ref on the wrap div + a persisted hide flag for the
   // bottom-right legend. Trackpad pinch fires `wheel` with `ctrlKey:
@@ -48,6 +60,18 @@ function MindMap({ data, layout, courseId, highlightedId, onNodeClick, onSourceC
   const isWheelingRef = useRefM(false);
   const wheelEndTimerRef = useRefM(null);
   const [, bumpWheel] = useStateM(0);
+  // review-swarm fix-all v2 #1: cached bounding-client-rect, refreshed
+  // via ResizeObserver + window resize/scroll instead of stat'd on every
+  // wheel event. Eliminates a per-event forced reflow when wheel runs
+  // adjacent to DOM writes (the inline transform style is rewritten on
+  // every setPan/setZoom). Fallback to live getBoundingClientRect when
+  // the cache is uninitialised.
+  const rectRef = useRefM(null);
+  // review-swarm fix-all v2 #3: gate wheel capture when the graph is
+  // empty (no nodes rendered). An empty-KG placeholder shouldn't trap
+  // page scroll. Read via ref so the [] dep array on the wheel effect
+  // stays valid (no re-attach on data change).
+  const isEmptyRef = useRefM(false);
   const [legendHidden, setLegendHidden] = useStateM(() => {
     try { return window.localStorage.getItem("nano-nlm:v1:kg-legend-hidden") === "1"; }
     catch (e) { return false; }
@@ -99,6 +123,8 @@ function MindMap({ data, layout, courseId, highlightedId, onNodeClick, onSourceC
   );
   const [simNodes, setSimNodes] = useStateM([]);
   const simRef = useRefM(null);
+  // Mirror prepared.empty into a ref for the wheel handler (closure-free).
+  useEffectM(() => { isEmptyRef.current = !!prepared.empty; }, [prepared.empty]);
   const { nodes, edges } = prepared.empty
     ? { nodes: [], edges: [] }
     : { nodes: (simNodes.length ? simNodes : prepared.nodes), edges: prepared.links || prepared.edges || [] };
@@ -448,6 +474,19 @@ function MindMap({ data, layout, courseId, highlightedId, onNodeClick, onSourceC
   useEffectM(() => {
     const el = wrapRef.current;
     if (!el) return;
+    // review-swarm fix-all v2 #1: cache the wrap's bounding rect via
+    // ResizeObserver + window resize/scroll instead of stat'ing it on
+    // every wheel event. Removes per-event forced-reflow risk and
+    // matches the per-render performance budget of the d3-force sim.
+    function refreshRect() { rectRef.current = el.getBoundingClientRect(); }
+    refreshRect();
+    const ro = (typeof ResizeObserver !== "undefined") ? new ResizeObserver(refreshRect) : null;
+    if (ro) ro.observe(el);
+    // Capture-phase scroll so nested scrollables (the sidebar, etc.)
+    // also invalidate the cached rect.
+    window.addEventListener("resize", refreshRect);
+    window.addEventListener("scroll", refreshRect, true);
+
     // review-swarm fix-all v1: gate which wheel events the graph captures.
     //   #6 — only pixel-delta (`deltaMode === 0`) events are treated as
     //   trackpad gestures. Mouse-wheel events on most browsers report
@@ -457,6 +496,8 @@ function MindMap({ data, layout, courseId, highlightedId, onNodeClick, onSourceC
     //   #4 — wheel events on the toolbar / legend / detail panel are
     //   skipped via `closest()` so pinching while reaching for `+` does
     //   not accidentally zoom the canvas. Mirrors startCanvasPan's guard.
+    // fix-all v2 #3: also skip when the graph has no rendered nodes
+    // (placeholder state) so the empty pane doesn't trap page scroll.
     function markWheeling() {
       if (!isWheelingRef.current) {
         isWheelingRef.current = true;
@@ -470,38 +511,38 @@ function MindMap({ data, layout, courseId, highlightedId, onNodeClick, onSourceC
       }, 150);
     }
     function onWheel(e) {
+      if (isEmptyRef.current) return;
       if (e.target && e.target.closest &&
           e.target.closest(".mindmap-toolbar, .mindmap-legend, .mindmap-detail, .mindmap-legend-toggle, .mm-edge-picker")) {
         return;
       }
-      // Skip non-trackpad wheel events: mouse-wheel + Windows ctrl+wheel
-      // page-zoom both report deltaMode !== 0 so page-scroll / browser-zoom
-      // affordances stay intact for those users.
       if (e.deltaMode !== 0) return;
+      // Cached rect (refreshed on resize/scroll); fallback to live read
+      // if for some reason the cache hasn't initialised.
+      const rect = rectRef.current || el.getBoundingClientRect();
       if (e.ctrlKey) {
         e.preventDefault();
         markWheeling();
-        const rect = el.getBoundingClientRect();
         const cx = e.clientX - rect.left - rect.width / 2;
         const cy = e.clientY - rect.top - rect.height / 2;
-        // Smooth scale: deltaY ≈ -53 for one notch of pinch-out on macOS;
-        // exp keeps the feel exponential like browser native zoom.
         const scaleFactor = Math.exp(-e.deltaY * 0.01);
         if (!Number.isFinite(scaleFactor)) return;
-        setZoom(prevZoom => {
-          const nextZoom = Math.max(KG_ZOOM_MIN, Math.min(KG_ZOOM_MAX, prevZoom * scaleFactor));
-          // #9 NaN injection guard. Number.isFinite catches NaN AND ±Inf
-          // from a poisoned WheelEvent (deltaY: NaN / MAX_VALUE).
-          if (!Number.isFinite(nextZoom) || nextZoom === prevZoom) return prevZoom;
-          const ratio = nextZoom / prevZoom;
-          setPan(prevPan => {
-            const nx = cx - (cx - prevPan.x) * ratio;
-            const ny = cy - (cy - prevPan.y) * ratio;
-            if (!Number.isFinite(nx) || !Number.isFinite(ny)) return prevPan;
-            return { x: nx, y: ny };
-          });
-          return nextZoom;
-        });
+        // review-swarm fix-all v2 #2: read zoom/pan via refs, compute
+        // both next values at the top level, call setters sequentially.
+        // Production React 18 batches the two setters into one render
+        // for native events; no nested-updater brittleness.
+        const prevZoom = zoomRef.current;
+        const prevPan = panRef.current;
+        const nextZoom = Math.max(KG_ZOOM_MIN, Math.min(KG_ZOOM_MAX, prevZoom * scaleFactor));
+        if (!Number.isFinite(nextZoom) || nextZoom === prevZoom) return;
+        const ratio = nextZoom / prevZoom;
+        const nx = cx - (cx - prevPan.x) * ratio;
+        const ny = cy - (cy - prevPan.y) * ratio;
+        if (!Number.isFinite(nx) || !Number.isFinite(ny)) return;
+        zoomRef.current = nextZoom;
+        panRef.current = { x: nx, y: ny };
+        setZoom(nextZoom);
+        setPan({ x: nx, y: ny });
       } else if (Math.abs(e.deltaX) > 0 || Math.abs(e.deltaY) > 0) {
         // Two-finger trackpad swipe → pan. Mouse-wheel was already gated
         // out above via `deltaMode !== 0`, so only trackpad reaches here.
@@ -510,15 +551,18 @@ function MindMap({ data, layout, courseId, highlightedId, onNodeClick, onSourceC
         const dx = e.deltaX;
         const dy = e.deltaY;
         if (!Number.isFinite(dx) || !Number.isFinite(dy)) return;
-        setPan(prevPan => ({
-          x: prevPan.x - dx,
-          y: prevPan.y - dy,
-        }));
+        const prevPan = panRef.current;
+        const next = { x: prevPan.x - dx, y: prevPan.y - dy };
+        panRef.current = next;
+        setPan(next);
       }
     }
     el.addEventListener("wheel", onWheel, { passive: false });
     return () => {
       el.removeEventListener("wheel", onWheel);
+      if (ro) ro.disconnect();
+      window.removeEventListener("resize", refreshRect);
+      window.removeEventListener("scroll", refreshRect, true);
       if (wheelEndTimerRef.current) clearTimeout(wheelEndTimerRef.current);
     };
   }, []);
