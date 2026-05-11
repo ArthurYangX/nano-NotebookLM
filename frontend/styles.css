@@ -993,10 +993,17 @@ body::before {
    in the bottom-right corner; a small × dismisses it and the collapsed
    ▤ pill in the same anchor brings it back. Persisted in localStorage
    so it survives reloads. */
+.mindmap-legend {
+  /* review-swarm fix-all v1 #8: reserve right padding so the absolutely-
+     positioned × close button never overlaps row 1's "Course root" text
+     on font-scale shifts. */
+  padding-right: 26px;
+}
 .mindmap-legend-close {
   position: absolute;
   top: 4px;
   right: 4px;
+  z-index: 1;
   background: transparent;
   border: none;
   color: var(--ink-3);

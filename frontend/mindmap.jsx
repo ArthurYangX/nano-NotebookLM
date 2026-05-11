@@ -1,6 +1,13 @@
 /* global React, MINDMAP, StudyState, API, d3 */
 const { useMemo: useMemoM, useState: useStateM, useRef: useRefM, useEffect: useEffectM, useId: useIdM } = React;
 
+// review-swarm fix-all v1 #2 + #4: unified zoom range so toolbar
+// buttons and trackpad pinch share the same clamp. Previously toolbar
+// was [0.5, 2] and wheel was [0.3, 3] — after pinching to 0.37 the
+// toolbar `−` would jump up to 0.5, surprising the user.
+const KG_ZOOM_MIN = 0.3;
+const KG_ZOOM_MAX = 3;
+
 // M2 (2026-05-06): the dead-code radial layout that lived here pre-M2 has
 // been removed. `StudyState.prepareMindmap` is now a real parent-aware
 // recursive radial layout — there's only one code path.
@@ -34,6 +41,13 @@ function MindMap({ data, layout, courseId, highlightedId, onNodeClick, onSourceC
   // preventDefault() and zoom/pan around the cursor instead of letting
   // the browser scroll the page.
   const wrapRef = useRefM(null);
+  // review-swarm fix-all v1 #1: transient flag set during pinch/pan so
+  // the 200ms transform transition is suppressed while wheel events are
+  // firing. Without this the rendered transform chases the latest
+  // setZoom/setPan with 200ms ease, visibly desyncing the cursor anchor.
+  const isWheelingRef = useRefM(false);
+  const wheelEndTimerRef = useRefM(null);
+  const [, bumpWheel] = useStateM(0);
   const [legendHidden, setLegendHidden] = useStateM(() => {
     try { return window.localStorage.getItem("nano-nlm:v1:kg-legend-hidden") === "1"; }
     catch (e) { return false; }
@@ -434,38 +448,79 @@ function MindMap({ data, layout, courseId, highlightedId, onNodeClick, onSourceC
   useEffectM(() => {
     const el = wrapRef.current;
     if (!el) return;
+    // review-swarm fix-all v1: gate which wheel events the graph captures.
+    //   #6 — only pixel-delta (`deltaMode === 0`) events are treated as
+    //   trackpad gestures. Mouse-wheel events on most browsers report
+    //   `deltaMode === 1` (line) or `2` (page); those bubble through so
+    //   the surrounding page scrolls normally and Windows users keep
+    //   their ctrl+wheel browser-zoom shortcut.
+    //   #4 — wheel events on the toolbar / legend / detail panel are
+    //   skipped via `closest()` so pinching while reaching for `+` does
+    //   not accidentally zoom the canvas. Mirrors startCanvasPan's guard.
+    function markWheeling() {
+      if (!isWheelingRef.current) {
+        isWheelingRef.current = true;
+        bumpWheel(n => n + 1);
+      }
+      if (wheelEndTimerRef.current) clearTimeout(wheelEndTimerRef.current);
+      wheelEndTimerRef.current = setTimeout(() => {
+        isWheelingRef.current = false;
+        wheelEndTimerRef.current = null;
+        bumpWheel(n => n + 1);
+      }, 150);
+    }
     function onWheel(e) {
+      if (e.target && e.target.closest &&
+          e.target.closest(".mindmap-toolbar, .mindmap-legend, .mindmap-detail, .mindmap-legend-toggle, .mm-edge-picker")) {
+        return;
+      }
+      // Skip non-trackpad wheel events: mouse-wheel + Windows ctrl+wheel
+      // page-zoom both report deltaMode !== 0 so page-scroll / browser-zoom
+      // affordances stay intact for those users.
+      if (e.deltaMode !== 0) return;
       if (e.ctrlKey) {
         e.preventDefault();
+        markWheeling();
         const rect = el.getBoundingClientRect();
         const cx = e.clientX - rect.left - rect.width / 2;
         const cy = e.clientY - rect.top - rect.height / 2;
         // Smooth scale: deltaY ≈ -53 for one notch of pinch-out on macOS;
         // exp keeps the feel exponential like browser native zoom.
         const scaleFactor = Math.exp(-e.deltaY * 0.01);
+        if (!Number.isFinite(scaleFactor)) return;
         setZoom(prevZoom => {
-          const nextZoom = Math.max(0.3, Math.min(3, prevZoom * scaleFactor));
-          if (nextZoom === prevZoom) return prevZoom;
+          const nextZoom = Math.max(KG_ZOOM_MIN, Math.min(KG_ZOOM_MAX, prevZoom * scaleFactor));
+          // #9 NaN injection guard. Number.isFinite catches NaN AND ±Inf
+          // from a poisoned WheelEvent (deltaY: NaN / MAX_VALUE).
+          if (!Number.isFinite(nextZoom) || nextZoom === prevZoom) return prevZoom;
           const ratio = nextZoom / prevZoom;
-          setPan(prevPan => ({
-            x: cx - (cx - prevPan.x) * ratio,
-            y: cy - (cy - prevPan.y) * ratio,
-          }));
+          setPan(prevPan => {
+            const nx = cx - (cx - prevPan.x) * ratio;
+            const ny = cy - (cy - prevPan.y) * ratio;
+            if (!Number.isFinite(nx) || !Number.isFinite(ny)) return prevPan;
+            return { x: nx, y: ny };
+          });
           return nextZoom;
         });
       } else if (Math.abs(e.deltaX) > 0 || Math.abs(e.deltaY) > 0) {
-        // Two-finger trackpad swipe (or wheel) → pan the canvas. We
-        // preventDefault to stop the surrounding page from scrolling
-        // when the cursor is over the graph.
+        // Two-finger trackpad swipe → pan. Mouse-wheel was already gated
+        // out above via `deltaMode !== 0`, so only trackpad reaches here.
         e.preventDefault();
+        markWheeling();
+        const dx = e.deltaX;
+        const dy = e.deltaY;
+        if (!Number.isFinite(dx) || !Number.isFinite(dy)) return;
         setPan(prevPan => ({
-          x: prevPan.x - e.deltaX,
-          y: prevPan.y - e.deltaY,
+          x: prevPan.x - dx,
+          y: prevPan.y - dy,
         }));
       }
     }
     el.addEventListener("wheel", onWheel, { passive: false });
-    return () => el.removeEventListener("wheel", onWheel);
+    return () => {
+      el.removeEventListener("wheel", onWheel);
+      if (wheelEndTimerRef.current) clearTimeout(wheelEndTimerRef.current);
+    };
   }, []);
 
   // ---- Dragging: window-level listeners so drag doesn't die if cursor leaves a node
@@ -680,7 +735,11 @@ function MindMap({ data, layout, courseId, highlightedId, onNodeClick, onSourceC
     return null;
   }
 
-  const isDraggingSomething = !!dragRef.current;
+  // review-swarm fix-all v1 #1: suppress the 200ms transform transition
+  // not only during pointer drags but also during in-flight wheel events,
+  // so pinch-zoom's cursor-anchor math doesn't visibly desync from the
+  // rendered transform.
+  const isDraggingSomething = !!dragRef.current || isWheelingRef.current;
 
   return (
     <div className="mindmap-wrap"
@@ -690,8 +749,8 @@ function MindMap({ data, layout, courseId, highlightedId, onNodeClick, onSourceC
     >
       {prepared.empty && <div className="mindmap-empty">{prepared.placeholder}</div>}
       <div className="mindmap-toolbar" onMouseDown={(e) => e.stopPropagation()}>
-        <button className="icon-btn" onClick={() => setZoom(z => Math.min(2, z + 0.15))}>+</button>
-        <button className="icon-btn" onClick={() => setZoom(z => Math.max(0.5, z - 0.15))}>−</button>
+        <button className="icon-btn" onClick={() => setZoom(z => Math.min(KG_ZOOM_MAX, z + 0.15))}>+</button>
+        <button className="icon-btn" onClick={() => setZoom(z => Math.max(KG_ZOOM_MIN, z - 0.15))}>−</button>
         <button className="icon-btn" title="Reset zoom, pan, and node positions"
           onClick={() => { setZoom(1); setPan({x:0,y:0}); setCollapsed(new Set()); setOffsets({}); }}>⟲</button>
         <div className="sep"></div>
@@ -938,6 +997,7 @@ function MindMap({ data, layout, courseId, highlightedId, onNodeClick, onSourceC
           type="button"
           className="mindmap-legend-toggle"
           title="Show legend"
+          aria-label="显示图例"
           onClick={toggleLegend}
         >▤</button>
       ) : (
@@ -947,7 +1007,7 @@ function MindMap({ data, layout, courseId, highlightedId, onNodeClick, onSourceC
             className="mindmap-legend-close"
             title="Hide legend"
             onClick={toggleLegend}
-            aria-label="Hide legend"
+            aria-label="隐藏图例"
           >×</button>
           <div className="row"><div className="sw" style={{ background: "var(--ink)", borderColor: "var(--ink)" }}></div>Course root</div>
           <div className="row"><div className="sw" style={{ background: "var(--accent-soft)", borderColor: "var(--accent)" }}></div>Topic · {visNodes.filter(n => n.kind === "branch").length}</div>

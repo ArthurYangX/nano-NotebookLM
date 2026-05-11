@@ -66,6 +66,10 @@ nano_notebooklm/   Python backend modules
 - Frontend: CDN React 18 + Babel standalone (no build step). Generated
   notes / quiz / mindmap are cached per-course in `localStorage`
   under `nano-nlm:v1:<course>:<kind>` so refresh doesn't lose work.
+  Global visual preferences (not per-course) use a flat `nano-nlm:v1:<kind>`
+  key — currently `:backend` (codex / qwen_raft toggle), `:kg-legend-hidden`
+  (Knowledge Graph bottom-right legend visibility). Any future global-pref
+  key should follow the same flat shape and be listed here.
 
 ## Course Data
 
@@ -182,6 +186,26 @@ nano_notebooklm/   Python backend modules
   KG returns `{links: [], edges: [], relationTypes: []}` on every path.
   All R3-3 affordances (dblclick edit / N add child / Del delete /
   shift+drag connect / alt+click NodeDeepDivePanel / commitOps) intact.
+- **Knowledge Graph trackpad gestures (2026-05-11):** wheel events on
+  `.mindmap-wrap` are captured via a non-passive `addEventListener` (React's
+  synthetic `onWheel` is passive by default — can't `preventDefault`).
+  Capture is gated on `e.deltaMode === 0` (DOM_DELTA_PIXEL) so mouse-wheel
+  + Windows ctrl+wheel page-zoom pass through unmodified; only macOS-style
+  trackpad gestures hit the graph handler. `ctrlKey: true` (OS-synthesized
+  pinch) → cursor-anchored zoom, range `[KG_ZOOM_MIN=0.3, KG_ZOOM_MAX=3]`
+  (toolbar +/-/⟲ buttons share the same constants — no more "toolbar
+  dead-zone" after pinch beyond 0.5-2). `ctrlKey: false` + non-zero delta
+  → two-finger pan. Both branches `preventDefault()`. Wheel-active state
+  via `isWheelingRef` + 150ms decay timer disables the 200ms transform
+  transition so the cursor-anchor invariant stays visually stable during
+  pinch. `closest('.mindmap-toolbar, .mindmap-legend, .mindmap-detail,
+  .mindmap-legend-toggle, .mm-edge-picker')` early-return so wheel over
+  the overlay UI doesn't accidentally zoom the canvas. NaN/Inf injection
+  guarded via `Number.isFinite` on every computed zoom + pan.
+- **KG legend hide-toggle (2026-05-11):** bottom-right legend has a `×`
+  close button that collapses it to a `▤` pill at the same anchor;
+  state persists in `localStorage["nano-nlm:v1:kg-legend-hidden"]`
+  (global key, no course segment — same convention as the backend chip).
 - Round 4 R4-1 + R4-2 (2026-05-10): direction switched to upload-only +
   KG-driven retrieval. `/api/courses` accepts `mode: Literal["all","user"] |
   None` defaulting to `"user"`; user mode filters `config.PRESET_COURSE_IDS`
