@@ -54,17 +54,21 @@ class _StubAsyncClient:
     async def __aexit__(self, *exc):
         return False
 
-    async def post(self, url: str, *, json=None, headers=None):
-        self.calls.append({"method": "POST", "url": url, "json": json, "headers": headers})
+    async def post(self, url: str, *, json=None, headers=None, **kw):
+        self.calls.append({"method": "POST", "url": url, "json": json, "headers": headers, **kw})
         if self._raise is not None:
             raise self._raise
         return self._next_response()
 
-    async def get(self, url: str, *, headers=None):
-        self.calls.append({"method": "GET", "url": url, "headers": headers})
+    async def get(self, url: str, *, headers=None, **kw):
+        self.calls.append({"method": "GET", "url": url, "headers": headers, **kw})
         if self._raise is not None:
             raise self._raise
         return self._next_response()
+
+    async def aclose(self):
+        # No-op; cached-client design calls this on backend.aclose().
+        return None
 
     def _next_response(self):
         if not self._responses:
@@ -560,3 +564,70 @@ def test_chat_with_no_backend_uses_default_routing(monkeypatch, tmp_path):
     assert len(qwen_stub.complete_calls) == 0
     # backend_fallback should be absent (no qwen attempt → no fallback).
     assert r.json().get("backend_fallback") is None
+
+
+# ══════════════════════════════════════════════════════════════════════
+# R4-5 fix-all v2 (review-swarm follow-up) — cached httpx.AsyncClient.
+# ══════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+async def test_qwen_client_is_reused_across_calls(monkeypatch):
+    """Two consecutive complete() calls must reuse the same underlying
+    httpx.AsyncClient instance so we don't pay TCP+TLS handshake on every
+    chat turn (~150-400ms over WAN to AutoDL)."""
+    import httpx
+
+    construct_count = {"n": 0}
+    stub = _StubAsyncClient(
+        responses=_StubResponse(200, {"data": ["ok"]})
+    )
+
+    def _factory(*a, **kw):
+        construct_count["n"] += 1
+        return stub
+
+    monkeypatch.setattr(httpx, "AsyncClient", _factory)
+
+    b = QwenRaftBackend(url="https://example.gradio.live")
+    # First call → constructs the cached client.
+    await b.complete("hi")
+    first = b._client
+    assert first is not None
+    assert construct_count["n"] == 1
+
+    # Second call → reuses cached client (no new construction).
+    await b.complete("hi again")
+    assert b._client is first
+    assert construct_count["n"] == 1
+
+    # health_check shares the same cached client.
+    await b.health_check()
+    assert b._client is first
+    assert construct_count["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_qwen_aclose_releases_cached_client(monkeypatch):
+    """aclose() must clear the cached client so a subsequent call lazily
+    rebuilds. Exercises the opt-in shutdown hook even though it's not wired
+    into FastAPI lifespan."""
+    import httpx
+
+    construct_count = {"n": 0}
+    stub = _StubAsyncClient(responses=_StubResponse(200, {"data": ["ok"]}))
+
+    def _factory(*a, **kw):
+        construct_count["n"] += 1
+        return stub
+
+    monkeypatch.setattr(httpx, "AsyncClient", _factory)
+
+    b = QwenRaftBackend(url="https://example.gradio.live")
+    await b.complete("hi")
+    assert construct_count["n"] == 1
+    await b.aclose()
+    assert b._client is None
+    # Next call rebuilds the client.
+    await b.complete("hi")
+    assert construct_count["n"] == 2

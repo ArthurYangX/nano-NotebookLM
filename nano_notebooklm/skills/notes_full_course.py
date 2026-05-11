@@ -43,6 +43,66 @@ if TYPE_CHECKING:  # avoid runtime import cycles — only used for type hints
 
 logger = logging.getLogger(__name__)
 
+# Cache hardening v1 (2026-05-11):
+#
+# (a) Per-course cache lock. write_cache_entry does load → mutate → save,
+#     which without a lock loses the other writer's entry under concurrent
+#     fan-out. We keep one asyncio.Lock per course_id, lazy-initialised in
+#     _get_course_cache_lock. Different courses don't contend.
+#
+# (b) Prompt version hash. If the team edits NOTE_FORMAT_LATEX /
+#     NOTE_GENERATION_PROMPT / NOTE_MERGE_REVIEW_PROMPT, every cached
+#     entry was produced by an outdated prompt and MUST regenerate.
+#     _NOTE_PROMPT_VERSION is a stable sha1[:8] hash over the concatenation
+#     of those three prompt strings, computed at import time. Each cache
+#     entry now carries this field and plan_for_course treats a mismatch
+#     as a miss.
+#
+# (c) Envelope schema. We wrap on-disk JSON in {"version", "entries",
+#     "prompt_version"} so future shape changes can read-migrate. load_cache
+#     accepts both v0 (bare-dict) legacy and v1 envelope. save_cache always
+#     writes v1.
+_NOTE_PROMPT_VERSION: str = hashlib.sha1(
+    (
+        prompts.NOTE_FORMAT_LATEX
+        + prompts.NOTE_GENERATION_PROMPT
+        + prompts.NOTE_MERGE_REVIEW_PROMPT
+    ).encode("utf-8")
+).hexdigest()[:8]
+
+_CACHE_SCHEMA_VERSION: int = 1
+
+# Keyed by (running-loop id, course_id) so locks captured under one loop
+# don't accidentally serve a different loop (e.g. across asyncio.run()
+# boundaries in test suites — production has a single loop, so the loop
+# component is constant). asyncio.Lock binds to the first loop that
+# acquires it; reusing it from another loop raises RuntimeError.
+_COURSE_CACHE_LOCKS: dict[tuple[int, str], asyncio.Lock] = {}
+
+
+def _get_course_cache_lock(course_id: str) -> asyncio.Lock:
+    """Lazy-init per-course asyncio.Lock for the currently-running event
+    loop. Two concurrent write_cache_entry calls for the same course
+    serialise; different courses run in parallel.
+
+    The dict grows by course_id forever — fine in practice (course_ids are
+    bounded by user upload count) but if this ever ships in a multi-tenant
+    SaaS context we'd want LRU eviction.
+    """
+    try:
+        loop_id = id(asyncio.get_running_loop())
+    except RuntimeError:
+        # No running loop (synchronous context) — use 0 as a sentinel.
+        # The caller will fail later anyway when `async with lock` runs,
+        # but we avoid a confusing KeyError here.
+        loop_id = 0
+    key = (loop_id, course_id)
+    lock = _COURSE_CACHE_LOCKS.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _COURSE_CACHE_LOCKS[key] = lock
+    return lock
+
 # Cap chunks fed into a single per-file prompt. Big PDF lectures can exceed
 # 100 chunks; at ~300 tokens each that's 30K+ input tokens before the
 # instructions, which starts to crowd codex GPT-5.4's context window. 60
@@ -130,7 +190,12 @@ def _cache_path(course_id: str) -> Path:
 def load_cache(course_id: str) -> dict[str, dict]:
     """Read per_file_cache.json. Returns {} on missing / corrupt file —
     the caller treats a missing cache the same as an empty one (everything
-    needs regen). Corrupt-file path logs at WARNING so an operator notices."""
+    needs regen). Corrupt-file path logs at WARNING so an operator notices.
+
+    Accepts both v0 (bare-dict `{source_file: entry, ...}`) legacy files
+    and v1 envelope (`{"version": 1, "entries": {...}, ...}`). Returns the
+    bare entries dict in both cases so callers don't need to know.
+    """
     try:
         p = _cache_path(course_id)
     except ValueError:
@@ -146,6 +211,13 @@ def load_cache(course_id: str) -> dict[str, dict]:
         return {}
     if not isinstance(data, dict):
         return {}
+    # v1 envelope: {"version": 1, "entries": {...}, "prompt_version": "..."}
+    if "version" in data and "entries" in data:
+        entries = data.get("entries")
+        if isinstance(entries, dict):
+            return entries
+        return {}
+    # v0 legacy: bare dict mapping source_file → entry
     return data
 
 
@@ -174,7 +246,12 @@ def save_cache(course_id: str, cache: dict[str, dict]) -> None:
     # is atomic.
     import uuid as _uuid
     tmp = p.with_suffix(f".json.tmp.{_uuid.uuid4().hex[:8]}")
-    payload = json.dumps(cache, ensure_ascii=False, indent=2, sort_keys=True)
+    envelope = {
+        "version": _CACHE_SCHEMA_VERSION,
+        "prompt_version": _NOTE_PROMPT_VERSION,
+        "entries": cache,
+    }
+    payload = json.dumps(envelope, ensure_ascii=False, indent=2, sort_keys=True)
     with tmp.open("w", encoding="utf-8") as fh:
         fh.write(payload)
     os.replace(tmp, p)
@@ -197,19 +274,65 @@ def chunk_hash(chunks: list[Chunk]) -> str:
     return h.hexdigest()
 
 
-def write_cache_entry(course_id: str, source_file: str, *,
-                      chunk_hash_value: str, content: str,
-                      model: str = "") -> None:
-    """Update one entry, atomically rewriting the whole cache file. Cheap
-    for typical course sizes (10–30 entries × a few KB each)."""
+def _write_cache_entry_unlocked(
+    course_id: str,
+    source_file: str,
+    *,
+    chunk_hash_value: str,
+    content: str,
+    model: str = "",
+    prompt_version: str | None = None,
+) -> None:
+    """Synchronous read-modify-write — MUST be called under the per-course
+    lock (see write_cache_entry). Exposed primarily for tests that want
+    to exercise the I/O path without async plumbing.
+
+    ``prompt_version`` defaults to the current module-level
+    ``_NOTE_PROMPT_VERSION``; callers may pass an explicit value to write
+    a stale entry (used by tests to simulate prompt-evolution invalidation).
+    """
     cache = load_cache(course_id)
     cache[source_file] = {
         "chunk_hash": chunk_hash_value,
         "content": content,
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "model": model,
+        "prompt_version": (
+            prompt_version if prompt_version is not None else _NOTE_PROMPT_VERSION
+        ),
     }
     save_cache(course_id, cache)
+
+
+async def write_cache_entry(
+    course_id: str,
+    source_file: str,
+    *,
+    chunk_hash_value: str,
+    content: str,
+    model: str = "",
+    prompt_version: str | None = None,
+) -> None:
+    """Update one cache entry, atomically rewriting the whole cache file.
+
+    Wraps the read-modify-write in a per-course asyncio.Lock so concurrent
+    callers for the SAME course don't drop each other's entries. The
+    actual disk I/O runs via asyncio.to_thread so blocking writes don't
+    stall the event loop.
+
+    Cheap for typical course sizes (10–30 entries × a few KB each).
+    """
+    lock = _get_course_cache_lock(course_id)
+    async with lock:
+        await asyncio.to_thread(
+            _write_cache_entry_unlocked,
+            course_id,
+            source_file,
+            chunk_hash_value=chunk_hash_value,
+            content=content,
+            model=model,
+            prompt_version=prompt_version,
+        )
 
 
 def prune_stale_cache(course_id: str, active_source_files: set[str]) -> int:
@@ -273,8 +396,29 @@ def plan_for_course(
         if entry and isinstance(entry, dict):
             stored_hash = entry.get("chunk_hash")
             stored_body = entry.get("content")
-            if stored_hash == cache_key and isinstance(stored_body, str) and stored_body.strip():
-                cached_content = stored_body
+            stored_prompt_version = entry.get("prompt_version")
+            # All three of (chunk_hash, prompt_version, content) must match
+            # current state. Stale prompt_version → entry was produced by
+            # an older prompt; regen so the LLM uses the current rubric.
+            if (
+                stored_hash == cache_key
+                and stored_prompt_version == _NOTE_PROMPT_VERSION
+                and isinstance(stored_body, str)
+                and stored_body.strip()
+            ):
+                # Defense in depth: re-run the sanitizer on the cached body.
+                # A tampered cache file (or one written by a buggy build
+                # that bypassed the per-file sanitizer) MUST NOT ship
+                # malicious LaTeX to the client / tectonic.
+                try:
+                    cached_content = check(stored_body)
+                except LaTeXUnsafeError as e:
+                    logger.warning(
+                        "cache entry rejected for course=%s file=%s — "
+                        "unsafe LaTeX: %s",
+                        course_id, source_file, e.reason,
+                    )
+                    cached_content = None
 
         # LaTeX-output fix-all v3 #1: prime LLM with `\cite{}` not `[Source:]`.
         # Same fix as note_generator.prepare_inputs — without it the LLM

@@ -89,6 +89,32 @@ class QwenRaftBackend(LLMBackend):
             fn_index if fn_index is not None
             else int(os.getenv("QWEN_RAFT_FN_INDEX", "0"))
         )
+        # fix-all v2 (R4-5 review-swarm): cache a single httpx.AsyncClient
+        # per backend instance so we don't pay TCP+TLS handshake (~150-400ms
+        # over WAN to AutoDL) on every chat turn / status poll. The client
+        # is lazily created on first use; callers can opt into shutdown via
+        # `aclose()` but the leak across process lifetime is acceptable
+        # (the backend instance lives module-level in api/server.py).
+        self._client: httpx.AsyncClient | None = None
+
+    def _get_client(self) -> httpx.AsyncClient:
+        """Lazy-create + cache the shared httpx.AsyncClient. The base
+        timeout is the chat-path timeout (``self.timeout``); the cheaper
+        health probe overrides via ``client.get(..., timeout=...)``."""
+        if self._client is None:
+            self._client = httpx.AsyncClient(timeout=self.timeout)
+        return self._client
+
+    async def aclose(self) -> None:
+        """Close the cached httpx.AsyncClient. Not wired into any FastAPI
+        lifespan today (the leak across process lifetime is acceptable);
+        exposed as an opt-in hook for callers that want clean shutdown
+        (e.g. test teardown)."""
+        if self._client is not None:
+            try:
+                await self._client.aclose()
+            finally:
+                self._client = None
 
     # ── Capability gate ────────────────────────────────────────────
 
@@ -105,8 +131,12 @@ class QwenRaftBackend(LLMBackend):
         if not self.configured:
             return {"ok": False, "reason": "not_configured"}
         try:
-            async with httpx.AsyncClient(timeout=min(self.timeout, 5.0)) as client:
-                resp = await client.get(self.url + "/", headers=self._headers())
+            client = self._get_client()
+            resp = await client.get(
+                self.url + "/",
+                headers=self._headers(),
+                timeout=min(self.timeout, 5.0),
+            )
             return {"ok": 200 <= resp.status_code < 400, "status": resp.status_code}
         except httpx.TimeoutException:
             return {"ok": False, "reason": "timeout"}
@@ -141,12 +171,12 @@ class QwenRaftBackend(LLMBackend):
         payload = {"data": [combined], "fn_index": self.fn_index}
         start = time.monotonic()
         try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                resp = await client.post(
-                    self.url + "/api/predict",
-                    json=payload,
-                    headers=self._headers(),
-                )
+            client = self._get_client()
+            resp = await client.post(
+                self.url + "/api/predict",
+                json=payload,
+                headers=self._headers(),
+            )
         except httpx.TimeoutException as exc:
             raise QwenBackendError("timeout", str(exc)) from exc
         except httpx.HTTPError as exc:

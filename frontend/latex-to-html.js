@@ -137,7 +137,20 @@
         return " CITE" + (citeBuf.length - 1) + " ";
       });
 
-    // Stage 3: stash whitelisted envs. Multi-pass for nesting (cap 6).
+    // Stage 3: stash whitelisted envs.
+    //
+    // Recursive descent (review-swarm fix-all): a regex like
+    // `\\begin\{(env)\}[\s\S]*?\\end\{\1\}` with non-greedy `*?` + backref
+    // only ever matches the OUTERMOST same-name end. A flat multi-pass loop
+    // therefore stashes only top-level envs — any env nested inside
+    // another's `inner` string survives into envBuf untouched. Stage 8
+    // restores envs via `renderInnerFragment(inner)`, which is inline-only
+    // (escape + inline macros) so a nested `\begin{proof}…\end{proof}`
+    // would render as literal escaped text instead of a `.thm-proof` box.
+    //
+    // Fix: descend into each match's `inner` first, then push. Recursion
+    // pushes into the SAME outer envBuf so ENV indices stay consistent
+    // across nesting depths.
     var envBuf = [];
     var envAlternation = ENV_NAMES.map(function (e) { return e.replace("*", "\\*"); }).join("|");
     var envRe = new RegExp(
@@ -147,15 +160,14 @@
       "\\\\end\\{\\1\\}",
       "g"
     );
-    for (var pass = 0; pass < 6; pass++) {
-      var touched = false;
-      text = text.replace(envRe, function (_m, env, optionalName, inner) {
-        touched = true;
-        envBuf.push({ env: env, optionalName: optionalName || "", inner: inner });
+    function envStashRecursive(input) {
+      return input.replace(envRe, function (_m, env, optionalName, inner) {
+        var stashedInner = envStashRecursive(inner);
+        envBuf.push({ env: env, optionalName: optionalName || "", inner: stashedInner });
         return " ENV" + (envBuf.length - 1) + " ";
       });
-      if (!touched) break;
     }
+    text = envStashRecursive(text);
 
     // Stage 4: stash unknown envs (escape hatch — not on whitelist).
     var unknownBuf = [];
@@ -220,7 +232,15 @@
         .map(function (s) { return "<li>" + renderInnerFragment(s) + "</li>"; })
         .join("");
     }
-    html = html.replace(/\s?ENV(\d+)\s?/g, function (_m, idx) {
+    // Env restore: loop until no ENV_n placeholders remain. The recursive
+    // envStashRecursive (Stage 3) preserved nested-env placeholders inside
+    // outer entries' `inner` strings — renderInnerFragment doesn't expand
+    // ENV_n by itself (it's inline-only), so a single replace pass would
+    // leave `ENV0` literal text inside a `.thm-theorem` box that wraps a
+    // nested proof. Loop with a cap (matches Stage 3 envBuf depth ceiling
+    // implicitly via envBuf.length); break early when no placeholder
+    // matched in a pass.
+    function envRestore(_m, idx) {
       var spec = envBuf[Number(idx)];
       var env = spec.env;
       var optionalName = spec.optionalName;
@@ -241,7 +261,13 @@
         return "<pre class=\"latex-unknown\">" + escapeHtml(inner) + "</pre>";
       }
       return rendered;
-    });
+    }
+    var envPlaceholderRe = /\s?ENV(\d+)\s?/g;
+    for (var envPass = 0; envPass < envBuf.length + 1; envPass++) {
+      if (!envPlaceholderRe.test(html)) break;
+      envPlaceholderRe.lastIndex = 0;
+      html = html.replace(envPlaceholderRe, envRestore);
+    }
 
     // Stage 9: restore cite chips.
     //

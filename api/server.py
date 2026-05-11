@@ -1157,8 +1157,7 @@ async def stream_full_course_notes(req: NoteFullCourseRequest, request: Request)
                             # cache write failure (disk full, etc.) shouldn't
                             # break the generation — log and continue.
                             try:
-                                await asyncio.to_thread(
-                                    notes_full_course.write_cache_entry,
+                                await notes_full_course.write_cache_entry(
                                     course_id, plan.source_file,
                                     chunk_hash_value=plan.cache_key,
                                     content=result.content,

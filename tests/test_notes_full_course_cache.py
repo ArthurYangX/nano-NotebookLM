@@ -20,8 +20,10 @@ Coverage:
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import json
+import logging
 from pathlib import Path
 from unittest.mock import patch, AsyncMock
 
@@ -136,8 +138,10 @@ def test_write_cache_entry_updates_one_key(isolated_course):
         "a.pdf": {"chunk_hash": "h1", "content": "A", "generated_at": "t", "model": "m"},
         "b.pdf": {"chunk_hash": "h2", "content": "B", "generated_at": "t", "model": "m"},
     })
-    nfc.write_cache_entry("testcourse", "a.pdf",
-                          chunk_hash_value="h1-new", content="A2")
+    asyncio.run(nfc.write_cache_entry(
+        "testcourse", "a.pdf",
+        chunk_hash_value="h1-new", content="A2",
+    ))
     cache = nfc.load_cache("testcourse")
     assert cache["a.pdf"]["chunk_hash"] == "h1-new"
     assert cache["a.pdf"]["content"] == "A2"
@@ -205,6 +209,7 @@ def test_plan_for_course_cache_hit_fills_cached_content(isolated_course):
             "content": "\\section{a.pdf}\nCACHED BODY",
             "generated_at": "2026-05-11T00:00:00+00:00",
             "model": "gpt-5.4",
+            "prompt_version": nfc._NOTE_PROMPT_VERSION,
         },
     })
     plans = nfc.plan_for_course(kb, "testcourse")
@@ -245,6 +250,7 @@ def test_plan_for_course_force_refresh_ignores_cache(isolated_course):
             "content": "CACHED BODY",
             "generated_at": "2026-05-11T00:00:00+00:00",
             "model": "",
+            "prompt_version": nfc._NOTE_PROMPT_VERSION,
         },
     })
     plans = nfc.plan_for_course(kb, "testcourse", force_refresh=True)
@@ -273,6 +279,7 @@ def test_plan_for_course_partial_hit_new_file(isolated_course):
             "content": f"\\section{{file_{i:02d}.pdf}}\nbody {i}",
             "generated_at": "2026-05-11T00:00:00+00:00",
             "model": "",
+            "prompt_version": nfc._NOTE_PROMPT_VERSION,
         }
     nfc.save_cache("testcourse", cache)
 
@@ -331,6 +338,7 @@ def test_endpoint_emits_file_cached_for_hit(endpoint_client, monkeypatch):
             "content": f"\\section{{{source_file}}}\nCACHED",
             "generated_at": "2026-05-11T00:00:00+00:00",
             "model": "",
+            "prompt_version": nfc._NOTE_PROMPT_VERSION,
         }
     nfc.save_cache("testcourse", cache)
 
@@ -485,3 +493,140 @@ def test_endpoint_prunes_stale_cache_on_request(endpoint_client, monkeypatch):
 
     cache = nfc.load_cache("testcourse")
     assert "ghost-file.pdf" not in cache
+
+
+# ── Cache hardening v1 (2026-05-11) ──────────────────────────────────
+
+
+def test_plan_for_course_prompt_version_mismatch_misses(isolated_course):
+    """An entry whose chunk_hash matches but whose prompt_version is stale
+    (e.g. the team edited NOTE_FORMAT_LATEX after the entry was written)
+    must be treated as a cache miss. The on-disk body was produced under
+    an outdated rubric and needs to regenerate."""
+    from nano_notebooklm.skills import notes_full_course as nfc
+
+    chunks = [_mk_chunk(1, "a.pdf")]
+    kb = _FakeKB(chunks)
+    capped_hash = nfc.chunk_hash(chunks)
+    nfc.save_cache("testcourse", {
+        "a.pdf": {
+            "chunk_hash": capped_hash,
+            "content": "\\section{a.pdf}\nOLD BODY",
+            "generated_at": "2026-05-10T00:00:00+00:00",
+            "model": "gpt-5.4",
+            # Deliberately a different version string from current
+            "prompt_version": "deadbeef",
+        },
+    })
+    plans = nfc.plan_for_course(kb, "testcourse")
+    assert len(plans) == 1
+    assert plans[0].cached_content is None
+
+
+def test_plan_for_course_rejects_unsafe_cached_content(isolated_course, caplog):
+    """Defense in depth: even if the on-disk cache file was tampered with
+    to inject `\\input{/etc/passwd}`, the read-time sanitizer rejects it
+    and plan_for_course treats the entry as a miss, logging at WARNING."""
+    from nano_notebooklm.skills import notes_full_course as nfc
+
+    chunks = [_mk_chunk(1, "a.pdf")]
+    kb = _FakeKB(chunks)
+    capped_hash = nfc.chunk_hash(chunks)
+    nfc.save_cache("testcourse", {
+        "a.pdf": {
+            "chunk_hash": capped_hash,
+            # Looks legitimate, but contains a forbidden command. The
+            # sanitizer's pattern catches `\input` followed by a non-letter.
+            "content": "\\section{a.pdf}\nbody \\input{/etc/passwd} more",
+            "generated_at": "2026-05-11T00:00:00+00:00",
+            "model": "gpt-5.4",
+            "prompt_version": nfc._NOTE_PROMPT_VERSION,
+        },
+    })
+    with caplog.at_level(logging.WARNING, logger="nano_notebooklm.skills.notes_full_course"):
+        plans = nfc.plan_for_course(kb, "testcourse")
+    assert len(plans) == 1
+    assert plans[0].cached_content is None
+    # The rejection produced a WARNING log mentioning the file
+    assert any(
+        "unsafe LaTeX" in rec.getMessage() and "a.pdf" in rec.getMessage()
+        for rec in caplog.records
+    ), [rec.getMessage() for rec in caplog.records]
+
+
+def test_save_cache_writes_v1_envelope(isolated_course):
+    """On-disk JSON is wrapped in {"version": 1, "entries": {...},
+    "prompt_version": "..."}. Old direct {source_file: entry} shape is
+    not produced by save_cache anymore (load_cache still accepts it for
+    legacy reads — covered by test_load_cache_accepts_legacy_v0_dict)."""
+    from nano_notebooklm.skills import notes_full_course as nfc
+
+    nfc.save_cache("testcourse", {
+        "a.pdf": {"chunk_hash": "h", "content": "x", "generated_at": "t", "model": ""},
+    })
+    p = isolated_course / "courses" / "testcourse" / "notes" / "per_file_cache.json"
+    raw = json.loads(p.read_text(encoding="utf-8"))
+    assert isinstance(raw, dict)
+    assert raw.get("version") == 1
+    assert raw.get("prompt_version") == nfc._NOTE_PROMPT_VERSION
+    assert isinstance(raw.get("entries"), dict)
+    assert "a.pdf" in raw["entries"]
+
+
+def test_load_cache_accepts_legacy_v0_dict(isolated_course):
+    """Pre-create a bare-dict JSON file on disk (the v0 shape that shipped
+    before this hardening). load_cache should treat it as entries — no
+    operator action required to migrate."""
+    from nano_notebooklm.skills import notes_full_course as nfc
+
+    p = isolated_course / "courses" / "testcourse" / "notes" / "per_file_cache.json"
+    # v0 legacy: bare dict mapping source_file → entry, no version envelope
+    legacy = {
+        "old.pdf": {
+            "chunk_hash": "h",
+            "content": "OLD",
+            "generated_at": "2026-05-10T00:00:00+00:00",
+            "model": "",
+        },
+    }
+    p.write_text(json.dumps(legacy), encoding="utf-8")
+    loaded = nfc.load_cache("testcourse")
+    assert loaded == legacy
+
+
+def test_concurrent_writes_to_same_course_preserve_all_entries(isolated_course):
+    """N parallel write_cache_entry calls for N different source_files —
+    the per-course asyncio.Lock guarantees no entry is lost. Without the
+    lock the read→mutate→save sequence races and last-writer-wins drops
+    siblings; with it, the final cache has all N entries.
+
+    8 writers is enough to make the race surface reliably on Python's
+    cooperative scheduler — each writer awaits load_cache (file I/O)
+    which deterministically yields control to the others.
+    """
+    from nano_notebooklm.skills import notes_full_course as nfc
+
+    n = 8
+
+    async def run():
+        await asyncio.gather(*[
+            nfc.write_cache_entry(
+                "testcourse",
+                f"file_{i:02d}.pdf",
+                chunk_hash_value=f"hash-{i}",
+                content=f"\\section{{file_{i:02d}.pdf}}\nbody {i}",
+                model="test",
+            )
+            for i in range(n)
+        ])
+
+    asyncio.run(run())
+    cache = nfc.load_cache("testcourse")
+    assert len(cache) == n, f"expected {n} entries, got {len(cache)}: {sorted(cache)}"
+    for i in range(n):
+        key = f"file_{i:02d}.pdf"
+        assert key in cache
+        assert cache[key]["chunk_hash"] == f"hash-{i}"
+        assert f"body {i}" in cache[key]["content"]
+        # Each entry stamped with the current prompt_version
+        assert cache[key]["prompt_version"] == nfc._NOTE_PROMPT_VERSION

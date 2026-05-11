@@ -397,3 +397,159 @@ def test_upload_stages_contract_unchanged_after_r4_4():
     body = m.group(1)
     assert '"kg_stage_c"' not in body, \
         "R4-4 must not add kg_stage_c to UploadStage Literal (breaks R4-2 contract)"
+
+
+# ══════════════════════════════════════════════════════════════════════
+# R4-4 fix-all v3 (review-swarm follow-up) — mtime-keyed cache on _load_kg.
+# Each cache test seeds its OWN course_id so it doesn't share cache state
+# with sibling tests (the module-level cache is process-scoped). Tests
+# also reset the cache explicitly to keep coupling local.
+# ══════════════════════════════════════════════════════════════════════
+
+
+@pytest.fixture
+def _reset_kg_cache():
+    """Clear the module-level _KG_LOAD_CACHE around each test that asserts
+    cache semantics so prior test runs don't leak entries (the cache key
+    includes artifacts_dir so collisions are unlikely in practice, but a
+    flaky shared state is worse than the cleanup cost)."""
+    from nano_notebooklm.kb import graph_search as gs_mod
+    gs_mod._KG_LOAD_CACHE.clear()
+    yield
+    gs_mod._KG_LOAD_CACHE.clear()
+
+
+def test_kg_load_cache_returns_same_data_on_unchanged_mtime(
+    isolated_artifacts, monkeypatch, _reset_kg_cache,
+):
+    """Two consecutive _load_kg() calls with no mtime change → second call
+    must not re-read the file from disk."""
+    from nano_notebooklm.kb import graph_search as gs_mod
+
+    art = isolated_artifacts
+    nodes = [_make_node("n_a", "Alpha", "zebra zebra", chunk_id="ca")]
+    _seed_course(art, "cT", nodes, [], [_make_chunk_row("ca", "alpha")])
+
+    # Count Path.read_text calls scoped to knowledge_graph.json + edits.
+    real_read_text = Path.read_text
+    read_calls: list[str] = []
+
+    def _counting_read_text(self, *a, **kw):
+        if self.name in ("knowledge_graph.json", "mindmap_edits.json"):
+            read_calls.append(self.name)
+        return real_read_text(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "read_text", _counting_read_text)
+
+    art_path = Path(art)
+    first = gs_mod._load_kg("cT", art_path)
+    assert first is not None
+    first_count = len(read_calls)
+    assert first_count >= 1  # at least the kg file was read on miss
+
+    second = gs_mod._load_kg("cT", art_path)
+    assert second is not None
+    # Second call must reuse cache → no additional reads of either file.
+    assert len(read_calls) == first_count, (
+        f"expected no new read_text calls on cache hit, got "
+        f"{len(read_calls) - first_count} extra: {read_calls[first_count:]}"
+    )
+    # Returned dict is the cached instance (identity check).
+    assert second is first
+
+
+def test_kg_load_cache_invalidates_on_mtime_bump(
+    isolated_artifacts, monkeypatch, _reset_kg_cache,
+):
+    """After touch()-ing the kg file, the next _load_kg() must re-read."""
+    import time as _time
+    from nano_notebooklm.kb import graph_search as gs_mod
+
+    art = isolated_artifacts
+    nodes = [_make_node("n_a", "Alpha", "zebra zebra", chunk_id="ca")]
+    _seed_course(art, "cT2", nodes, [], [_make_chunk_row("ca", "alpha")])
+
+    real_read_text = Path.read_text
+    read_calls: list[str] = []
+
+    def _counting_read_text(self, *a, **kw):
+        if self.name == "knowledge_graph.json":
+            read_calls.append(self.name)
+        return real_read_text(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "read_text", _counting_read_text)
+
+    art_path = Path(art)
+    gs_mod._load_kg("cT2", art_path)
+    assert len(read_calls) == 1
+
+    # Bump mtime on the kg file. Sleep enough that the new mtime is
+    # distinguishable from the original on filesystems with second-
+    # resolution mtimes (most macOS HFS+/APFS is sub-second but
+    # belt-and-braces).
+    kg_path = art_path / "courses" / "cT2" / "knowledge_graph.json"
+    new_mtime = kg_path.stat().st_mtime + 5.0
+    import os as _os
+    _os.utime(kg_path, (new_mtime, new_mtime))
+
+    gs_mod._load_kg("cT2", art_path)
+    # Cache invalidated → second read happened.
+    assert len(read_calls) == 2
+
+
+def test_kg_load_cache_invalidates_on_edits_mtime_bump(
+    isolated_artifacts, monkeypatch, _reset_kg_cache,
+):
+    """Adding/updating mindmap_edits.json must invalidate the cache so
+    delete_node overlays from /api/mindmap/{id}/edit take effect on the
+    next chat without restarting the server."""
+    from nano_notebooklm.kb import graph_search as gs_mod
+
+    art = isolated_artifacts
+    nodes = [
+        _make_node("n_a", "Alpha", "zebra zebra", chunk_id="ca"),
+        _make_node("n_b", "Beta", "zebra and topic", chunk_id="cb"),
+    ]
+    _seed_course(art, "cT3", nodes, [], [
+        _make_chunk_row("ca", "alpha"), _make_chunk_row("cb", "beta"),
+    ])
+
+    art_path = Path(art)
+    # First load (no edits sidecar yet) — both nodes present.
+    first = gs_mod._load_kg("cT3", art_path)
+    assert {n["id"] for n in first["nodes"]} == {"n_a", "n_b"}
+
+    # Write an edits sidecar that deletes n_b.
+    edits_path = art_path / "courses" / "cT3" / "mindmap_edits.json"
+    edits_path.write_text(json.dumps([
+        {"op": "delete_node", "id": "n_b"},
+    ]))
+
+    second = gs_mod._load_kg("cT3", art_path)
+    # Overlay must drop n_b on the second call (cache invalidated by
+    # edits-file mtime change).
+    assert {n["id"] for n in second["nodes"]} == {"n_a"}
+
+
+def test_kg_load_returns_none_when_file_missing_does_not_cache_negative(
+    isolated_artifacts, _reset_kg_cache,
+):
+    """Negative result (no KG file) must not produce a sticky cache entry
+    — if the user uploads a course later and writes knowledge_graph.json,
+    the very next call should pick it up."""
+    from nano_notebooklm.kb import graph_search as gs_mod
+
+    art = isolated_artifacts
+    art_path = Path(art)
+    # Course dir exists but no KG file.
+    (art_path / "courses" / "cT4").mkdir(parents=True)
+    assert gs_mod._load_kg("cT4", art_path) is None
+
+    # Now write the KG file.
+    nodes = [_make_node("n_a", "Alpha", "zebra", chunk_id="ca")]
+    (art_path / "courses" / "cT4" / "knowledge_graph.json").write_text(
+        json.dumps({"nodes": nodes, "edges": [], "course_name": "cT4"})
+    )
+    out = gs_mod._load_kg("cT4", art_path)
+    assert out is not None
+    assert {n["id"] for n in out["nodes"]} == {"n_a"}

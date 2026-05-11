@@ -738,3 +738,108 @@ def test_hidden_courses_roundtrip():
         """
     )
     assert run_node(script).strip() == "ok"
+
+
+# ---------------------------------------------------------------------------
+# review-swarm fix-all (2026-05-11): Node-smoke regressions for the
+# latex-to-html shim. Each test stands the shim up via `require()`; the IIFE
+# in latex-to-html.js sets `module.exports` so no DOM shim is needed.
+# NanoMarkdown is optional (the shim falls back to a built-in escapeHtml +
+# no-op stashMath when the global is absent), so we can exercise the
+# rendering pipeline directly under Node.
+# ---------------------------------------------------------------------------
+
+
+def test_latex_nested_env_renders_with_styles():
+    """Stage-3 recursive env stash + Stage-8 looped restore: a `\\begin{proof}`
+    nested inside `\\begin{theorem}` must produce BOTH the `thm-theorem` and
+    `thm-proof` div classes. The pre-fix multi-pass loop only caught the
+    outer env; the inner `\\begin{proof}` survived as literal escaped text
+    inside renderInnerFragment's output."""
+    script = textwrap.dedent(
+        """
+        const NL = require('./frontend/latex-to-html.js');
+        const html = NL.latexToHtml('\\\\begin{theorem}outer body \\\\begin{proof}qed\\\\end{proof}\\\\end{theorem}');
+        if (!html.includes('thm-box thm-theorem')) throw new Error('outer theorem class missing: ' + html);
+        if (!html.includes('thm-box thm-proof')) throw new Error('nested proof class missing (regression): ' + html);
+        // Proof box must live INSIDE the theorem box, not adjacent to it.
+        const theoremIdx = html.indexOf('thm-theorem');
+        const proofIdx = html.indexOf('thm-proof');
+        if (theoremIdx < 0 || proofIdx < 0 || proofIdx < theoremIdx) {
+          throw new Error('proof should appear after theorem in the html: ' + html);
+        }
+        console.log('ok');
+        """
+    )
+    assert run_node(script).strip() == "ok"
+
+
+def test_latex_extract_toc_strips_inline_macros():
+    """extractTOC must reduce `\\subsection{\\texttt{leaq}：地址计算指令}` to
+    plain text `leaq：地址计算指令` so the sidebar shows readable titles
+    instead of literal LaTeX macros."""
+    script = textwrap.dedent(
+        """
+        const NL = require('./frontend/latex-to-html.js');
+        const toc = NL.extractTOC('\\\\subsection{\\\\texttt{leaq}：地址计算指令}');
+        if (toc.length !== 1) throw new Error('expected 1 entry, got ' + toc.length);
+        if (toc[0].text !== 'leaq：地址计算指令') {
+          throw new Error('inline macro not stripped: ' + JSON.stringify(toc[0]));
+        }
+        if (toc[0].text.startsWith('\\\\texttt')) {
+          throw new Error('leading \\\\texttt survived: ' + toc[0].text);
+        }
+        console.log('ok');
+        """
+    )
+    assert run_node(script).strip() == "ok"
+
+
+def test_latex_cite_chip_normalises_colon_to_comma():
+    """`\\cite{file.pdf:Page 4/50}` must emit a chip whose data-cite is in
+    canonical `[Source: file.pdf, Page 4/50]` form — the comma split is the
+    contract resolveCitationNavigation parses in study-state.js."""
+    script = textwrap.dedent(
+        """
+        const NL = require('./frontend/latex-to-html.js');
+        const html = NL.latexToHtml('\\\\cite{file.pdf:Page 4/50}');
+        if (!html.includes('data-cite="[Source: file.pdf, Page 4/50]"')) {
+          throw new Error('comma form not produced: ' + html);
+        }
+        if (html.includes('data-cite="[Source: file.pdf:Page 4/50]"')) {
+          throw new Error('legacy colon form leaked into data-cite: ' + html);
+        }
+        // The display label (chip text) should also use the comma form.
+        if (!html.includes('>file.pdf, Page 4/50</button>')) {
+          throw new Error('chip label not normalised: ' + html);
+        }
+        console.log('ok');
+        """
+    )
+    assert run_node(script).strip() == "ok"
+
+
+def test_latex_cite_chip_inside_env_populates():
+    """v3 #4 regression: a `\\cite` inside `\\begin{theorem}` must still
+    produce a chip with a non-empty data-cite attribute. The pre-v3 code
+    recursively called latexToHtml inside renderInnerFragment with a fresh
+    citeBuf, which looked CITE_n up in an empty buffer and emitted
+    `[Source: ]` chips. Confirms renderInnerFragment now preserves the
+    placeholder for the outer Stage-9 sweep."""
+    script = textwrap.dedent(
+        """
+        const NL = require('./frontend/latex-to-html.js');
+        const html = NL.latexToHtml('\\\\begin{theorem}body \\\\cite{x.pdf:p1}\\\\end{theorem}');
+        if (!html.includes('thm-box thm-theorem')) throw new Error('theorem missing: ' + html);
+        // The chip should be present with the actual filename + location,
+        // not the empty `[Source: ]` regression form.
+        if (!html.includes('data-cite="[Source: x.pdf, p1]"')) {
+          throw new Error('cite-in-env did not populate data-cite: ' + html);
+        }
+        if (html.includes('data-cite="[Source: ]"')) {
+          throw new Error('empty data-cite leaked: ' + html);
+        }
+        console.log('ok');
+        """
+    )
+    assert run_node(script).strip() == "ok"

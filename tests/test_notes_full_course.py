@@ -521,6 +521,11 @@ def test_endpoint_cancels_outstanding_tasks_on_disconnect(fc_client, monkeypatch
     # Only a couple of workers should have entered the LLM call before
     # cancellation — definitely fewer than the 5 plans.
     assert started < 5, f"cancellation failed: {started} workers ran past sleep"
+
+
+def test_endpoint_rejects_invalid_concurrency(fc_client):
+    """Pydantic validation: concurrency must be in [1, 8]. Values outside
+    the range surface as 422 with a structured error body."""
     client, _ = fc_client
     # concurrency=0 is below the ge=1 floor → 422 from Pydantic
     response = client.post("/api/notes/full-course/stream",

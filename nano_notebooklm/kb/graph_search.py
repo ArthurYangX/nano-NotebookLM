@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 from collections import deque
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -47,6 +48,18 @@ DEFAULT_HOP_LIMIT = 2
 DEFAULT_MAX_CHUNKS = 30
 
 
+# fix-all v2 (R4-4 review-swarm follow-up): mtime-keyed cache so each chat
+# turn doesn't re-read + parse `knowledge_graph.json` + `mindmap_edits.json`
+# (100-500ms of sync I/O on a 15K-chunk course). Value =
+# (overlayed_kg_dict, kg_mtime, edits_mtime). Read-only after population
+# per-course-version — we only ever REPLACE entries, never mutate them in
+# place, so plain dict lookups across asyncio tasks are safe. The lock only
+# serialises the read-and-replace path so two concurrent first-loads don't
+# both pay disk cost.
+_KG_LOAD_CACHE: dict[str, tuple[dict[str, Any], float, float]] = {}
+_KG_LOAD_CACHE_LOCK = threading.Lock()
+
+
 def _concept_embed_text(node: dict[str, Any]) -> str:
     """fix-all v1 #C8 + v3 #L5 (R4-4 review-swarm): adapter around the
     extractor's canonical helper so lazy-recompute embeddings can never
@@ -66,10 +79,46 @@ def _concept_embed_text(node: dict[str, Any]) -> str:
     ))
 
 
+def _cache_key(course_id: str, artifacts_dir: Path) -> str:
+    """Cache key folds artifacts_dir in so tests using ``tmp_path`` per case
+    don't collide with a long-running server's cache entry for the same
+    course_id under the production artifacts dir."""
+    return f"{artifacts_dir}::{course_id}"
+
+
 def _load_kg(course_id: str, artifacts_dir: Path) -> dict[str, Any] | None:
+    """Load + overlay the course KG with mtime-keyed memoisation.
+
+    fix-all v2 (R4-4 follow-up): every graphrag chat used to re-read +
+    parse `knowledge_graph.json` + `mindmap_edits.json` (~100-500ms of
+    sync I/O on a 15K-chunk course). We now cache the overlayed dict
+    keyed by both file mtimes — on a cache hit, no disk read; on mtime
+    bump (re-extraction or new student edit), we silently re-read.
+    """
     kg_path = artifacts_dir / "courses" / course_id / "knowledge_graph.json"
     if not kg_path.exists():
         return None
+
+    try:
+        kg_mtime = kg_path.stat().st_mtime
+    except OSError:
+        return None
+
+    edits_path = artifacts_dir / "courses" / course_id / "mindmap_edits.json"
+    try:
+        edits_mtime = edits_path.stat().st_mtime if edits_path.exists() else 0.0
+    except OSError:
+        edits_mtime = 0.0
+
+    key = _cache_key(course_id, artifacts_dir)
+    # Fast-path: matched mtimes → return cached dict without touching disk.
+    cached = _KG_LOAD_CACHE.get(key)
+    if cached is not None and cached[1] == kg_mtime and cached[2] == edits_mtime:
+        return cached[0]
+
+    # Slow-path: read + overlay, then publish under the lock so concurrent
+    # first-loads don't both pay the cost (one wins; the other's overwrite
+    # is idempotent — same mtimes, same content).
     try:
         kg = json.loads(kg_path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
@@ -86,7 +135,11 @@ def _load_kg(course_id: str, artifacts_dir: Path) -> dict[str, Any] | None:
     # (re-extraction rewrites the whole file); student edits live in a
     # sidecar mindmap_edits.json replayed on every read in api/server.py
     # — graphrag previously bypassed this overlay by reading the raw KG.
-    return _apply_minimal_edit_overlay(kg, course_id, artifacts_dir)
+    overlayed = _apply_minimal_edit_overlay(kg, course_id, artifacts_dir)
+
+    with _KG_LOAD_CACHE_LOCK:
+        _KG_LOAD_CACHE[key] = (overlayed, kg_mtime, edits_mtime)
+    return overlayed
 
 
 def _apply_minimal_edit_overlay(
@@ -225,13 +278,18 @@ def _resolve_node_embeddings(
         # cache-miss list. On legacy KGs (no cached embeddings on disk)
         # that's the entire ranking input → graph_search silently
         # returned []. Fall back to per-node embed so a single bad text
-        # only loses its own node, not all 200. Log without exc_info to
-        # avoid leaking request bodies from openai-python tracebacks
-        # (#V5 PII scrub principle).
+        # only loses its own node, not all 200.
+        # fix-all v3 (R4-4 follow-up review-swarm): drop `str(exc)` from
+        # the format args — under EMBEDDING_MODE=api the openai-python
+        # APIError carries the request body (the failing input texts —
+        # i.e. concept names + definitions) in its repr, which would
+        # leak into log shippers. Type name (+ optional `code` attr on
+        # APIError) is sufficient for triage; mirrors qa_skill.py:622-628.
+        code = getattr(exc, "code", type(exc).__name__)
         logger.warning(
-            "graph_search: batched lazy embed failed (%s: %s); "
+            "graph_search: batched lazy embed failed (%s); "
             "falling back to per-node embed for %d nodes",
-            type(exc).__name__, exc, len(to_compute),
+            code, len(to_compute),
         )
         _resolve_per_node(to_compute, embed_fn, expected_dim, cache)
         return cache
@@ -341,9 +399,13 @@ def graph_search(
         # query-embed path. In EMBEDDING_MODE=api, the openai-python SDK's
         # exception object often carries the request body (`input=[query]`)
         # in its repr/traceback, which would land the user's question in
-        # log shippers. Type + message is sufficient for triage.
-        logger.warning("graph_search: embed_fn failed on query (%s: %s)",
-                       type(exc).__name__, exc)
+        # log shippers.
+        # fix-all v3 (R4-4 follow-up review-swarm): also drop `str(exc)`
+        # from the format args — `APIError.__str__` includes the request
+        # body, so even the message-only render (without exc_info) leaks
+        # the user's question text. Mirrors qa_skill.py:622-628.
+        code = getattr(exc, "code", type(exc).__name__)
+        logger.warning("graph_search: embed_fn failed on query (%s)", code)
         return []
 
     expected_dim = int(q_emb.shape[0])
