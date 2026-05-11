@@ -289,7 +289,29 @@ STRICTLY FORBIDDEN (output will be rejected):
   \verbatiminput, \InputIfFileExists, \loop, \csname
 
 Do not emit Markdown syntax (`##`, `**bold**`, `- bullet`) — the renderer
-ignores anything outside the macro set above."""
+ignores anything outside the macro set above.
+
+LaTeX-output fix-all v3 #2: an explicit good-vs-bad example, because earlier
+GPT-5.x runs mirrored the markdown shape of the [Source:] markers in the
+input. We now prime input with `\cite{}` AND show output expectations.
+
+BAD (do not produce):
+  ## Attention 机制
+  **Query**：表示"我要找什么"的向量。
+  - 公式：$E = QK^T / \sqrt{D_Q}$
+  [Source: lecture_8.pdf, Page 40/122]
+
+GOOD (produce exactly this shape — LaTeX commands, environments, \cite{}):
+  \section{Attention 机制}
+  \begin{definition}[Query]
+  \textbf{Query}（查询）：表示"我要找什么"的向量。\cite{lecture_8.pdf:Page 40/122}
+  \end{definition}
+  公式：$E = QK^T / \sqrt{D_Q}$ \cite{lecture_8.pdf:Page 40/122}
+
+If the source material below contains markdown-style markers, IGNORE the
+format and re-encode the content into the LaTeX macro set above. The
+renderer will not display `##`, `**`, `- `, or `[Source:]` literally — it
+will appear to the student as either raw text or be silently dropped."""
 
 # Server-side preamble used by the tectonic PDF compile endpoint and any other
 # path that needs to stitch the LLM body into a compilable document. Keeps

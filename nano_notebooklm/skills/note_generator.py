@@ -49,8 +49,13 @@ class NoteGeneratorSkill(Skill):
         if not results:
             return None
 
+        # LaTeX-output fix-all v3 #1: prime the LLM with the citation
+        # format we want OUT in the format we feed IN. Earlier the source
+        # text used "[Source: file, loc]" — a markdown-flavoured marker that
+        # the LLM mirrored back instead of emitting `\cite{file:loc}`. With
+        # `\cite{...}` already in the input, GPT-5.x reliably keeps it.
         source_text = "\n\n---\n\n".join(
-            f"[Source: {r.source_file}, {r.location}]\n{r.text}"
+            f"\\cite{{{r.source_file}:{r.location}}}\n{r.text}"
             for r in results
         )
         prompt = prompts.NOTE_GENERATION_PROMPT.format(

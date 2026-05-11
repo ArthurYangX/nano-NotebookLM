@@ -103,8 +103,12 @@ def plan_for_course(
     plans: list[FilePlan] = []
     for idx, (source_file, file_chunks) in enumerate(groups.items()):
         capped = file_chunks[:MAX_CHUNKS_PER_FILE]
+        # LaTeX-output fix-all v3 #1: prime LLM with `\cite{}` not `[Source:]`.
+        # Same fix as note_generator.prepare_inputs — without it the LLM
+        # mirrored the markdown-flavoured [Source:] marker straight into the
+        # output, dragging the rest of the response into markdown shape.
         source_text = "\n\n---\n\n".join(
-            f"[Source: {c.source_file}, {c.location}]\n{c.text}"
+            f"\\cite{{{c.source_file}:{c.location}}}\n{c.text}"
             for c in capped
         )
         prompt = prompts.NOTE_GENERATION_PROMPT.format(
