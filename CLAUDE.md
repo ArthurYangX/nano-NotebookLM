@@ -271,6 +271,41 @@ nano_notebooklm/   Python backend modules
   `delete_edge` ops so student-deleted nodes no longer seed
   retrieval. Adds 16 regression tests in
   tests/test_r4_4_fix_all_v2.py.
+- R4-4 fix-all v3 (2026-05-11, LOW backlog clean + real-behavior tests):
+  closes 12 LOW items from v1/v2 review-swarms and upgrades 3 grep pins
+  to true behavioral assertions. (T1) `test_extract_from_chunks_yields
+  _event_loop_during_embed` proves A2's `asyncio.to_thread(embed_fn,
+  texts)` actually off-loads — a concurrent ticker coroutine ticks ≥ 5
+  times during a 100ms embed sleep. (T2) `test_startup_hook_fire_and
+  _forget_does_not_block_status` proves B7's fire-and-forget — TestClient
+  reaches /api/status in < 350ms despite a 400ms slow_embed warmup.
+  (T3) `test_per_node_fallback_only_loses_poisoned_node` proves V4's
+  per-node fallback: a POISON_BOMB sentinel node only loses itself, the
+  other four still rank. (L4) `_maybe_graphrag` now wraps graph_search
+  in `asyncio.wait_for(timeout=GRAPHRAG_TIMEOUT_SECONDS=10s)` so a
+  stalled embed_fn falls through to RAG instead of hanging the chat.
+  (L5) `graph_search._concept_embed_text` builds a real `Concept`
+  instance instead of a duck-typed _Shim — signature drift in the
+  extractor helper now raises ValidationError at construction rather
+  than silently dropping every cache-miss node into a broad except.
+  (L6) `_normalize_kg_nodes` strip of `concept_embedding` is now pinned
+  by a positive isolation test so a future spread-operator refactor
+  breaks loudly rather than silently shipping ~300KB float arrays per
+  /api/mindmap request. (L7) `KnowledgeGraph.add_concepts` merge branch
+  overwrites concept_embedding on dimension mismatch (operator switched
+  EMBEDDING_MODE local→api → re-extract no longer stuck on stale 384d
+  cache). (L8) end-to-end test pins the graphrag-zero → RAG → cross-
+  course fallback chain (course A's empty KG + course B's strong match
+  → path="cross-course" + cross_course_origin="courseB"). (L9) end-to-
+  end test pins user_lang × graphrag — `Reply ONLY in zh` addendum lands
+  in the system prompt even when the graphrag branch fires. (L10)
+  `_graphrag_enabled` semantics inverted to fail-safe: only an explicit
+  enable token (`1/true/yes/on/enabled`) keeps graphrag on, anything
+  else (typos, unknown spellings) disables. (L11) `server.py:_warm
+  _embed_fn` carries an attribution comment back-referencing commit
+  764276d (R4-4 fix-all v1) + abce190 (v2), so `git blame` doesn't
+  silently misattribute the design intent to R4-6's e60bca3.
+  Adds 11 regression tests in tests/test_r4_4_fix_all_v3.py.
 - Still missing for production: auth / multi-tenant, request rate limits,
   background-task ingestion, OpenAPI client codegen, structured metrics
   (Prometheus). Mastery is still read-only (KG editing landed in M3).

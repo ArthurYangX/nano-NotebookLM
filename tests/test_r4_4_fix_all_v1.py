@@ -299,7 +299,12 @@ def test_edit_node_drops_concept_embedding_on_definition_change(isolated_artifac
 
 
 def test_graphrag_enabled_kill_switch(monkeypatch):
-    """GRAPHRAG_ENABLED=0 / false / no / off / disabled must disable graphrag."""
+    """GRAPHRAG_ENABLED=0 / false / no / off / disabled disable graphrag.
+
+    fix-all v3 #L10 inverted the semantics to fail-safe: only an explicit
+    enable token re-enables graphrag, and anything else (typos, unknown
+    spellings) disables. Empty / missing defaults to on.
+    """
     from nano_notebooklm.skills import qa_skill
     monkeypatch.delenv("GRAPHRAG_ENABLED", raising=False)
     assert qa_skill._graphrag_enabled() is True  # default
@@ -307,7 +312,9 @@ def test_graphrag_enabled_kill_switch(monkeypatch):
         monkeypatch.setenv("GRAPHRAG_ENABLED", disabling)
         assert qa_skill._graphrag_enabled() is False, \
             f"GRAPHRAG_ENABLED={disabling!r} should disable graphrag"
-    for enabling in ("1", "true", "yes", "on", "", "anything-else"):
+    # Explicit enable tokens keep graphrag on; empty also stays on
+    # (operator hasn't expressed an intent).
+    for enabling in ("1", "true", "yes", "on", "enabled", ""):
         monkeypatch.setenv("GRAPHRAG_ENABLED", enabling)
         assert qa_skill._graphrag_enabled() is True, \
             f"GRAPHRAG_ENABLED={enabling!r} should keep graphrag enabled"

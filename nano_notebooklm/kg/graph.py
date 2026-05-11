@@ -49,11 +49,24 @@ class KnowledgeGraph:
                     existing["parent_topic"] = c.parent_topic
                 if existing.get("learning_order") is None and c.learning_order is not None:
                     existing["learning_order"] = c.learning_order
-                # fix-all v1 #A1: keep the first non-null concept_embedding.
-                # If existing already cached one, leave it (same first-seen
-                # discipline as parent_topic above); only fill on absence.
-                if existing.get("concept_embedding") is None and c.concept_embedding is not None:
-                    existing["concept_embedding"] = c.concept_embedding
+                # fix-all v1 #A1 + v3 #L7: keep the first non-null
+                # concept_embedding (first-seen discipline mirrors
+                # parent_topic above) — *except* when the existing
+                # embedding has a different dimension from the new one,
+                # which signals the operator switched EMBEDDING_MODE
+                # (e.g. local 384d → API 1536d). In that case the cached
+                # value is stale and graph_search would silently drop it
+                # on every query; overwrite so the next save persists the
+                # fresh dimension.
+                existing_emb = existing.get("concept_embedding")
+                new_emb = c.concept_embedding
+                if new_emb is not None:
+                    if existing_emb is None:
+                        existing["concept_embedding"] = new_emb
+                    elif (isinstance(existing_emb, list)
+                          and isinstance(new_emb, list)
+                          and len(existing_emb) != len(new_emb)):
+                        existing["concept_embedding"] = new_emb
             else:
                 self.graph.add_node(
                     c.concept_id,

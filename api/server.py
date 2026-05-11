@@ -86,6 +86,11 @@ app.add_middleware(
 )
 
 
+# Attribution (fix-all v3 #L11): the original embed_fn warm-up + status
+# surface designed in R4-4 review-swarm fix-all v1/v2 (commits 764276d /
+# abce190) but the actual server.py edits first landed in e60bca3
+# (R4-6 notes pipeline) because a parallel session committed R4-6
+# against a working tree that already contained the v1 changes.
 # fix-all v1 #B7 (R4-4 review-swarm): pre-warm kb.embed_fn at boot so the
 # first /api/mindmap, /api/upload, or graphrag /api/chat doesn't pay the
 # 5-30s sentence-transformer model download + load on the request hot

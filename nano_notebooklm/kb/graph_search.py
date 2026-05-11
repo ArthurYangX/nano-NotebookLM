@@ -34,7 +34,7 @@ import numpy as np
 
 from nano_notebooklm import config
 from nano_notebooklm.kg.extractor import _concept_embed_text as _extractor_embed_text
-from nano_notebooklm.types import SearchResult
+from nano_notebooklm.types import Concept, SearchResult
 
 logger = logging.getLogger(__name__)
 
@@ -48,17 +48,22 @@ DEFAULT_MAX_CHUNKS = 30
 
 
 def _concept_embed_text(node: dict[str, Any]) -> str:
-    """fix-all v1 #C8 (R4-4 review-swarm): adapter around the extractor's
-    canonical helper so lazy-recompute embeddings can never drift from the
-    cached batch-compute embeddings. Build a synthetic Concept-like object
-    that exposes the two fields the extractor reads (`name`, `definition`)
-    and delegate."""
-    class _Shim:
-        pass
-    shim = _Shim()
-    shim.name = (node.get("name") or "")
-    shim.definition = (node.get("definition") or "")
-    return _extractor_embed_text(shim)
+    """fix-all v1 #C8 + v3 #L5 (R4-4 review-swarm): adapter around the
+    extractor's canonical helper so lazy-recompute embeddings can never
+    drift from the cached batch-compute embeddings.
+
+    v1 used a `class _Shim: pass` instance, which silently AttributeErrors
+    if the extractor helper later reads any field beyond name/definition.
+    v3 replaces it with a real `Concept` instance so any signature drift
+    surfaces at construction time (Pydantic ValidationError) rather than
+    deep inside a graph_search broad-except clause that would drop every
+    cache-miss node.
+    """
+    return _extractor_embed_text(Concept(
+        concept_id=str(node.get("id") or "shim"),
+        name=str(node.get("name") or ""),
+        definition=str(node.get("definition") or ""),
+    ))
 
 
 def _load_kg(course_id: str, artifacts_dir: Path) -> dict[str, Any] | None:

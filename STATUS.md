@@ -408,6 +408,37 @@
 
 **review_notes**: 仍 deferred 到 v3（不阻塞）：(a) Reviewer 3 #3 KG/chunks.json mtime LRU cache；(b) Reviewer 3 #4 api_score 与 sort_key 不一致；(c) Reviewer 4 #4 mindmap GET concept_embedding 隔离 assert 测试；(d) graphrag-zero → cross-course 链 / user_lang × graphrag prompt 注入端到端测试；(e) `_Shim` 类型化用 Concept；(f) 6 个 preset KG 一次性 backfill script；(g) Reviewer 3 #1 SentenceTransformer 首加载竞争锁。
 
+#### R4-4 fix-all v3（2026-05-11，LOW 队列清理 + 真行为测试）
+
+- **status**: [review]
+- **owner**: claude
+- **submitted_at**: 2026-05-11
+
+清掉 fix-all v1+v2 review-swarm 出的 12 项 LOW + 3 个之前 grep-only 的回归保护改成真行为测试。**11 条新回归测试**。
+
+**真行为测试（替代 source-pin grep，更强保护）**：
+
+- **T1 A2 event-loop 不阻塞 真行为**：`test_extract_from_chunks_yields_event_loop_during_embed` — 注入 `slow_embed`（`time.sleep(100ms)`），并发 ticker coroutine（5ms cadence）必须在 embed 期间 tick ≥ 5 次。如果 embed_fn 跑在 event loop 上会被卡 100ms → 只 tick 0-1 次。验证 `await asyncio.to_thread(embed_fn, texts)` 真正 off-load。
+- **T2 B7 fire-and-forget 真行为**：`test_startup_hook_fire_and_forget_does_not_block_status` — 注入 `slow_embed`（`time.sleep(400ms)`），TestClient 起 app 后立即调 `/api/status`，boot + first response 必须 < 350ms（远小于 400ms warmup）。如果 startup 内 `await`，boot 会被卡 400ms+。
+- **T3 B4 poison-text 真行为**：`test_per_node_fallback_only_loses_poisoned_node` — 5 节点 KG，一个 "POISON_BOMB" sentinel 节点让 per-node embed_fn 也抛；其他 4 节点应该 ranked OK，poison 自己丢失（不影响别人）。
+
+**L 批 LOW 修复（8 条）**：
+
+- **L4 graph_search 加 10s timeout**（`asyncio.wait_for` in `_maybe_graphrag`）+ `GRAPHRAG_TIMEOUT_SECONDS` 常量。stalled embed_fn 不再无限阻塞 chat。
+- **L5 `_Shim` → 真 `Concept` 实例**：graph_search 的 `_concept_embed_text` 用 `Concept(concept_id=..., name=..., definition=...)` 代替 duck-typed `_Shim` class。extractor 帮助函数若未来读其他字段，Concept ValidationError 立即触发，不再被 broad except 吞。
+- **L6 mindmap GET 隔离测试**：`test_normalize_kg_nodes_strips_concept_embedding` 钉死 `_normalize_kg_nodes` 不把 `concept_embedding` 透出 wire（防 spread-refactor 退化）。
+- **L7 KnowledgeGraph.add_concepts merge 分支 dim-mismatch 时覆盖**：local 384d → API 1536d 切换后 re-extract，merge 不再 stuck 在 stale 384d 缓存。
+- **L8 graphrag-zero → cross-course 端到端**：`test_graphrag_zero_falls_through_to_cross_course` — 课 A KG 空 + 无 chunks；课 B 有强匹配 chunk。/api/chat course=A → 回应 `path="cross-course"`, `cross_course_origin="courseB"`。
+- **L9 user_lang × graphrag 端到端**：`test_user_lang_zh_addendum_lands_in_graphrag_system_prompt` — graphrag path 用 `user_lang=zh` 时 captured system prompt 含 "Reply ONLY in zh"。
+- **L10 GRAPHRAG_ENABLED 反转为 fail-safe**：原 v1 仅识别 5 个 disable token（`0/false/no/off/disabled`），typo 失败开。v3 反转：未识别值默认 disable，仅 5 个 enable token（`1/true/yes/on/enabled`）+ 空值保持 default-on。
+- **L11 attribution 注释 server.py:96**：注释指向 R4-4 fix-all v1 commit 764276d / v2 commit abce190，未来 `git blame` 不再误归属 R4-6。
+
+**files touched**: nano_notebooklm/kb/graph_search.py / nano_notebooklm/kg/graph.py / nano_notebooklm/skills/qa_skill.py / api/server.py / tests/test_r4_4_fix_all_v1.py（update kill-switch 期望对齐 L10 反转） + **新增** tests/test_r4_4_fix_all_v3.py（11 条）。**pytest**: **(待补)**。
+
+**self-check**: ☑ mini（3 真行为 + 8 LOW grep/单测）  ☑ corner（dim mismatch / poison node / unknown env token / wait_for timeout 常量）  ☑ no regression（待全 suite 验证）  ☑ offline。
+
+**review_notes**: 仍 deferred 到 v4 / 不阻塞：(a) Reviewer 3 #3 KG/chunks.json mtime LRU cache（架构性）；(b) Reviewer 3 #4 api_score 与 sort_key 一致性（公式重设计）；(c) 6 个 preset KG 一次性 backfill script（独立 ops 任务）；(d) SentenceTransformer 首加载竞争锁（pre-existing latent，并发首调试场景少见）；(e) test 1171s vs 343s 慢 3x 调查（与 R4-2/R4-6 测试 setup 相关，独立调研）。
+
 ### #R4-5 Backend backend 切换 chip：codex GPT-5.4 / Qwen2.5-7B-RAFT — [claude]
 
 - **goal ref**: GOAL.md Round 4 #R4-5

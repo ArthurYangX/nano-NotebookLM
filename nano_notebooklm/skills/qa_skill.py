@@ -34,6 +34,13 @@ logger = logging.getLogger(__name__)
 # latency budget. 5s is generous: codex GPT-5.5 typically translates in <1s.
 TRANSLATION_TIMEOUT_SECONDS = 5.0
 
+# fix-all v3 #L4 (R4-4 review-swarm v3): bound graph_search wall time so a
+# stalled embed_fn (e.g. API-mode HTTP hang) doesn't block the chat path
+# indefinitely. Local sentence-transformer batched call on 200 nodes is
+# ~0.3-1.0s; API mode typical < 2s. 10s catches a stuck call quickly while
+# leaving headroom for legacy KGs that pay the per-node batch on first use.
+GRAPHRAG_TIMEOUT_SECONDS = 10.0
+
 # fix-all v1 #A3 / #B6 (R4-4 review-swarm): graphrag admission gate. Plain
 # cosine ranking against the KG concept embeddings yields api_scores roughly
 # in the [-1, 1] cosine range; 0.15 puts "moderate semantic overlap" as the
@@ -73,12 +80,23 @@ def _graphrag_score_floor() -> float:
 
 
 def _graphrag_enabled() -> bool:
-    """Kill switch. Operator sets GRAPHRAG_ENABLED=0 (or false/no/off) to
-    disable graphrag globally without removing knowledge_graph.json files."""
+    """Kill switch. Default on; operators disable with any non-empty value
+    other than the explicit enable list.
+
+    fix-all v3 #L10 (R4-4 review-swarm v3): v1 used an explicit DISABLE
+    allow-list (`0/false/no/off/disabled`), which silently fail-open on
+    typos like `disablle`, `falce`, `stop`, etc. — exactly the wrong
+    direction for a kill switch. v3 inverts the semantics: any value the
+    operator types intending to disable should disable. Empty/missing →
+    default on (= no operator intent expressed). Explicit enable values
+    (`1/true/yes/on/enabled`) → on. Everything else → off (fail-safe).
+    """
     raw = (os.getenv("GRAPHRAG_ENABLED") or "").strip().lower()
-    if raw in ("0", "false", "no", "off", "disabled"):
-        return False
-    return True  # default on
+    if not raw:
+        return True  # default on when env not set
+    if raw in ("1", "true", "yes", "on", "enabled"):
+        return True
+    return False  # any other non-empty value disables (fail-safe)
 
 # Quote / wrapper characters the translation LLM sometimes returns despite
 # being told not to. We strip them so RAG doesn't search for `"memory"` etc.
@@ -361,9 +379,23 @@ class QASkill(Skill):
             # Imported lazily so qa_skill stays importable if a future
             # refactor moves graph_search; circular-import safety.
             from nano_notebooklm.kb.graph_search import graph_search
-            return await asyncio.to_thread(
-                graph_search, question, course_filter, self.kb.embed_fn,
+            # fix-all v3 #L4 (R4-4 review-swarm v3): bound graph_search wall
+            # time via asyncio.wait_for. embed_fn in API mode can hang on a
+            # stalled HTTP connection; without a timeout, qa_skill never
+            # falls through to plain RAG. 10s is generous — local sentence-
+            # transformer batched call is < 1s; API mode typical < 2s.
+            return await asyncio.wait_for(
+                asyncio.to_thread(
+                    graph_search, question, course_filter, self.kb.embed_fn,
+                ),
+                timeout=GRAPHRAG_TIMEOUT_SECONDS,
             )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "graph_search timed out (>%ss) for course=%s; falling back to RAG",
+                GRAPHRAG_TIMEOUT_SECONDS, course_filter,
+            )
+            return None
         except Exception as exc:  # noqa: BLE001 — never crash chat on KG error
             # fix-all v2 #V5 (R4-4 review-swarm v2): drop exc_info=True so
             # API-mode openai-python tracebacks don't ship user query text
