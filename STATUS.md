@@ -316,24 +316,43 @@
 
 **files touched**: frontend/index.html / frontend/mindmap.jsx / frontend/study-state.js / CLAUDE.md + **新增** tests/test_r4_3_fix_all_v1.py（10 条回归）。**pytest**: **629 passed in 416s**（v4 580 + R4-1 8 + R4-2 9 + R4-2 fix-all v1 13 + R4-3 codex 7 + R4-3 fix-all v1 10 + 其他 = 629，零 regression）。
 
-### #R4-4 GraphRAG retriever 接进 /api/chat（path="graphrag"）— **本轮最重要** — [claude]
+### #R4-4 GraphRAG retriever 接进 /api/chat（path="graphrag"）— **本轮最重要** — [review]
 
 - **goal ref**: GOAL.md Round 4 #R4-4
-- **status**: [claude]
+- **status**: [review]
 - **owner**: claude
 - **claimed_at**: 2026-05-10 23:00
-- **blocked_by**: R4-1 + R4-2（需要 KG + chunks 都 upload-only 跑通才能端到端测）。可以与 R4-1/R4-2 并行写后端代码 + 单元测（用 fixture KG），只在 PR 之前等前置 land。
-- **files (planned)**:
-  - **新增** `nano_notebooklm/kb/graph_search.py`：`graph_search(query, course_id, top_k_concepts=5, hop_limit=2) -> List[Chunk]`；BFS 沿边扩展 + dedup + weight sort + chunks 上限 30
-  - `nano_notebooklm/kg/extractor.py`：Stage A/B extract 时给每个 concept node 算并缓存 `concept_embedding: List[float]`（一次性，写进 `knowledge_graph.json`）
-  - `nano_notebooklm/skills/qa_skill.py`：入口加 graphrag 分支；`knowledge_graph.json` 存在 + graph_search ≥2 hits → `path="graphrag"`；否则降级到现有 RAG / general
-  - `nano_notebooklm/orchestrator/router_intent.py`：classify_input 增加 graphrag 优先级（在 rag 之前）
-  - `api/server.py`：`ChatResponse.path` Literal 加 `"graphrag"`
-  - `frontend/assistant.jsx`：path chip 加绿色"图检索"样式
-  - **新增** `tests/test_graph_search.py`
-- **mini-test**: `test_graph_search_returns_chunks_from_neighbor_nodes`（A-part_of-B-prereq_of-C, D 独立；query→A 取 A/B/C 不取 D） / `test_chat_uses_graphrag_path_when_kg_present`
-- **corner-test**: `test_graph_search_falls_back_to_rag_when_kg_missing` / `test_graph_search_zero_hits_falls_back_to_rag` / `test_graph_search_hop_limit_2_caps_chunks_at_30` / `test_concept_embedding_lazy_when_missing` / `test_chat_response_path_literal_includes_graphrag`
-- **conflict notes**: graph_search 是新文件不冲突；qa_skill.py / router_intent.py / api/server.py 改动需在 R4-1（server.py courses 改动）合入后再 rebase 一次。
+- **submitted_at**: 2026-05-11 09:30
+- **files**:
+  - **新增** `nano_notebooklm/kb/graph_search.py`（~250 行）：`graph_search(query, course_id, embed_fn, artifacts_dir=None, top_k_concepts=5, hop_limit=2, max_chunks=30) -> list[SearchResult]`；KG json + chunks.json 双盘读 → query embed → concept cosine 排序 → top-k seeds → undirected BFS hop_limit → dedup chunks 按 `(-hop, seed_score, node_weight)` 排 → join chunks.json 拿 text → 截到 max_chunks
+  - `nano_notebooklm/kg/extractor.py`（+~35 行）：`extract_from_chunks` 加 `embed_fn` 可选 kwarg；新增 `_concept_embed_text(c)` helper（`f"{name}。{definition}"` 截 600）；Stage B 100% emit 之后批量算 concept_embedding 写到 topics + leaves（不动 fallback 路径以外的逻辑，不破 R4-2 4-stage NDJSON 契约 — UPLOAD_STAGES 仍 4 值）；embedding 失败仅 warn，graph_search lazy fallback 兜底
+  - `nano_notebooklm/types.py`（+9 行）：`Concept.concept_embedding: list[float] | None = None` 新字段，root 不算所以 None 合法
+  - `nano_notebooklm/skills/qa_skill.py`（+~50 行）：execute 加 graphrag 分支（在 RAG 之前判，require `course_filter` 且 `not checked_files` 且 `len(results) >= 2`）；新 helper `_maybe_graphrag` 走 `asyncio.to_thread`；命中后 `_answer_rag` 复用既有 _format_context / _serialize_sources，path="graphrag"
+  - `nano_notebooklm/orchestrator/router_intent.py`（+1 行）：`Path` Literal 加 `"graphrag"`（仅类型契约统一，classify_input 内部不主动 emit；I/O 在 qa_skill 层做）
+  - `api/server.py`（+5 行）：`ChatResponse.path` Literal 扩到 5 值；两处 `extract_from_chunks` 调用点（get_mindmap line 837, upload_files line 1580）传 `embed_fn=kb.embed_fn`
+  - `frontend/assistant.jsx`（+1 行）：`PATH_LABELS.graphrag = { text: "🕸️ 图检索", title: "..." }`
+  - `frontend/styles.css`（+2 行）：`.path-chip.path-graphrag` 绿色 oklch 颜色，紧邻其他 path-chip 样式同段
+  - **新增** `tests/test_graph_search.py`（370 行，2 mini + 5 corner + 2 回归 = 9 条）
+  - `tests/test_upload_stream.py` / `tests/test_r4_2_fix_all_v1.py`：4 个 fake `extract_from_chunks` 签名加 `**kwargs` 接 embed_fn kwarg；`test_drain_queue_before_reraise_source_order` 的 6000 字符 cutoff 扩到 8000（embed_fn 注释让 _extract_task 长了 ~200 字符）
+- **mini-test**: `test_graph_search_returns_chunks_from_neighbor_nodes`（A-part-of-B-depends-on-C，D 独立；query 命中 A → 返回 A/B/C 不含 D，2 跳验证）/ `test_chat_uses_graphrag_path_when_kg_present`（落 KG + chunks → POST /api/chat → `path=="graphrag"`，sources ≥ 2）
+- **corner-test**:
+  - `test_graph_search_falls_back_to_rag_when_kg_missing`（数据缺失 → 返回 []）
+  - `test_graph_search_zero_hits_falls_back_to_rag`（KG 有但 source_chunks=[] → []）
+  - `test_graph_search_hop_limit_2_caps_chunks_at_30`（hub 节点 50 chunks → cap 到 30）
+  - `test_concept_embedding_lazy_when_missing`（无 concept_embedding 字段 + 384d stale 缓存两种缺失，均走 lazy 重算）
+  - `test_chat_response_path_literal_includes_graphrag`（grep server.py 钉死 ChatResponse.path Literal 5 值）
+- **回归保护**:
+  - `test_extract_from_chunks_writes_concept_embedding_when_embed_fn_passed`（end-to-end：FakeRouter Stage A + Stage B → topics + leaves 都 carry concept_embedding；signature inspect 钉死 `embed_fn` kwarg）
+  - `test_upload_stages_contract_unchanged_after_r4_4`（UPLOAD_STAGES 仍 4 值 + UploadStage Literal 不含 `"kg_stage_c"` — 守护 R4-2 NDJSON 契约不破）
+- **pytest**: **657 passed in 343s**（R4-3 land 后 baseline + R4-4 新增 9 + R4-2 测试 fixture 兼容性修复全过，零 regression）
+- **self-check**: ☑ mini  ☑ corner（5 类全覆盖：边界 hub-cap / 数据缺失 KG-missing / 兼容 lazy-fallback / 上游失败 0-hit / 前端契约 path-Literal-grep）  ☑ no regression  ☑ offline（_keyword_embed 一阶 one-hot + FakeRouter monkeypatch，无真 LLM/sentence-transformer）  ☐ 浏览器实测：reviewer 在有 KG 的课（如 Lecture8Test）发问，验证 🕸️ 图检索 绿色 chip + sources 命中
+- **review_notes**:
+  1. **graphrag 在 RAG 之前判**（不是 fallback）：GOAL.md 明确"先跑 graph_search 结果非空（≥2 hits）走 path=graphrag；否则降级到现有 BM25/向量 RRF"。实现按此 — 路由层 router_intent 仅扩 Literal 类型不动逻辑，I/O 留在 qa_skill 避免路由层做磁盘读。
+  2. **不新增 NDJSON Stage C**：concept_embedding 计算合并进 Stage B 100% emit 之后（前端处理为 stage_b 100% 后的"静默尾段"），保 R4-2 ship 的 4-stage 契约。**取舍**：sentence-transformer 算 ~30 个 concept ≤1s 不会让 UX 卡明显，processing.jsx 不用动；如果未来切大模型 embedding 让这段变慢再考虑加 stage_c。
+  3. **checked_files 时跳过 graphrag**：graph_search 的 hop 展开拿不到 per-file 过滤信号；让 checked_files 路径继续走 RAG + `_apply_checked_files`。
+  4. **lazy fallback 维度安全**：query 嵌入维度作为 source of truth，KG 缓存的 concept_embedding 若维度不匹配（旧 384d 缓存遇 fake 32d 测试 / embedding 模型升级）→ 当前 node 走 lazy 重算覆盖。corner `test_concept_embedding_lazy_when_missing` 双场景钉死。
+  5. **path chip 颜色**：用 oklch 绿色（与 plum/amber/crimson 同 family），无新 CSS 变量；GOAL.md 说"绿色图检索"对齐。
+- **conflict notes**: graph_search 是新文件；qa_skill / router_intent / api/server.py / extractor / types / frontend 都改动量小，与 R4-5（占 ChatRequest 模型段 + /api/status 端点）物理隔离。R4-2 fake_extract 测试 fixture 加 **kwargs 是单向兼容（接受未来更多 kwarg），不影响 R4-5 后续在 ChatRequest 加 backend 字段。
 
 ### #R4-5 Backend backend 切换 chip：codex GPT-5.4 / Qwen2.5-7B-RAFT — [claude]
 

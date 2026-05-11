@@ -121,6 +121,13 @@ class Concept(BaseModel):
     # ("study Topic 1 before Topic 2"). None on roots, leaves, or
     # whenever the LLM didn't emit `prerequisite_of` for that batch.
     learning_order: int | None = None
+    # R4-4: cached L2-normalised embedding of "name。definition" for
+    # GraphRAG cosine ranking. Populated during extract_from_chunks
+    # when an embed_fn is passed; None on legacy KGs and on the root
+    # node (root has no source_chunks so graph_search ignores it).
+    # graph_search lazy-computes when missing so an upgrade doesn't
+    # require re-running extraction.
+    concept_embedding: list[float] | None = None
 
 
 class Relation(BaseModel):

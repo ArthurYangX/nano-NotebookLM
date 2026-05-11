@@ -26,7 +26,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
-from typing import Any, Final, Literal
+from typing import Any, Callable, Final, Literal
 
 
 # fix-all v1 #A9: single source of truth for the R4-2 NDJSON `stage`
@@ -308,12 +308,26 @@ async def extract_concepts_from_chunk(
 # ── Orchestration ───────────────────────────────────────────────────
 
 
+def _concept_embed_text(c: Concept) -> str:
+    """Text fed to the embedding model for a concept node. Name + definition
+    captures more semantic surface than name alone — a node called "Encoder"
+    is ambiguous, "Encoder。The half of a transformer that maps tokens to
+    contextual representations." is not. Truncate at 600 chars to keep batch
+    sizes predictable on long definitions.
+    """
+    name = (c.name or "").strip()
+    definition = (c.definition or "").strip()
+    text = f"{name}。{definition}" if definition else name
+    return text[:600]
+
+
 async def extract_from_chunks(
     chunks: list[Chunk],
     course_name: str,
     router: ModelRouter,
     max_chunks: int = 50,
     progress_callback=None,
+    embed_fn: Callable[[list[str]], Any] | None = None,
 ) -> tuple[list[Concept], list[Relation]]:
     """Two-stage extraction.
 
@@ -399,6 +413,28 @@ async def extract_from_chunks(
         pct = max(1, min(99, int(100 * done / max(1, len(sampled)))))
         _emit(KG_STAGE_B, pct)
     _emit(KG_STAGE_B, 100)
+
+    # R4-4: cache concept_embedding on every non-root concept so graph_search
+    # can cosine-rank against the query without recomputing. Folded into
+    # Stage B (no new NDJSON stage emitted) to preserve R4-2's 4-stage upload
+    # contract — frontend processing.jsx sees Stage B hit 100% and the
+    # embedding pass runs in the silence between Stage B 100% and the `done`
+    # event. Lazy fallback in graph_search covers any concepts that miss this
+    # pass (legacy KGs, embed_fn failures, dimension mismatches).
+    targets: list[Concept] = [*topics, *all_concepts]
+    if embed_fn is not None and targets:
+        try:
+            texts = [_concept_embed_text(c) for c in targets]
+            embs = embed_fn(texts)
+            # embed_fn returns either np.ndarray (shape [n, d]) or list[list[float]].
+            for c, emb in zip(targets, embs):
+                c.concept_embedding = [float(x) for x in emb]
+        except Exception:  # noqa: BLE001 — embedding failure is non-fatal
+            logger.warning(
+                "concept_embedding batch failed for %d concepts; graph_search "
+                "will fall back to lazy per-query embedding",
+                len(targets), exc_info=True,
+            )
 
     if not topics:
         # Fallback path — Stage A produced nothing. Return per-chunk

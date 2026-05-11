@@ -123,7 +123,8 @@ def test_error_event_carries_current_stage(monkeypatch, upload_client):
     stage='kg_stage_b' (not None / not 'unknown')."""
     from nano_notebooklm.kg import extractor as extractor_mod
 
-    async def _boom(chunks, course_name, router, max_chunks=30, progress_callback=None):
+    async def _boom(chunks, course_name, router, max_chunks=30,
+                    progress_callback=None, **kwargs):  # R4-4: accept embed_fn kwarg
         if progress_callback is not None:
             progress_callback("kg_stage_a", 0)
             progress_callback("kg_stage_a", 100)
@@ -145,7 +146,8 @@ def test_done_event_carries_duration_ms(monkeypatch, upload_client):
     """fix-all v1 #A11: done event must include duration_ms for ops triage."""
     from nano_notebooklm.kg import extractor as extractor_mod
 
-    async def _fake(chunks, course_name, router, max_chunks=30, progress_callback=None):
+    async def _fake(chunks, course_name, router, max_chunks=30,
+                    progress_callback=None, **kwargs):  # R4-4: accept embed_fn kwarg
         if progress_callback is not None:
             progress_callback("kg_stage_a", 100)
             progress_callback("kg_stage_b", 100)
@@ -171,8 +173,9 @@ def test_drain_queue_before_reraise_source_order():
     so events queued in the same tick as the exception aren't lost."""
     src = Path("api/server.py").read_text(encoding="utf-8")
     # Locate the upload generator. Find positions of the drain loop and
-    # `await extract_task`.
-    upload = src[src.index("async def _events"):src.index("async def _events") + 6000]
+    # `await extract_task`. Slice generously — R4-4 grew the _extract_task
+    # closure (embed_fn kwarg + comment) past the original 6000-char window.
+    upload = src[src.index("async def _events"):src.index("async def _events") + 8000]
     drain_pos = upload.index("while not kg_queue.empty()")
     await_pos = upload.index("concepts, relations = await extract_task")
     assert drain_pos < await_pos, "queue drain must precede `await extract_task`"

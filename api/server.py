@@ -372,8 +372,11 @@ class ChatResponse(BaseModel):
     model: str = "fallback"
     tokens_used: int = 0
     # `path` is omitted for the pre-routing #R1 boilerplate response (when
-    # checked_files knocks all results to 0). Otherwise must be one of four.
-    path: Literal["rag", "general", "translated", "cross-course"] | None = None
+    # checked_files knocks all results to 0). Otherwise one of five — R4-4
+    # added `"graphrag"` for KG-driven retrieval (concept cosine + BFS
+    # neighbour expansion) which fires before the BM25/vector path when the
+    # course has a `knowledge_graph.json` and graph_search returns ≥2 hits.
+    path: Literal["rag", "general", "translated", "cross-course", "graphrag"] | None = None
     original_query: str | None = None
     translated_query: str | None = None
     general_reason: str | None = None
@@ -834,7 +837,13 @@ async def get_mindmap(course_id: str):
         if not chunks:
             raise HTTPException(404, f"No chunks for course '{course_id}'")
 
-        concepts, relations = await extract_from_chunks(chunks, course_id, router, max_chunks=30)
+        concepts, relations = await extract_from_chunks(
+            chunks, course_id, router, max_chunks=30,
+            # R4-4: pass kb.embed_fn so the extractor caches concept_embedding
+            # on every non-root concept for GraphRAG cosine ranking. Falls
+            # back to lazy graph_search compute if this call fails.
+            embed_fn=kb.embed_fn,
+        )
         concepts = merge_concepts(concepts)
         relations = merge_relations(relations)
 
@@ -1580,6 +1589,10 @@ async def upload_files(course_id: str, files: Annotated[list[UploadFile], File(.
                     return await extract_from_chunks(
                         chunks, course_id, router, max_chunks=30,
                         progress_callback=_progress,
+                        # R4-4: pass kb.embed_fn so concept_embedding is
+                        # cached during upload, eliminating the lazy-compute
+                        # cost on the first GraphRAG /api/chat call.
+                        embed_fn=kb.embed_fn,
                     )
 
                 extract_task = _asyncio.create_task(_extract_task())

@@ -105,6 +105,36 @@ class QASkill(Skill):
                 user_lang=user_lang,
             )
 
+        # ── R4-4 Path graphrag: KG-driven retrieve fires *before* the
+        # BM25/vector path when the course has a knowledge_graph.json.
+        # The KG is the upload pipeline's product (R4-2) — its concept
+        # nodes are L2-normalised embeddings the graph_search ranks by
+        # cosine, then expands along part-of / prerequisite_of / depends-on
+        # edges to surface the chunks the extractor already linked into
+        # the same neighbourhood. Compared to plain RAG this nails
+        # cross-concept queries ("how do X and Y relate?") where the
+        # surface-lexical RRF would pull two independent passages.
+        #
+        # Skip conditions:
+        #   - All Courses mode (no course_filter): no per-course KG to
+        #     consult; the kb.search global path handles it.
+        #   - checked_files set: user pinned a file subset; graph_search's
+        #     hop expansion cannot honour per-file filtering without
+        #     materially degrading the neighbourhood signal.
+        # Skip → fall through to existing RAG → translation → cross-course
+        # → general chain.
+        if course_filter and not checked_files:
+            graphrag_results = await self._maybe_graphrag(question, course_filter)
+            if graphrag_results and len(graphrag_results) >= 2:
+                logger.info("qa.path=graphrag course=%s top1=%.4f hits=%d",
+                            course_filter, graphrag_results[0].score,
+                            len(graphrag_results))
+                return await self._answer_rag(
+                    question, course_filter, graphrag_results,
+                    path="graphrag",
+                    user_lang=user_lang,
+                )
+
         # ── Path A (rag): retrieve, gate, fall back if low-quality ──
         raw = self.kb.search(question, top_k=top_k, course_id=course_filter)
         results = self._apply_checked_files(raw, checked_files,
@@ -240,6 +270,39 @@ class QASkill(Skill):
             if second:
                 filtered = second[:top_k]
         return filtered
+
+    async def _maybe_graphrag(
+        self,
+        question: str,
+        course_filter: str,
+    ) -> list[SearchResult] | None:
+        """R4-4: try GraphRAG retrieve for `course_filter`. Returns:
+          - ``None`` when the course has no ``knowledge_graph.json`` (caller
+            falls through to plain RAG without logging a path miss).
+          - ``[]`` when the KG exists but graph_search returned zero hits
+            (caller treats as a miss and falls through, same as None).
+          - ``list[SearchResult]`` of length ≥1 on a positive retrieve;
+            caller's ``>=2`` gate decides whether to commit to path=graphrag.
+
+        The KG file existence check + the synchronous load + cosine pass
+        are off-loaded via ``asyncio.to_thread`` so event-loop responsiveness
+        is preserved during the 30-100 ms KG load on a cold course.
+        """
+        from nano_notebooklm import config
+        kg_path = config.ARTIFACTS_DIR / "courses" / course_filter / "knowledge_graph.json"
+        if not kg_path.exists():
+            return None
+        try:
+            # Imported lazily so qa_skill stays importable if a future
+            # refactor moves graph_search; circular-import safety.
+            from nano_notebooklm.kb.graph_search import graph_search
+            return await asyncio.to_thread(
+                graph_search, question, course_filter, self.kb.embed_fn,
+            )
+        except Exception as exc:  # noqa: BLE001 — never crash chat on KG error
+            logger.warning("graph_search failed for course=%s: %s",
+                           course_filter, exc, exc_info=True)
+            return None
 
     def _maybe_cross_course_fallback(
         self,

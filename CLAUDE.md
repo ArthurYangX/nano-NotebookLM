@@ -80,9 +80,9 @@ nano_notebooklm/   Python backend modules
   → 422), 422 errors return `{error: "validation_error", request_id, detail}`.
   All responses include `x-request-id` and `x-response-time-ms` headers.
   `/api/chat` carries a `ChatResponse` model with `path: Literal["rag", "general",
-  "translated", "cross-course"] | None` (forbidden extras) and optional
-  `original_query` / `translated_query` / `general_reason` / `filter_empty` /
-  `filter_low_quality` side fields.
+  "translated", "cross-course", "graphrag"] | None` (forbidden extras) and
+  optional `original_query` / `translated_query` / `general_reason` /
+  `filter_empty` / `filter_low_quality` / `cross_course_origin` side fields.
 - Smart routing (Round 2 #1+#2+#3): chat input goes through
   `router_intent.classify_input` — short / greeting / pure-punctuation queries
   skip RAG and go to a general GPT path; RAG results pass a score gate
@@ -203,8 +203,27 @@ nano_notebooklm/   Python backend modules
   and `frontend/processing.jsx`. `frontend/processing.jsx` rewritten to
   render 4 progress bars driven by NDJSON events; retry button re-invokes
   the original upload via a `retryRef` closure (not just dismiss-modal).
+- Round 4 R4-4 GraphRAG retriever (2026-05-11): `/api/chat` adds a fifth
+  path `"graphrag"` that fires *before* BM25/vector RRF when the course has
+  a `knowledge_graph.json`. New module `nano_notebooklm/kb/graph_search.py`
+  loads the KG, embeds the query, ranks concept nodes by cosine
+  (using cached `concept_embedding: list[float]` on each non-root Concept;
+  lazy recompute on missing/dim-mismatch), takes top-k seeds, BFS-expands
+  along part-of/depends-on/prerequisite_of edges to hop_limit, then collects
+  reachable nodes' `source_chunks`, dedups by chunk_id, sorts by
+  `(-hop_distance, seed_score, node_weight)`, joins `chunks.json` for text,
+  and caps at `max_chunks=30`. `extract_from_chunks` gains an optional
+  `embed_fn` kwarg so the upload pipeline + mindmap GET both seed
+  `concept_embedding` once; legacy KGs without the field fall through to
+  lazy per-query embedding. Compute is folded into Stage B's 100% emit
+  (no `kg_stage_c` — preserves R4-2's 4-stage NDJSON upload contract).
+  qa_skill's `_maybe_graphrag` runs the disk read + cosine pass via
+  `asyncio.to_thread`; skipped when `course_filter` is None (All Courses)
+  or `checked_files` is set (graphrag hop expansion can't honour per-file
+  filtering). <2 hits → silent fall-through to existing RAG → translation
+  → cross-course → general chain. Frontend chip: green `🕸️ 图检索` via
+  `.path-chip.path-graphrag` oklch styling.
 - Still missing for production: auth / multi-tenant, request rate limits,
   background-task ingestion, OpenAPI client codegen, structured metrics
   (Prometheus). Mastery is still read-only (KG editing landed in M3).
-  R4-4 (GraphRAG retriever) + R4-5 (Qwen-RAFT backend chip) + R4-3
-  (force-directed KG view, codex in flight) outstanding.
+  R4-5 (Qwen-RAFT backend chip) is the only outstanding Round 4 P0.

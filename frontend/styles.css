@@ -1943,6 +1943,8 @@ mark.hl-flash { animation: hl-flash 0.9s ease-out; }
 .path-chip.path-translated { border-color: var(--amber); color: oklch(0.42 0.08 70); background: var(--amber-soft); }
 .path-chip.path-cross-course { border-color: var(--plum); color: var(--plum); background: var(--plum-soft); }
 .path-chip.path-filter-empty { border-color: var(--crimson); color: var(--crimson); background: var(--crimson-soft); }
+/* R4-4: GraphRAG path — KG-driven retrieval (concept cosine + BFS hop) */
+.path-chip.path-graphrag { border-color: oklch(0.62 0.15 160); color: oklch(0.32 0.12 160); background: oklch(0.94 0.06 160); }
 .path-chip-detail {
   margin-left: 4px;
   opacity: 0.75;

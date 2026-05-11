@@ -29,7 +29,7 @@ from nano_notebooklm.types import SearchResult
 
 logger = logging.getLogger(__name__)
 
-Path = Literal["rag", "general", "translated", "cross-course"]
+Path = Literal["rag", "general", "translated", "cross-course", "graphrag"]
 
 # ── Tunables ──────────────────────────────────────────────────────────
 
