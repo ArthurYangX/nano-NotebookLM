@@ -987,6 +987,61 @@
     }
   }
 
+  // ── Hidden-courses (frontend-only, localStorage-backed) ─────────────
+  // Lets the user hide stale/test courses (SmokeTest, abandoned uploads)
+  // from the topbar dropdown WITHOUT touching backend data. Hidden state
+  // is per-browser; "manage" panel toggles entries and "unhide all"
+  // clears the set. Backend `/api/courses` is unaware of this list.
+  const HIDDEN_COURSES_KEY = `${PREFIX}:hidden-courses`;
+
+  function loadHiddenCourses(storage) {
+    try {
+      const raw = storage.getItem(HIDDEN_COURSES_KEY);
+      if (!raw) return [];
+      const parsed = JSON.parse(raw);
+      return Array.isArray(parsed) ? parsed.filter(s => typeof s === "string") : [];
+    } catch (e) { return []; }
+  }
+
+  function saveHiddenCourses(storage, ids) {
+    try {
+      const list = Array.isArray(ids)
+        ? Array.from(new Set(ids.filter(s => typeof s === "string"))).sort()
+        : [];
+      storage.setItem(HIDDEN_COURSES_KEY, JSON.stringify(list));
+      return true;
+    } catch (e) {
+      if (typeof console !== "undefined") console.warn("hidden-courses save failed", e);
+      return false;
+    }
+  }
+
+  function isCourseHidden(storage, courseId) {
+    if (!courseId) return false;
+    return loadHiddenCourses(storage).includes(courseId);
+  }
+
+  function setCourseHidden(storage, courseId, hidden) {
+    if (!courseId) return loadHiddenCourses(storage);
+    const current = new Set(loadHiddenCourses(storage));
+    if (hidden) current.add(courseId);
+    else current.delete(courseId);
+    const next = Array.from(current).sort();
+    saveHiddenCourses(storage, next);
+    return next;
+  }
+
+  function filterVisibleCourses(courses, hiddenIds) {
+    if (!Array.isArray(courses)) return [];
+    const hidden = new Set(Array.isArray(hiddenIds) ? hiddenIds : []);
+    return courses.filter(c => c && !hidden.has(c.id));
+  }
+
+  function clearHiddenCourses(storage) {
+    try { storage.removeItem(HIDDEN_COURSES_KEY); return true; }
+    catch (e) { return false; }
+  }
+
   return {
     createMemoryStorage,
     createSkillEntries,
@@ -1033,5 +1088,12 @@
     saveUserLang,
     USER_LANG_KEY,
     DEFAULT_LANG_CHOICES,
+    loadHiddenCourses,
+    saveHiddenCourses,
+    isCourseHidden,
+    setCourseHidden,
+    filterVisibleCourses,
+    clearHiddenCourses,
+    HIDDEN_COURSES_KEY,
   };
 });

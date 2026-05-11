@@ -281,6 +281,30 @@ body::before {
   padding: 0 8px 12px;
 }
 
+/* Bulk selection bar — 全选 / 全不选 / 反选 buttons above the sources list. */
+.lib-bulk-bar {
+  border-bottom: 1px solid var(--paper-3);
+  margin: 0 8px;
+}
+.lib-bulk-btn {
+  background: transparent;
+  border: 1px solid var(--paper-3);
+  border-radius: 3px;
+  padding: 2px 8px;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--ink-2);
+  cursor: pointer;
+  transition: background 0.1s ease;
+}
+.lib-bulk-btn:hover:not(:disabled) {
+  background: var(--paper-2);
+}
+.lib-bulk-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
 .source-item {
   display: grid;
   grid-template-columns: 24px 1fr auto;

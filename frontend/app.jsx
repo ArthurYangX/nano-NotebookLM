@@ -31,6 +31,13 @@ function App() {
   // ── Core state ──
   const [courses, setCourses] = useState([]);
   const [activeCourse, setActiveCourse] = useState(null);
+  // Frontend-only hidden-course set (per-browser localStorage). Backend
+  // /api/courses is unaware — the data stays on disk, only the dropdown
+  // filters it out. Initialised from storage in the courses-load effect.
+  const [hiddenCourseIds, setHiddenCourseIds] = useState(() =>
+    typeof localStorage !== "undefined" ? StudyState.loadHiddenCourses(localStorage) : []
+  );
+  const [showCourseManager, setShowCourseManager] = useState(false);
   const [backendStatus, setBackendStatus] = useState(null);
   const [realNotes, setRealNotes] = useState(null);
   const [realQuiz, setRealQuiz] = useState(null);
@@ -109,27 +116,92 @@ function App() {
   // breaks; React DevTools complains; gc'd on rerender). Use a ref.
   const retryRef = useRef(null);
 
+  // ── Hidden-course toggle handlers ─────────────────────────────────
+  function toggleCourseHidden(courseId) {
+    if (!courseId) return;
+    const next = StudyState.setCourseHidden(localStorage, courseId,
+      !hiddenCourseIds.includes(courseId));
+    setHiddenCourseIds(next);
+  }
+  function unhideAllCourses() {
+    StudyState.clearHiddenCourses(localStorage);
+    setHiddenCourseIds([]);
+  }
+  // If the active course just got hidden, jump to the first visible one
+  // (or to All Courses if every course is now hidden).
+  useEffect(() => {
+    if (!activeCourse) return;
+    if (!hiddenCourseIds.includes(activeCourse)) return;
+    const next = courses.find(c => !hiddenCourseIds.includes(c.id));
+    setActiveCourse(next ? next.id : null);
+  }, [hiddenCourseIds, courses, activeCourse]);
+
+  // Keep Library's "Collections" sidebar in sync with the visible-course
+  // filter. `window.SAMPLE_COLLECTIONS` is read inside Library's render so
+  // a stale value used to linger here until the next page reload. Now it
+  // re-derives whenever courses load OR the user toggles a hide. App
+  // re-renders on hiddenCourseIds change → Library re-renders → reads the
+  // refreshed global.
+  useEffect(() => {
+    const colors = [
+      "oklch(0.42 0.08 160)", "oklch(0.48 0.12 25)",
+      "oklch(0.45 0.1 255)", "oklch(0.44 0.09 310)",
+      "oklch(0.46 0.11 50)", "oklch(0.43 0.08 200)",
+      "oklch(0.47 0.10 100)", "oklch(0.41 0.09 280)",
+    ];
+    const hidden = new Set(hiddenCourseIds);
+    const visible = courses.filter(c => !hidden.has(c.id));
+    window.SAMPLE_COLLECTIONS = visible.map((c, i) => ({
+      id: c.id, name: c.name, count: c.chunks, color: colors[i % colors.length],
+    }));
+  }, [courses, hiddenCourseIds]);
+
   // ── Load courses on mount ──
   useEffect(() => {
     API.getCourses(courseModeRef.current).then(data => {
       const crs = data.courses || [];
       setCourses(crs);
-      if (crs.length > 0) setActiveCourse(crs[0].id);
-      // Update global collections for Library component
-      const colors = ["oklch(0.42 0.08 160)", "oklch(0.48 0.12 25)", "oklch(0.45 0.1 255)", "oklch(0.44 0.09 310)", "oklch(0.46 0.11 50)", "oklch(0.43 0.08 200)", "oklch(0.47 0.10 100)", "oklch(0.41 0.09 280)"];
-      window.SAMPLE_COLLECTIONS = crs.map((c, i) => ({
-        id: c.id, name: c.name, count: c.chunks, color: colors[i % colors.length],
-      }));
+      // Pick the first VISIBLE course as the initial selection so we
+      // don't auto-select a hidden one (which the dropdown wouldn't
+      // even render). Falls back to All Courses (null) if every course
+      // is hidden.
+      const hidden = new Set(StudyState.loadHiddenCourses(localStorage));
+      const firstVisible = crs.find(c => !hidden.has(c.id));
+      if (firstVisible) setActiveCourse(firstVisible.id);
+      // SAMPLE_COLLECTIONS now updated by a separate effect that watches
+      // hiddenCourseIds so Library's "Collections" sidebar follows the
+      // dropdown's visible scope when the user toggles hide/unhide.
     }).catch(() => {});
     API.getStatus().then(setBackendStatus).catch(() => {});
   }, []);
 
   useEffect(() => {
+    // fix-all v1 #V6 (R4-5 review v1): ±20% jitter so concurrent tabs
+    // opened together don't all poll in lockstep — the AutoDL host
+    // (and the cached qwen health probe) sees a smoothed request rate
+    // instead of a 6N req/min unison pulse.
+    const POLL_BASE_MS = 10000;
+    const POLL_JITTER_RATIO = 0.2;
+    const interval = POLL_BASE_MS + (Math.random() * 2 - 1) * POLL_BASE_MS * POLL_JITTER_RATIO;
     const iv = setInterval(() => {
       API.getStatus().then(setBackendStatus).catch(() => setBackendStatus(null));
-    }, 10000);
+    }, interval);
     return () => clearInterval(iv);
   }, []);
+
+  // fix-all v1 #V6 (R4-5 review v1): auto-rollback the chip when the
+  // operator-side QWEN_RAFT_URL is unconfigured or the AutoDL host
+  // becomes unreachable. Without this, localStorage persists a stale
+  // "qwen_raft" selection across reloads → chip greys out but state
+  // keeps sending backend="qwen_raft" → every chat gets a 422 (URL
+  // unset) or a silent fallback (URL set, host down). Auto-rollback
+  // resets to codex once status confirms qwen is unavailable.
+  useEffect(() => {
+    if (!backendStatus || backend !== "qwen_raft") return;
+    if (!backendStatus.qwen_raft_configured || !backendStatus.qwen_raft_available) {
+      commitBackend("codex");
+    }
+  }, [backendStatus, backend]);
 
   // ── Load sources when course changes; restore generated content from cache ──
   useEffect(() => {
@@ -145,26 +217,42 @@ function App() {
     setGenerationState(StudyState.createGenerationState());
 
     if (!activeCourse) {
-      // "All Courses" mode — show all sources from all courses
+      // "All Courses" mode — show sources from every VISIBLE course.
+      // Hidden courses are excluded so cross-course search and citation
+      // resolution match the dropdown's visible scope.
       setSources([]);
-      // Load sources from all courses
-      Promise.all(courses.map(c => API.getSources(c.id).catch(() => ({ sources: [] }))))
+      const visible = courses.filter(c => !hiddenCourseIds.includes(c.id));
+      Promise.all(visible.map(c => API.getSources(c.id).catch(() => ({ sources: [] }))))
         .then(results => {
           const allSrcs = [];
           results.forEach((data, ci) => {
+            // BUGFIX: use visible[ci], not courses[ci]. After filtering
+            // out hidden courses, the index `ci` points into `visible` —
+            // indexing into `courses` (the unfiltered array) shifted
+            // each chunk's labelled course by however many earlier
+            // courses were hidden.
+            const cid = visible[ci].id;
             (data.sources || []).forEach((s, i) => {
               allSrcs.push({
-                id: `${courses[ci].id}_${s.id || i}`,
+                id: `${cid}_${s.id || i}`,
                 type: s.type === "pdf" ? "pdf" : s.type === "pptx" ? "ppt" : "txt",
-                title: `[${courses[ci].id}] ${s.title}`,
-                sourceFile: s.title,  // raw filename, used for backend filter
+                title: `[${cid}] ${s.title}`,
+                sourceFile: s.title,
                 meta: `${s.chunks} chunks`,
                 checked: true,
-                collection: courses[ci].id,
+                collection: cid,
               });
             });
           });
           setSources(allSrcs);
+          // If the previously-active file belongs to a course that just
+          // got hidden, `activeId` is now stale (no longer in allSrcs).
+          // Fall back to the first visible source so the Reader pane
+          // doesn't sit on a dead id (which `activeIdInSources` would
+          // freeze, leaving the user looking at stale content).
+          setActiveId(prev => (prev && allSrcs.some(s => s.id === prev))
+            ? prev
+            : (allSrcs[0] ? allSrcs[0].id : null));
         });
       return;
     }
@@ -192,7 +280,11 @@ function App() {
       if (srcs.length > 0) setActiveId(srcs[0].id);
     }).catch(() => {});
     API.getSessionLog().then(data => setSessionDays(data.days || {})).catch(() => {});
-  }, [activeCourse]);
+    // hiddenCourseIds in deps: re-run when the user un/hides a course
+    // while in "All Courses" mode, so the cross-course source list
+    // matches the dropdown's visible scope. courses also in deps so the
+    // initial load resolves once courses arrive.
+  }, [activeCourse, courses, hiddenCourseIds]);
 
   // ── Theme ──
   useEffect(() => {
@@ -224,6 +316,17 @@ function App() {
 
   async function handleGenerateNotes({ force = false } = {}) {
     if (!activeCourse) { alert("Please select a specific course first (not 'All Courses')"); return; }
+    // Force-regenerate confirm (review-swarm fix-all): the 🔄 button skips
+    // the per-file cache and re-runs every section through the LLM. Guard
+    // against accidental clicks — cache hits are cheap, force runs cost ~2
+    // min + LLM tokens.
+    if (force) {
+      if (typeof window !== "undefined" && typeof window.confirm === "function") {
+        if (!window.confirm("Force-regenerate all sections? This ignores the cache and may take ~2 minutes + LLM cost. Continue?")) {
+          return;
+        }
+      }
+    }
     setMode("notes");
     setStreaming(true);
     setStreamProgress(0);
@@ -261,6 +364,31 @@ function App() {
     }
     let reviewPartial = "";
     let inReview = false;
+    // Throttle setRealNotes during review_chunk (review-swarm fix-all):
+    // backend ships ~10 deltas/sec; each setRealNotes invalidates the
+    // useMemo for latexToHtml(draft), which re-runs the 8-stage regex
+    // pipeline on an ever-growing string. Coalesce to ~250ms intervals.
+    let reviewSetTimer = null;
+    function scheduleReviewUpdate() {
+      if (reviewSetTimer) return;
+      reviewSetTimer = setTimeout(() => {
+        reviewSetTimer = null;
+        setRealNotes(reviewPartial);
+      }, 250);
+    }
+    // Coalesce setRealNotes during cache-batch (review-swarm fix-all):
+    // when N file_cached events arrive back-to-back, each previously
+    // triggered an O(N) rebuildDraftFromFiles + latexToHtml render. Defer
+    // to a single render at the next event-loop turn.
+    let cachedBatchPending = false;
+    function scheduleCachedRender() {
+      if (cachedBatchPending) return;
+      cachedBatchPending = true;
+      setTimeout(() => {
+        cachedBatchPending = false;
+        if (!inReview) setRealNotes(rebuildDraftFromFiles());
+      }, 0);
+    }
     try {
       const final = await API.streamFullCourseNotes(activeCourse, event => {
         if (event.type === "plan") {
@@ -279,8 +407,13 @@ function App() {
           // "⚡ 10 cached · ⏳ 1 fresh" so the user knows why generation is fast.
           setNoteCacheStats({
             total: event.total,
-            cached: event.cached_count || 0,
-            fresh: event.fresh_count || event.total,
+            // Nullish-coalescing (review-swarm fix-all): a legitimate
+            // `cached_count: 0` / `fresh_count: 0` (all-fresh / all-cached
+            // scenarios) must NOT fall back to `event.total`; `||` mis-
+            // routes 0 to the fallback and the chip then shows e.g.
+            // "N cached · 0 fresh" instead of the correct counts.
+            cached: event.cached_count ?? 0,
+            fresh: event.fresh_count ?? event.total,
             force: !!event.force,
           });
         } else if (event.type === "file_start") {
@@ -298,7 +431,7 @@ function App() {
             fileSections[event.idx].content = event.content;
             fileSections[event.idx].source_file = event.source_file || fileSections[event.idx].source_file;
           }
-          if (!inReview) setRealNotes(rebuildDraftFromFiles());
+          scheduleCachedRender();
           setStreamProgress(p => p + 1);
         } else if (event.type === "file_done") {
           if (fileSections[event.idx]) {
@@ -306,7 +439,7 @@ function App() {
             fileSections[event.idx].content = event.content;
             fileSections[event.idx].source_file = event.source_file || fileSections[event.idx].source_file;
           }
-          if (!inReview) setRealNotes(rebuildDraftFromFiles());
+          scheduleCachedRender();
           setStreamProgress(p => p + 1);
         } else if (event.type === "file_error") {
           if (fileSections[event.idx]) {
@@ -324,7 +457,10 @@ function App() {
           // Backend ships `delta` only — review_chunk would otherwise be
           // O(N²) on the wire. Accumulate locally.
           reviewPartial = reviewPartial + (event.delta || "");
-          setRealNotes(reviewPartial);
+          // Throttle the React render to ~250ms (see scheduleReviewUpdate
+          // above); setGenerationState stays un-throttled because it only
+          // tracks partial text for retry state, no expensive re-render.
+          scheduleReviewUpdate();
           setGenerationState(s => StudyState.recordPartialGeneration(s, event.delta || ""));
         } else if (event.type === "error") {
           setGenerationState(s => StudyState.recordGenerationFailure(
@@ -334,6 +470,9 @@ function App() {
           ));
         }
       }, { userLang, force });
+      // Cancel any pending throttled review render — the next setRealNotes
+      // below installs the canonical final content.
+      if (reviewSetTimer) { clearTimeout(reviewSetTimer); reviewSetTimer = null; }
       if (final && final.type === "error") throw new Error(final.error || "stream_failed");
       const content = (final && final.content) || reviewPartial || rebuildDraftFromFiles() || "Notes generation failed.";
       setRealNotes(content);
@@ -540,7 +679,13 @@ function App() {
 
   const effectiveMode = processing ? "processing" : mode;
   const activeSources = sources.filter(s => s.checked);
-  const totalChunks = courses.reduce((sum, c) => sum + (c.chunks || 0), 0);
+  // visibleCourses applies the frontend-only hidden-course filter. The
+  // unfiltered `courses` array stays the source of truth — the manager
+  // panel shows ALL courses (with toggle state) and "All Courses" chunk
+  // counts use only visible ones (consistent with what the dropdown lists).
+  const hiddenSet = new Set(hiddenCourseIds);
+  const visibleCourses = courses.filter(c => !hiddenSet.has(c.id));
+  const totalChunks = visibleCourses.reduce((sum, c) => sum + (c.chunks || 0), 0);
 
   const tabs = [
     { id: "reader", label: "Reader", num: activeCourse ? "§" : "—" },
@@ -568,7 +713,7 @@ function App() {
             style={{ background: "transparent", border: "1px solid var(--paper-3)", borderRadius: 4, padding: "2px 8px", fontFamily: "var(--mono)", fontSize: 11, color: "var(--ink-2)", minWidth: 180 }}
           >
             <option value="">🌐 All Courses ({totalChunks} chunks)</option>
-            {courses.map(c => {
+            {visibleCourses.map(c => {
               const flag = c.lang === "zh" ? "🇨🇳" : c.lang === "mixed" ? "🌐" : "🇺🇸";
               return (
                 <option key={c.id} value={c.id}>
@@ -577,6 +722,19 @@ function App() {
               );
             })}
           </select>
+          <button
+            className="course-manage-btn mono"
+            title="管理课程显示 / Manage course visibility (frontend-only hide; backend data is preserved)"
+            onClick={() => setShowCourseManager(true)}
+            style={{
+              marginLeft: 6, background: "transparent",
+              border: "1px solid var(--paper-3)", borderRadius: 4,
+              padding: "2px 6px", fontFamily: "var(--mono)", fontSize: 11,
+              color: "var(--ink-2)", cursor: "pointer",
+            }}
+          >
+            管理{hiddenCourseIds.length ? ` · ${hiddenCourseIds.length} 已隐藏` : ""}
+          </button>
         </div>
         <div className="spacer"></div>
         <div className="topbar-actions">
@@ -641,6 +799,12 @@ function App() {
         activeId={activeId}
         onPick={setActiveId}
         onToggle={(id) => setSources(ss => ss.map(s => s.id === id ? { ...s, checked: !s.checked } : s))}
+        onToggleMany={(ids, checked) => {
+          // Batch update so Library's 全选/全不选/反选/Shift-click range
+          // produces a single React render, not N renders.
+          const idSet = new Set(ids);
+          setSources(ss => ss.map(s => idSet.has(s.id) ? { ...s, checked: !!checked } : s));
+        }}
         onStartUpload={onStartUpload}
         uploading={uploading}
       />
@@ -663,7 +827,7 @@ function App() {
           <button className="tool mono" style={{ fontSize: 11 }}>{activeSources.length}/{sources.length} sources</button>
         </div>
         <div className="workspace">
-          {(!uploading && !processing && courses.length === 0) && (
+          {(!uploading && !processing && visibleCourses.length === 0) && (
             <div className="empty-courses-cta" data-testid="empty-courses">
               <div className="empty-courses-card">
                 <div className="empty-courses-glyph">📂</div>
@@ -804,7 +968,7 @@ function App() {
       <footer className="statusbar">
         <div className="item">
           <span className="dot"></span>
-          <span>Indexed</span><b>{courses.length} courses · {totalChunks} chunks</b>
+          <span>Indexed</span><b>{visibleCourses.length} courses · {totalChunks} chunks</b>
         </div>
         <div className="item">
           <span>Backend</span><b>{backendStatus ? backendStatus.backends.join(", ") || "none" : "..."}</b>
@@ -888,6 +1052,67 @@ function App() {
                 onClick={() => setShowLangModal(false)}
               >Cancel</button>
             )}
+          </div>
+        </div>
+      )}
+
+      {/* ========= Course visibility manager (frontend-only hide) ========= */}
+      {showCourseManager && (
+        <div className="lang-modal-overlay" role="dialog" aria-modal="true"
+             onClick={e => { if (e.target === e.currentTarget) setShowCourseManager(false); }}>
+          <div className="lang-modal" style={{ maxWidth: 480, maxHeight: "70vh", overflowY: "auto" }}>
+            <h3 className="lang-modal-title">课程显示管理</h3>
+            <p className="lang-modal-hint">
+              勾掉的课程会从顶栏下拉里隐藏 —
+              <b>仅前端</b>过滤，后端 <code>artifacts/courses/</code> 下的数据完整保留。
+              换浏览器或清 localStorage 后会重置。
+            </p>
+            <div style={{ display: "flex", flexDirection: "column", gap: 6, margin: "12px 0" }}>
+              {courses.length === 0 && (
+                <div className="mono" style={{ color: "var(--ink-3)", fontSize: 12 }}>
+                  没有课程可管理。
+                </div>
+              )}
+              {courses.map(c => {
+                const hidden = hiddenCourseIds.includes(c.id);
+                const flag = c.lang === "zh" ? "🇨🇳" : c.lang === "mixed" ? "🌐" : "🇺🇸";
+                return (
+                  <label
+                    key={c.id}
+                    style={{
+                      display: "flex", alignItems: "center", gap: 8,
+                      padding: "6px 8px", border: "1px solid var(--paper-3)",
+                      borderRadius: 4, cursor: "pointer",
+                      opacity: hidden ? 0.55 : 1,
+                    }}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={!hidden}
+                      onChange={() => toggleCourseHidden(c.id)}
+                    />
+                    <span className="mono" style={{ fontSize: 12 }}>
+                      {flag} {c.name}
+                    </span>
+                    <span className="mono" style={{ marginLeft: "auto", fontSize: 11, color: "var(--ink-3)" }}>
+                      {c.chunks} chunks
+                    </span>
+                  </label>
+                );
+              })}
+            </div>
+            <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+              {hiddenCourseIds.length > 0 && (
+                <button
+                  className="lang-modal-close mono"
+                  onClick={unhideAllCourses}
+                >全部显示 ({hiddenCourseIds.length})</button>
+              )}
+              <button
+                className="lang-modal-close mono"
+                onClick={() => setShowCourseManager(false)}
+              >完成</button>
+            </div>
           </div>
         </div>
       )}

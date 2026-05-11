@@ -683,3 +683,58 @@ def test_checked_source_files_legacy_title_fallback():
         """
     )
     assert run_node(script).strip() == "ok"
+
+
+def test_hidden_courses_roundtrip():
+    """Hidden-course set persists in localStorage and toggles atomically."""
+    script = textwrap.dedent(
+        """
+        const h = require('./frontend/study-state.js');
+        const s = h.createMemoryStorage();
+
+        // Empty by default.
+        const before = h.loadHiddenCourses(s);
+        if (before.length !== 0) throw new Error('expected empty: ' + JSON.stringify(before));
+        if (h.isCourseHidden(s, 'foo')) throw new Error('foo should not be hidden');
+
+        // Hide one.
+        let next = h.setCourseHidden(s, 'SmokeTest_A', true);
+        if (next.length !== 1 || next[0] !== 'SmokeTest_A') throw new Error('hide one failed: ' + JSON.stringify(next));
+        if (!h.isCourseHidden(s, 'SmokeTest_A')) throw new Error('isCourseHidden after add failed');
+
+        // Hide a second (sorted output).
+        next = h.setCourseHidden(s, 'Lecture8Test', true);
+        if (JSON.stringify(next) !== '["Lecture8Test","SmokeTest_A"]')
+          throw new Error('sorted output failed: ' + JSON.stringify(next));
+
+        // Unhide one.
+        next = h.setCourseHidden(s, 'SmokeTest_A', false);
+        if (next.length !== 1 || next[0] !== 'Lecture8Test') throw new Error('unhide failed: ' + JSON.stringify(next));
+
+        // filterVisibleCourses skips hidden.
+        const courses = [{id:'A'},{id:'Lecture8Test'},{id:'C'}];
+        const visible = h.filterVisibleCourses(courses, next);
+        if (visible.map(c=>c.id).join(',') !== 'A,C') throw new Error('filter visible failed: ' + visible.map(c=>c.id));
+
+        // clearHiddenCourses removes everything.
+        h.clearHiddenCourses(s);
+        if (h.loadHiddenCourses(s).length !== 0) throw new Error('clear failed');
+
+        // Bad input — non-string entries get dropped on save.
+        h.saveHiddenCourses(s, ['ok', 123, null, 'dup', 'dup']);
+        const cleaned = h.loadHiddenCourses(s);
+        if (JSON.stringify(cleaned) !== '["dup","ok"]')
+          throw new Error('non-string filtering failed: ' + JSON.stringify(cleaned));
+
+        // Corrupt storage falls back to empty list.
+        s.setItem(h.HIDDEN_COURSES_KEY, '{not-json');
+        if (h.loadHiddenCourses(s).length !== 0) throw new Error('corrupt fallback failed');
+
+        // Non-array JSON also falls back.
+        s.setItem(h.HIDDEN_COURSES_KEY, '"a-string"');
+        if (h.loadHiddenCourses(s).length !== 0) throw new Error('non-array fallback failed');
+
+        console.log('ok');
+        """
+    )
+    assert run_node(script).strip() == "ok"
