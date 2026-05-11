@@ -2015,7 +2015,52 @@ def _overlay_user_edits(kg_data: dict, course_id: str) -> dict:
     ops = _load_edits(course_id)
     if not ops:
         return kg_data
+    # R5-1 fix-all v1 #F5: an existing mindmap_edits.json from before the
+    # chapter-roots refactor references the legacy single-root id
+    # `root_{course_id}`. Post-R5-1 the KG ships N roots with ids
+    # `root_{course_id}__{chapter_slug}`, so any op pointing at the old
+    # id silently turns into a "skipped: parent_id not found" result and
+    # the student sees their previously-applied edits vanish. We rewrite
+    # stale `root_{course_id}` references to the FIRST chapter root id
+    # (alphabetically by name in `_kg_to_mindmap`'s ordering) so the
+    # student's edits stay attached to a real node. Only triggers when
+    # the legacy id is genuinely absent from the new KG — if a future
+    # extractor revives the legacy id, no rewriting happens.
+    nodes = kg_data.get("nodes") or []
+    node_ids = {str(n.get("id") or n.get("concept_id") or "") for n in nodes}
+    legacy_root_id = f"root_{course_id}"
+    if ops and legacy_root_id not in node_ids:
+        chapter_roots = [
+            n for n in nodes
+            if n.get("depth") == 0 or n.get("concept_type") == "root"
+        ]
+        if chapter_roots:
+            chapter_roots.sort(
+                key=lambda n: (str(n.get("name") or ""), str(n.get("id") or "")),
+            )
+            new_root_id = str(chapter_roots[0].get("id") or "")
+            if new_root_id:
+                ops = _rewrite_legacy_root_refs(ops, legacy_root_id, new_root_id)
     return apply_edit_ops(kg_data, ops)
+
+
+def _rewrite_legacy_root_refs(
+    ops: list[dict], legacy_root_id: str, new_root_id: str,
+) -> list[dict]:
+    """Return a copy of `ops` with `legacy_root_id` references redirected
+    to `new_root_id`. Touches `parent_id` / `source` / `target`; leaves
+    `id` alone for delete/update ops (those silently no-op via the
+    existing missing-id guard rather than accidentally targeting the new
+    chapter root). The original ops file on disk is not mutated — this
+    is a load-time shim only."""
+    rewritten: list[dict] = []
+    for op in ops:
+        op_copy = dict(op)
+        for field in ("parent_id", "source", "target"):
+            if op_copy.get(field) == legacy_root_id:
+                op_copy[field] = new_root_id
+        rewritten.append(op_copy)
+    return rewritten
 
 
 @app.post("/api/mindmap/{course_id}/edit", tags=["skills"],

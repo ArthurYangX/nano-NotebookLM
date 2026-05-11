@@ -191,16 +191,33 @@
     // Position assignment via recursive sub-wedge division. R5-1: when
     // multi-root, the depth=0 special-case (place at origin, give children
     // the full 2π) is suppressed — each chapter root is placed on an inner
-    // ring at its assigned angle and its children fill that root's slice.
+    // ring at half the topic radius and its children fan out from there.
+    // R5-1 fix-all v1 #F1: pre-fix, roots were at `max(1, 0) * R = R` and
+    // their topic children were also at `1 * R = R`, putting both rings
+    // on top of each other in the first frame. Now roots are at 0.5*R and
+    // every descendant gets an effective +1 ring so topics land at 1.5*R
+    // and leaves at 2.5*R.
     const positions = new Map();
     const multiRoot = rootIds.length > 1;
+    const ROOT_INNER_RADIUS_RATIO = 0.5;  // root sits at half a topic ring
     function place(id, depth, angleStart, angleEnd, hue, ancestors) {
       const seen = new Set(ancestors || []);
       if (seen.has(id)) return;
       seen.add(id);
       const angle = (angleStart + angleEnd) / 2;
       const placeAtOrigin = depth === 0 && !multiRoot;
-      const r = placeAtOrigin ? 0 : Math.max(1, depth) * RADIUS_PER_DEPTH;
+      let r;
+      if (placeAtOrigin) {
+        r = 0;
+      } else if (multiRoot && depth === 0) {
+        r = ROOT_INNER_RADIUS_RATIO * RADIUS_PER_DEPTH;
+      } else if (multiRoot) {
+        // Multi-root descendants: bump by ROOT_INNER_RADIUS_RATIO so the
+        // root's inner ring + topic ring stay disjoint.
+        r = (depth + ROOT_INNER_RADIUS_RATIO) * RADIUS_PER_DEPTH;
+      } else {
+        r = depth * RADIUS_PER_DEPTH;
+      }
       positions.set(id, {
         x: placeAtOrigin ? 0 : Math.cos(angle) * r,
         y: placeAtOrigin ? 0 : Math.sin(angle) * r,

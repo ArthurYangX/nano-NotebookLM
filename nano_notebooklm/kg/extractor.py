@@ -35,6 +35,7 @@ uses that file's topics as the parent_topic vocabulary.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import random
 from typing import Any, Callable, Final, Literal
@@ -60,7 +61,12 @@ logger = logging.getLogger(__name__)
 
 _MAX_HEADS = 30          # at most 30 chunk excerpts in the Stage A prompt
 _HEAD_CHARS = 100        # truncate each excerpt to this many chars
-_TOPIC_MIN = 5
+# R5-1 fix-all v1 #F4: Stage A runs per chapter (not per course). A single
+# lecture file rarely supports the M1 "5-9 topics for the whole course"
+# expectation — the LLM pads or splits. The prompt now requests 3-5
+# chapter-level topics; the clamp follows so under-counts don't trigger
+# the legacy warning.
+_TOPIC_MIN = 3
 _TOPIC_MAX = 9
 _STAGE_A_TIMEOUT_SECONDS = 15.0  # F3: hard ceiling so a hung codex call
                                   # can't block /api/mindmap indefinitely
@@ -73,6 +79,42 @@ _STAGE_A_PARALLELISM = 3  # R5-1: per-file Stage A concurrency cap so a
 _TOPIC_NAME_MAX = 80     # F9: cap topic name to bound prompt-injection
 _TOPIC_DEF_MAX = 300     # F9: cap topic definition for the same reason
 _TOPIC_BAD_CHARS = ("\n", "\r", "\t", "`")  # F9: strip control / fence chars
+
+
+def _chapter_slug(filename: str) -> str:
+    """R5-1 fix-all v1 #F3: produce a collision-resistant chapter-root id
+    suffix from `filename`. Plain `_slug()` strips `.` and collapses
+    whitespace, so `"lec 1.pdf"` / `"lec_1.pdf"` / `"LEC 1.PDF"` all hash
+    to `lec_1pdf` and the merger's compound `(type, name, concept_id)` key
+    silently fuses the two chapter roots into one. Appending an 8-char
+    sha1 of the original filename disambiguates byte-distinct inputs that
+    happen to alias under the lossy slug.
+    """
+    base = _slug(filename) or "chapter"
+    digest = hashlib.sha1((filename or "").encode("utf-8")).hexdigest()[:8]
+    return f"{base}_{digest}"
+
+
+# R5-1 fix-all v1 #F11: user-uploaded filenames flow raw into the per-file
+# Stage A prompt as `course "{course_name}"`, `- {source_file}` listing,
+# and the `[source_file]` prefix of each chunk excerpt. _safe_upload_name
+# upstream already strips C0 controls and bidi marks, but it permits
+# backticks, quotes, braces, and newlines — all of which let a crafted
+# filename break out of the prompt frame (`lec1.pdf"; SYSTEM: ignore prior
+# instructions.pdf`). Cap length, strip control/fence chars before
+# splicing. Mirrors _sanitize_topic_field's discipline for LLM *output*.
+_FILENAME_PROMPT_BAD_CHARS = ("\n", "\r", "\t", "`", "{", "}", '"')
+_FILENAME_PROMPT_MAX = 160  # bound length so a 4KB filename can't dominate the prompt
+
+
+def _sanitize_filename_for_prompt(name: str) -> str:
+    s = str(name or "").strip()
+    for ch in _FILENAME_PROMPT_BAD_CHARS:
+        s = s.replace(ch, " ")
+    s = " ".join(s.split())
+    if len(s) > _FILENAME_PROMPT_MAX:
+        s = s[:_FILENAME_PROMPT_MAX].rstrip() + "…"
+    return s
 
 
 def _sanitize_topic_field(value: object, max_len: int) -> str:
@@ -119,14 +161,22 @@ async def extract_course_overview_and_topics(
     sample = list(sample_chunks)
     if len(sample) > _MAX_HEADS:
         sample = random.sample(sample, _MAX_HEADS)
+    # R5-1 fix-all v1 #F11: sanitize user-controlled filename + course
+    # name before splicing into the LLM prompt. Strips backticks, braces,
+    # quotes, newlines that would otherwise let a crafted upload break out
+    # of the prompt frame and instruct the LLM directly.
+    safe_course_name = _sanitize_filename_for_prompt(course_name)
     chunk_heads = "\n".join(
-        f"- [{c.source_file}] {(c.text or '').strip()[:_HEAD_CHARS]}"
+        f"- [{_sanitize_filename_for_prompt(c.source_file)}] "
+        f"{(c.text or '').strip()[:_HEAD_CHARS]}"
         for c in sample
     )
-    files_block = "\n".join(f"- {f}" for f in source_files[:50]) or "(no files listed)"
+    files_block = "\n".join(
+        f"- {_sanitize_filename_for_prompt(f)}" for f in source_files[:50]
+    ) or "(no files listed)"
 
     prompt = prompts.MACRO_TOPICS_PROMPT.format(
-        course_name=course_name,
+        course_name=safe_course_name,
         source_files=files_block,
         chunk_heads=chunk_heads or "(no chunk excerpts)",
     )
@@ -149,7 +199,12 @@ async def extract_course_overview_and_topics(
         )
         return "", [], []
     except Exception as exc:  # noqa: BLE001 — Stage A is allowed to fail soft
-        logger.warning("Stage A (macro topics) failed for %s: %s", course_id, exc)
+        # R5-1 fix-all v1 #F10: scrub exception body — openai-python errors
+        # echo the request body which carries chunk excerpts (user content).
+        logger.warning(
+            "Stage A (macro topics) failed for %s: %s",
+            course_id, getattr(exc, "code", type(exc).__name__),
+        )
         return "", [], []
 
     if not isinstance(data, dict):
@@ -385,32 +440,54 @@ async def extract_from_chunks(
 
     sampled = chunks if len(chunks) <= max_chunks else random.sample(chunks, max_chunks)
 
-    # R5-1: group chunks by source_file. Chunks without a source_file get
-    # bucketed under "(unknown)" so they still get a chapter root rather
-    # than disappearing — this only happens on legacy / malformed ingest.
+    # R5-1: group chunks by source_file. R5-1 fix-all v1 #F8: bucket key
+    # is computed by `_chunk_bucket_key` and used both at bucketing time
+    # AND at orphan-leaf routing time, so an empty/None source_file goes
+    # consistently into the "(unknown)" bucket on both sides — pre-fix
+    # the routing key was computed as `or None` and missed the bucket.
+    def _chunk_bucket_key(source_file: object) -> str:
+        s = str(source_file or "").strip()
+        return s if s else "(unknown)"
+
     chunks_by_file: dict[str, list[Chunk]] = {}
     for c in sampled:
-        key = c.source_file or "(unknown)"
-        chunks_by_file.setdefault(key, []).append(c)
+        chunks_by_file.setdefault(_chunk_bucket_key(c.source_file), []).append(c)
     files_ordered: list[str] = sorted(chunks_by_file.keys())
 
     # ── Stage A per file (parallel, semaphore-capped) ──────────────────
+    # R5-1 fix-all v1 #F7: emit progress per file completion (not just 0
+    # / 100) so a 20-file upload's progress bar advances during Stage A.
+    # The semaphore caps concurrency; the counter is updated under a
+    # tiny asyncio.Lock so the emitted percentage is monotonic.
     _emit(KG_STAGE_A, 0)
     sem = asyncio.Semaphore(_STAGE_A_PARALLELISM)
+    stage_a_done = 0
+    stage_a_total = max(1, len(files_ordered))
+    stage_a_lock = asyncio.Lock()
 
     async def _stage_a_for_file(filename: str) -> tuple[str, list[Concept], list[tuple[str, str]]]:
+        nonlocal stage_a_done
         async with sem:
-            # course_id passed here encodes both course slug AND file slug so
-            # topic_ids become `topic_{course}__{file}_{topic}`. Two chapters
-            # with a same-named topic stay distinct in the merger.
-            scoped_course_id = f"{course_name}__{_slug(filename)}"
-            return await extract_course_overview_and_topics(
-                course_id=scoped_course_id,
-                course_name=filename,
-                source_files=[filename],
-                sample_chunks=chunks_by_file[filename],
-                router=router,
-            )
+            try:
+                # course_id encodes course slug + chapter-slug-with-hash so
+                # `_slug` collisions on similar filenames (e.g. "lec 1.pdf"
+                # / "lec_1.pdf") don't fuse into one root via the merger's
+                # (type, name, concept_id) key. R5-1 fix-all v1 #F3.
+                scoped_course_id = f"{course_name}__{_chapter_slug(filename)}"
+                return await extract_course_overview_and_topics(
+                    course_id=scoped_course_id,
+                    course_name=filename,
+                    source_files=[filename],
+                    sample_chunks=chunks_by_file[filename],
+                    router=router,
+                )
+            finally:
+                async with stage_a_lock:
+                    stage_a_done += 1
+                    # Cap pre-completion emits at 99 so the terminal 100 is
+                    # always the explicit one emitted by the orchestrator.
+                    pct = max(1, min(99, int(100 * stage_a_done / stage_a_total)))
+                    _emit(KG_STAGE_A, pct)
 
     stage_a_results = await asyncio.gather(
         *[_stage_a_for_file(f) for f in files_ordered],
@@ -423,7 +500,14 @@ async def extract_from_chunks(
     per_file_prereq: dict[str, list[tuple[str, str]]] = {}
     for filename, result in zip(files_ordered, stage_a_results):
         if isinstance(result, Exception):
-            logger.warning("Stage A failed for chapter %r: %s", filename, result)
+            # R5-1 fix-all v1 #F10: scrub exception body before logging.
+            # `str(exc)` on openai-python errors echoes the request which
+            # includes the prompt (user-supplied chunk excerpts). Mirror
+            # R4-4 fix-all v2 V5: log a structured code, not the body.
+            logger.warning(
+                "Stage A failed for chapter %r: %s",
+                filename, getattr(result, "code", type(result).__name__),
+            )
             per_file_overview[filename] = ""
             per_file_topics[filename] = []
             per_file_prereq[filename] = []
@@ -450,33 +534,43 @@ async def extract_from_chunks(
             for t in topics:
                 t.learning_order = position.get(t.concept_id)
 
-    # ── Stage B per file (batched, deterministic file order) ───────────
+    # ── Stage B flattened (R5-1 fix-all v1 #F2) ────────────────────────
+    # Pre-fix Stage B ran a sequential `for filename in files_ordered`
+    # outer loop with inner 5-chunk batches — small files under-filled
+    # the concurrency window and a 5-file × 6-chunk corpus took ~10
+    # sequential batches instead of 6 batches of 5. Flatten back to a
+    # single batched loop across all sampled chunks; the per-chunk
+    # topics arg is looked up from the same `_chunk_bucket_key` so each
+    # chunk still sees its OWN chapter's topics.
     _emit(KG_STAGE_B, 0)
     batch_size = 5
     all_concepts: list[Concept] = []
     all_relations: list[Relation] = []
-    done = 0
 
-    for filename in files_ordered:
-        file_chunks = chunks_by_file[filename]
-        file_topics = per_file_topics[filename]
-        for i in range(0, len(file_chunks), batch_size):
-            batch = file_chunks[i:i + batch_size]
-            tasks = [
-                extract_concepts_from_chunk(c, course_name, router, topics=file_topics)
-                for c in batch
-            ]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            for result in results:
-                if isinstance(result, Exception):
-                    logger.warning(f"Batch extraction error: {result}")
-                    continue
-                concepts, relations = result
-                all_concepts.extend(concepts)
-                all_relations.extend(relations)
-            done += len(batch)
-            pct = max(1, min(99, int(100 * done / max(1, len(sampled)))))
-            _emit(KG_STAGE_B, pct)
+    for i in range(0, len(sampled), batch_size):
+        batch = sampled[i:i + batch_size]
+        tasks = [
+            extract_concepts_from_chunk(
+                c, course_name, router,
+                topics=per_file_topics.get(_chunk_bucket_key(c.source_file), []),
+            )
+            for c in batch
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for result in results:
+            if isinstance(result, Exception):
+                # Same PII-scrub discipline as Stage A.
+                logger.warning(
+                    "Batch extraction error: %s",
+                    getattr(result, "code", type(result).__name__),
+                )
+                continue
+            concepts, relations = result
+            all_concepts.extend(concepts)
+            all_relations.extend(relations)
+        done = min(i + batch_size, len(sampled))
+        pct = max(1, min(99, int(100 * done / max(1, len(sampled)))))
+        _emit(KG_STAGE_B, pct)
     _emit(KG_STAGE_B, 100)
 
     # R4-4: cache concept_embedding on every non-root concept so graph_search
@@ -538,7 +632,10 @@ async def extract_from_chunks(
         # their chapters in the graph even if topic extraction sputtered).
         if not topics and not chunks_by_file.get(filename):
             continue
-        root_id = f"root_{course_name}__{_slug(filename)}"
+        # R5-1 fix-all v1 #F3: chapter_slug appends a sha1[:8] of the raw
+        # filename so two distinct files with collision-prone slugs
+        # ("lec 1.pdf" / "lec_1.pdf") get distinct root ids.
+        root_id = f"root_{course_name}__{_chapter_slug(filename)}"
         # Strip directory prefixes from the display label so it reads as
         # a chapter title; the underlying source_chunks still carry the
         # full path for citation routing.
@@ -570,24 +667,32 @@ async def extract_from_chunks(
             ))
 
     # Wire leaves: prefer the LLM-declared parent_topic (per-file scoped);
-    # if it's missing/unknown, fall back to the leaf's own source_file root.
+    # if it's missing/unknown, fall back to the leaf's own source_file
+    # root. R5-1 fix-all v1 #F8+F9: route by the SAME `_chunk_bucket_key`
+    # used at bucketing time so empty/None source_file ends up in the
+    # "(unknown)" bucket on both sides. Pre-fix, mismatch caused such
+    # leaves to silently graft onto `roots[0]` (the alphabetically-first
+    # chapter), creating a cross-chapter attribution bug. If even the
+    # "(unknown)" bucket has no root (shouldn't happen given the loop
+    # above, but defensively), we now drop the leaf-edge entirely rather
+    # than misattribute it to an unrelated chapter.
     for c in all_concepts:
         if c.parent_topic and c.parent_topic in topic_id_to_root:
             leaf_edges.append(Relation(
                 source=c.concept_id, target=c.parent_topic, relation_type="part-of",
             ))
             continue
-        leaf_file = None
+        leaf_file_raw = None
         if c.source_chunks:
-            leaf_file = c.source_chunks[0].get("source_file") or None
-        target_root = filename_to_root.get(leaf_file or "")
-        if not target_root and roots:
-            # Last-ditch: pick the first root rather than dropping the leaf.
-            target_root = roots[0].concept_id
+            leaf_file_raw = c.source_chunks[0].get("source_file")
+        target_root = filename_to_root.get(_chunk_bucket_key(leaf_file_raw))
         if target_root:
             orphan_edges.append(Relation(
                 source=c.concept_id, target=target_root, relation_type="part-of",
             ))
+        # else: no chapter root resolved (e.g. leaf has empty
+        # source_chunks). Skip the edge rather than misattribute; the
+        # leaf node still exists but renders unparented.
 
     logger.info(
         "Chapter-rooted extraction: %d roots + %d topics + %d concepts (%d orphans), "

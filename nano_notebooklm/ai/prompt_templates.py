@@ -152,28 +152,32 @@ CONCEPT_EXTRACTION_SYSTEM = (
     "Output valid JSON only."
 )
 
-# Stage A — macro topic skeleton from a corpus-wide sample. We feed the LLM
-# the file list + chunk *heads* (first 80 chars each, up to 30 chunks) so it
-# sees the whole course outline at once and produces 5-9 chapter-level topics.
-# Without this stage every concept is chunk-local and the mind map collapses
-# into 100+ unrelated leaves.
+# Stage A — macro topic skeleton for a single chapter (source file). R5-1
+# changed the unit of Stage A from "the course as a whole" to "one chapter".
+# The LLM sees one file's name + chunk heads (first 100 chars each, up to
+# 30 chunks) and produces 3-5 topics that summarise THAT chapter. The
+# "course_overview" field is reused as a per-chapter overview (kept as
+# field name for back-compat with downstream code that reads it).
 MACRO_TOPICS_SYSTEM = (
-    "You are an expert at distilling university courses into their high-level "
-    "topic skeleton. You see file titles and snippets from across the entire "
-    "course, then output the 5-9 main themes/chapters. Output valid JSON only."
+    "You are an expert at distilling a single lecture / chapter into its "
+    "topic skeleton. You see the chapter's file name and a sample of its "
+    "content, then output 3-5 disjoint topics that span that chapter. "
+    "Output valid JSON only."
 )
 
-MACRO_TOPICS_PROMPT = """Read the source list and chunk excerpts from the course "{course_name}" below, then identify the 5-9 most important macro-topics for the course as a whole.
+MACRO_TOPICS_PROMPT = """Read the chapter file name and chunk excerpts below, then identify the 3-5 most important topics for THIS CHAPTER (not the whole course).
 
-Source files:
+Chapter file: {course_name}
+
+Source files (for context — usually just this chapter):
 {source_files}
 
-Chunk excerpts (one per line):
+Chunk excerpts from this chapter (one per line):
 {chunk_heads}
 
 Output a JSON object with this exact structure:
 {{
-  "course_overview": "one-sentence summary of what this course covers (match the dominant language of the excerpts)",
+  "course_overview": "one-sentence summary of what THIS CHAPTER covers (match the dominant language of the excerpts)",
   "topics": [
     {{
       "name": "topic name (concise, 1-4 words; match the dominant language)",
@@ -187,11 +191,11 @@ Output a JSON object with this exact structure:
 }}
 
 Rules:
-- Produce 5-9 topics — not 3, not 15. Aim for chapter-level granularity.
-- Topics must be DISJOINT and span the course breadth, not overlap.
+- Produce 3-5 topics for this chapter. Quality over quantity — don't pad with overlapping or vague topics.
+- Topics must be DISJOINT and span the chapter, not the whole course.
 - Match the dominant language of the excerpts (Chinese excerpts → Chinese topic names; English → English).
 - Do NOT invent topics not supported by the excerpts.
-- weight reflects how central the topic is to the course (10 = core, 1 = minor).
+- weight reflects how central the topic is to this chapter (10 = core, 1 = minor).
 - prerequisite_of lists pedagogical precedence between the topics above.
   "from" must be studied BEFORE "to". Use names that exactly match the
   topics array. Omit pairs you're unsure about — empty list is fine.

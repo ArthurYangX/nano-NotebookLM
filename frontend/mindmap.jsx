@@ -1057,7 +1057,7 @@ function MindMap({ data, layout, courseId, highlightedId, onNodeClick, onSourceC
             onClick={toggleLegend}
             aria-label="隐藏图例"
           >×</button>
-          <div className="row"><div className="sw" style={{ background: "var(--ink)", borderColor: "var(--ink)" }}></div>Chapter · {visNodes.filter(n => n.kind === "root").length}</div>
+          <div className="row"><div className="sw" style={{ background: "var(--ink)", borderColor: "var(--ink)" }}></div>Chapter · {(prepared.rootIds || []).length || visNodes.filter(n => n.kind === "root").length}</div>
           <div className="row"><div className="sw" style={{ background: "var(--accent-soft)", borderColor: "var(--accent)" }}></div>Topic · {visNodes.filter(n => n.kind === "branch").length}</div>
           <div className="row"><div className="sw" style={{ background: "var(--paper)", borderColor: "var(--rule-strong)" }}></div>Concept · {visNodes.filter(n => n.kind === "leaf").length}</div>
           <div className="row"><div className="sw" style={{ background: "transparent", borderColor: "var(--rule-strong)" }}></div>Relations · {visEdges.length}/{edges.length}</div>
