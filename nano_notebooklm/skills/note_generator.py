@@ -23,10 +23,13 @@ class NoteGeneratorSkill(Skill):
         streaming endpoint can reuse the same prompt and pipe deltas
         directly through `router.complete_stream` instead of running the
         whole skill then chunking the result.
+
+        LaTeX-refactor: format is fixed to "latex"; the markdown branch is
+        gone. `params.get("format")` is accepted for backwards-compat but
+        only "latex" is honoured — anything else is silently coerced.
         """
         course_id = params.get("course_id", "")
         topic = params.get("topic")
-        note_format = params.get("format", "markdown")
         user_lang = params.get("user_lang")
 
         if not course_id:
@@ -50,15 +53,11 @@ class NoteGeneratorSkill(Skill):
             f"[Source: {r.source_file}, {r.location}]\n{r.text}"
             for r in results
         )
-        format_instructions = (prompts.NOTE_FORMAT_LATEX
-                               if note_format == "latex"
-                               else prompts.NOTE_FORMAT_MARKDOWN)
         prompt = prompts.NOTE_GENERATION_PROMPT.format(
             course_name=course_id,
             topic=topic or "Full Course Overview",
-            format=note_format,
             source_text=source_text,
-            format_instructions=format_instructions,
+            format_instructions=prompts.NOTE_FORMAT_LATEX,
         )
         system = prompts.NOTE_GENERATION_SYSTEM
         binding = prompts.USER_LANG_BINDING(user_lang)
@@ -70,7 +69,7 @@ class NoteGeneratorSkill(Skill):
             "task_type": "note_generation",
             "temperature": 0.3,
             "max_tokens": 8192,
-            "format": note_format,
+            "format": "latex",
             "topic": topic or "Full Course",
             "sources_used": len(results),
             "course_id": course_id,
@@ -81,12 +80,14 @@ class NoteGeneratorSkill(Skill):
         Params:
             course_id (str): Course identifier
             topic (str | None): Specific topic to focus on (None = full course)
-            format (str): "markdown" or "latex"
             scope (str): "lecture" | "chapter" | "full"
+
+        LaTeX-refactor: `format` param is no longer honoured; output is
+        always LaTeX. Kept in signature for backwards-compat call sites.
         """
         course_id = params.get("course_id", "")
         topic = params.get("topic")
-        note_format = params.get("format", "markdown")
+        note_format = "latex"
         scope = params.get("scope", "full")
 
         prepared = self.prepare_inputs(params)
@@ -112,7 +113,7 @@ class NoteGeneratorSkill(Skill):
         # resolved output path stays under ARTIFACTS_DIR/courses/ — `course_id`
         # values like "../../etc" would otherwise let any future caller
         # write outside the artifacts tree.
-        ext = ".tex" if note_format == "latex" else ".md"
+        ext = ".tex"
         topic_slug = _slugify(topic) if topic else "full_course"
         output_dir = (config.ARTIFACTS_DIR / "courses" / course_id / "notes").resolve()
         allowed_root = (config.ARTIFACTS_DIR / "courses").resolve()

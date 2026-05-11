@@ -153,6 +153,15 @@ function App() {
       return;
     }
 
+    // Clear activeId + sources synchronously when activeCourse changes.
+    // Without this the Reader briefly sees (new course, old course's
+    // activeId, old course's sources) — the `activeIdInSources` guard
+    // there incorrectly passes against the stale sources list and fires a
+    // (new_course, old_doc_id) fetch that 404s. The new course's sources
+    // and a fresh activeId are populated once getSources resolves below.
+    setActiveId(null);
+    setActivePage(null);
+    setSources([]);
     API.getSources(activeCourse).then(data => {
       const srcs = (data.sources || []).map((s, i) => ({
         id: s.id || `s${i}`,
@@ -185,35 +194,87 @@ function App() {
   }
 
   // ── API actions ──
+  // Notes generation now runs the full-course pipeline: per-file parallel
+  // LLM calls (concurrency=4), programmatic \section{} concat, then one
+  // LLM review pass for terminology/cross-ref polish. As each per-file
+  // result lands we append its \section{...} to the visible draft so the
+  // user sees progress immediately; once the review pass starts streaming
+  // we swap the draft for the streamed partial; on done we install the
+  // final reviewed body.
   async function handleGenerateNotes() {
     if (!activeCourse) { alert("Please select a specific course first (not 'All Courses')"); return; }
     setMode("notes");
     setStreaming(true);
     setStreamProgress(0);
     setGenerationState(StudyState.createGenerationState());
+    const fileSections = [];
+    function rebuildDraftFromFiles() {
+      return fileSections
+        .filter(f => f && f.status === "done" && f.content)
+        .map(f => `\\section{${(f.source_file || "untitled").replace(/[{}\\]/g, c => "\\" + c)}}\n${f.content}`)
+        .join("\n\n");
+    }
+    let reviewPartial = "";
+    let inReview = false;
     try {
-      let partial = "";
-      const final = await API.streamNotes(activeCourse, null, "markdown", event => {
-        if (event.type === "chunk") {
-          partial = event.partial;
-          setRealNotes(partial);
-          setGenerationState(s => StudyState.recordPartialGeneration(s, event.chunk));
+      const final = await API.streamFullCourseNotes(activeCourse, event => {
+        if (event.type === "plan") {
+          for (let i = 0; i < event.total; i += 1) {
+            fileSections[i] = {
+              source_file: event.files && event.files[i] ? event.files[i].source_file : `file_${i}`,
+              status: "pending",
+              content: null,
+              error: null,
+            };
+          }
+          setStreamProgress(0);
+        } else if (event.type === "file_start") {
+          if (fileSections[event.idx]) {
+            fileSections[event.idx].status = "running";
+            fileSections[event.idx].source_file = event.source_file || fileSections[event.idx].source_file;
+          }
+        } else if (event.type === "file_done") {
+          if (fileSections[event.idx]) {
+            fileSections[event.idx].status = "done";
+            fileSections[event.idx].content = event.content;
+            fileSections[event.idx].source_file = event.source_file || fileSections[event.idx].source_file;
+          }
+          if (!inReview) setRealNotes(rebuildDraftFromFiles());
           setStreamProgress(p => p + 1);
+        } else if (event.type === "file_error") {
+          if (fileSections[event.idx]) {
+            fileSections[event.idx].status = "error";
+            fileSections[event.idx].error = event.error;
+          }
+          setStreamProgress(p => p + 1);
+        } else if (event.type === "merging") {
+          // Programmatic concat is instant — no UI swap needed; the draft
+          // already shows the assembled sections from file_done events.
+        } else if (event.type === "reviewing") {
+          inReview = true;
+          reviewPartial = "";
+        } else if (event.type === "review_chunk") {
+          reviewPartial = event.partial || (reviewPartial + (event.delta || ""));
+          setRealNotes(reviewPartial);
+          setGenerationState(s => StudyState.recordPartialGeneration(s, event.delta || ""));
         } else if (event.type === "error") {
-          setGenerationState(s => StudyState.recordGenerationFailure({ ...s, partial: event.partial || partial }, new Error(event.error), (s.failures || 0) + 1));
+          setGenerationState(s => StudyState.recordGenerationFailure(
+            { ...s, partial: event.partial || reviewPartial || rebuildDraftFromFiles() },
+            new Error(event.error || "stream_failed"),
+            (s.failures || 0) + 1,
+          ));
         }
       }, { userLang });
-      if (final && final.type === "error") throw new Error(final.error);
-      const content = (final && final.content) || partial || "Notes generation failed.";
+      if (final && final.type === "error") throw new Error(final.error || "stream_failed");
+      const content = (final && final.content) || reviewPartial || rebuildDraftFromFiles() || "Notes generation failed.";
       setRealNotes(content);
       saveCached(activeCourse, "notes", content);
       StudyState.saveNoteDraft(localStorage, activeCourse, content);
       await API.appendSessionLog(activeCourse, "generation", { kind: "notes" }).catch(() => {});
     } catch (e) {
       const msg = "Error: " + e.message;
-      setRealNotes(prev => prev || msg);
+      setRealNotes(prev => prev || rebuildDraftFromFiles() || msg);
       setGenerationState(s => StudyState.recordGenerationFailure(s, e, (s.failures || 0) + 1));
-      // Don't cache errors
     }
     setStreaming(false);
   }
@@ -507,6 +568,7 @@ function App() {
           {effectiveMode === "reader" && (
             <Reader
               sources={sources}
+              activeCourse={activeCourse}
               activeId={activeId}
               activePage={activePage}
               highlightedId={highlightedId}
@@ -816,6 +878,98 @@ function markdownToHtml(content) {
   return html;
 }
 
+/* ── CodeMirror 6 editor wrapper ── */
+// Babel-standalone-friendly React wrapper around CodeMirror 6 (loaded as
+// ES modules via index.html, exposed on window.__CM6). Falls back to a
+// plain <textarea> when CM6 isn't ready (offline / esm.sh failure / loading).
+// Polls + listens for `cm6-ready` for up to 5s before settling on fallback.
+function CodeMirror6Editor({ value, onChange, language, placeholder }) {
+  const hostRef = React.useRef(null);
+  const viewRef = React.useRef(null);
+  const [ready, setReady] = React.useState(
+    typeof window !== "undefined" && window.__CM6 && window.__CM6.ready
+  );
+  const [fallback, setFallback] = React.useState(false);
+
+  // Wait for cm6-ready event, with a 5s ceiling before fallback to textarea.
+  React.useEffect(() => {
+    if (ready || fallback) return;
+    if (typeof window === "undefined") return;
+    let cancelled = false;
+    const onReady = () => { if (!cancelled) setReady(true); };
+    const onFailed = () => { if (!cancelled) setFallback(true); };
+    window.addEventListener("cm6-ready", onReady);
+    window.addEventListener("cm6-failed", onFailed);
+    const timer = setTimeout(() => {
+      if (cancelled) return;
+      if (window.__CM6 && window.__CM6.ready) setReady(true);
+      else setFallback(true);
+    }, 5000);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+      window.removeEventListener("cm6-ready", onReady);
+      window.removeEventListener("cm6-failed", onFailed);
+    };
+  }, [ready, fallback]);
+
+  // Mount CM6 once ready. Recreate on language change.
+  React.useEffect(() => {
+    if (!ready || !hostRef.current) return;
+    const CM6 = window.__CM6;
+    if (!CM6 || !CM6.ready) { setFallback(true); return; }
+    const langExt = (language === "stex" || language === "latex")
+      ? CM6.StreamLanguage.define(CM6.stex)
+      : [];
+    const updateListener = CM6.EditorView.updateListener.of((vu) => {
+      if (vu.docChanged) {
+        const next = vu.state.doc.toString();
+        onChange && onChange(next);
+      }
+    });
+    const state = CM6.EditorState.create({
+      doc: String(value || ""),
+      extensions: [CM6.basicSetup, langExt, updateListener],
+    });
+    const view = new CM6.EditorView({ state, parent: hostRef.current });
+    viewRef.current = view;
+    return () => {
+      view.destroy();
+      viewRef.current = null;
+    };
+    // language switch is the only reason to rebuild; `value` is synced via
+    // the imperative effect below to avoid recreating the view on every keystroke.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ready, language]);
+
+  // Sync external value changes (course switch, streaming overwrite) into
+  // the editor without losing cursor on no-op updates.
+  React.useEffect(() => {
+    const view = viewRef.current;
+    if (!view) return;
+    const cur = view.state.doc.toString();
+    if (cur === (value || "")) return;
+    view.dispatch({
+      changes: { from: 0, to: cur.length, insert: String(value || "") },
+    });
+  }, [value]);
+
+  if (fallback) {
+    return <textarea
+      className="notes-editor"
+      placeholder={placeholder}
+      value={value || ""}
+      onChange={e => onChange && onChange(e.target.value)}
+    />;
+  }
+  if (!ready) {
+    return <div className="notes-editor cm6-loading mono">
+      Loading editor…
+    </div>;
+  }
+  return <div ref={hostRef} className="notes-editor cm6-host" />;
+}
+
 /* ── Real Notes View — reading UX (Range API + highlights + TOC + chip routing) ── */
 
 function findTextRangeInRoot(root, text, before, after) {
@@ -1036,12 +1190,18 @@ function RealNotesView({ content, streaming, activeCourse, onContentChange, gene
   }, [content, streaming, editing]);
 
   // Highlights / TOC. During streaming we extract the TOC from the partial
-  // markdown but DO NOT prune highlights — the partial doesn't contain
+  // LaTeX but DO NOT prune highlights — the partial doesn't contain
   // sections that haven't streamed yet, and pruning would silently delete
   // their anchors from localStorage.
+  // LaTeX-refactor: TOC is extracted from `\section{...}` macros via the
+  // latex-to-html shim's extractor; falls back to the markdown helper for
+  // older content (legacy partial drafts).
   React.useEffect(() => {
     if (!activeCourse) { setHighlights([]); setTocItems([]); return; }
-    setTocItems(StudyState.extractHeadingTOC(draft));
+    const toc = (typeof NanoLatex !== "undefined" && NanoLatex.extractTOC)
+      ? NanoLatex.extractTOC(draft)
+      : StudyState.extractHeadingTOC(draft);
+    setTocItems(toc);
     if (streaming) return;
     const result = StudyState.pruneStaleHighlights(localStorage, activeCourse, draft);
     setHighlights(result.kept);
@@ -1117,8 +1277,21 @@ function RealNotesView({ content, streaming, activeCourse, onContentChange, gene
     onContentChange && onContentChange(value);
   }
 
-  function downloadMarkdown() {
-    const exp = StudyState.buildMarkdownExport(activeCourse, draft);
+  // LaTeX-refactor: 3-way export. Source-of-truth is always the LaTeX body
+  // in `draft`. Browser-print uses the same HTML we render here (so math +
+  // theorem boxes look right), tectonic compile sends the source up.
+  const [tectonicAvailable, setTectonicAvailable] = React.useState(null);
+  const [compileError, setCompileError] = React.useState(null);
+  React.useEffect(() => {
+    let cancelled = false;
+    fetch("/api/status").then(r => r.ok ? r.json() : null).then(s => {
+      if (!cancelled && s) setTectonicAvailable(Boolean(s.tectonic_available));
+    }).catch(() => { /* status probe is best-effort */ });
+    return () => { cancelled = true; };
+  }, []);
+
+  function downloadLatex() {
+    const exp = StudyState.buildLatexExport(activeCourse, draft);
     const blob = new Blob([exp.content], { type: exp.mime });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
@@ -1128,13 +1301,66 @@ function RealNotesView({ content, streaming, activeCourse, onContentChange, gene
     URL.revokeObjectURL(url);
   }
 
-  function exportPdf() {
-    const html = StudyState.buildPdfPrintHtml(activeCourse, draft);
+  function printPdfFromBrowser() {
+    // Re-render the LaTeX through the same shim used in the preview, so
+    // the print output carries theorem boxes + math (via KaTeX inline-rendered
+    // HTML) rather than raw source.
+    const rendered = (typeof NanoLatex !== "undefined" && NanoLatex.latexToHtml)
+      ? NanoLatex.latexToHtml(draft)
+      : "<pre>" + (draft || "").replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c])) + "</pre>";
+    const html = StudyState.buildPrintHtml(activeCourse, rendered);
     const win = window.open("", "_blank");
     if (!win) return;
     win.document.write(html);
     win.document.close();
-    win.print();
+    // Defer print to give KaTeX a tick to render in the new window.
+    setTimeout(() => { try { win.print(); } catch (e) {} }, 350);
+  }
+
+  async function compilePdfWithTectonic() {
+    if (!activeCourse) return;
+    setCompileError(null);
+    try {
+      const resp = await fetch("/api/notes/export/pdf", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ course_id: activeCourse, latex_source: draft }),
+      });
+      if (!resp.ok) {
+        let body = null;
+        try { body = await resp.json(); } catch (e) {}
+        if (body && body.error === "tectonic_unavailable") {
+          setTectonicAvailable(false);
+          setCompileError("Tectonic 不可用：服务器未安装 LaTeX 编译器。");
+          return;
+        }
+        if (body && body.error === "latex_unsafe") {
+          setCompileError(`安全检查拦截：${body.reason || "包含禁止的 LaTeX 命令"}`);
+          return;
+        }
+        if (body && body.error === "latex_compile_failed") {
+          const tail = (body.log || "").slice(-800);
+          setCompileError(`LaTeX 编译失败 (exit ${body.exit_code || "?"})：\n${tail}`);
+          return;
+        }
+        if (body && body.error === "latex_compile_timeout") {
+          setCompileError("编译超时（>60s）。文档可能含死循环或复杂的图。");
+          return;
+        }
+        setCompileError(`Compile failed: HTTP ${resp.status}`);
+        return;
+      }
+      const blob = await resp.blob();
+      const url = URL.createObjectURL(blob);
+      const safeCourse = String(activeCourse || "course").replace(/[^\w.-]+/g, "-");
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `${safeCourse}-notes.pdf`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      setCompileError(`网络错误：${e.message || e}`);
+    }
   }
 
   function captureSelection() {
@@ -1243,24 +1469,48 @@ function RealNotesView({ content, streaming, activeCourse, onContentChange, gene
     setHighlights(list);
   }
 
-  const html = markdownToHtml(draft);
+  // LaTeX-refactor: render LaTeX → HTML via the latex-to-html shim. Math
+  // placeholders are restored to $...$ / $$...$$ inside the HTML; the
+  // existing KaTeX renderMath effect (above) sweeps them after mount.
+  const html = (typeof NanoLatex !== "undefined" && NanoLatex.latexToHtml)
+    ? NanoLatex.latexToHtml(draft)
+    : ""; // shim missing → empty preview rather than mangled raw source
 
   return (
     <div className="reader-body notes-reader-body">
       <div className="notes-toolbar">
         <button className="btn ghost" onClick={() => { setEditing(!editing); setSelMenu(null); setPopover(null); }}>{editing ? "Preview" : "Edit"}</button>
-        <button className="btn ghost" onClick={downloadMarkdown}>Markdown</button>
-        <button className="btn ghost" onClick={exportPdf}>PDF</button>
+        <button className="btn ghost" onClick={downloadLatex} title="下载 .tex 源文件">.tex</button>
+        <button className="btn ghost" onClick={printPdfFromBrowser} title="浏览器打印（快速预览）">PDF (print)</button>
+        <button
+          className="btn ghost"
+          onClick={compilePdfWithTectonic}
+          disabled={tectonicAvailable === false}
+          title={tectonicAvailable === false
+            ? "Tectonic 不可用：服务器未安装 LaTeX 编译器"
+            : "服务端 LaTeX 编译（学术排版）"}
+        >PDF (compile)</button>
         <button className="btn ghost" onClick={() => setShowToc(v => !v)} disabled={editing}>{showToc ? "Hide TOC" : "Show TOC"}</button>
         <button className="btn ghost" onClick={() => setShowDrawer(v => !v)} disabled={editing}>{showDrawer ? "Hide Highlights" : `Highlights · ${highlights.length}`}</button>
         {generationState?.retryable && <button className="btn primary" onClick={onRetry}>Retry</button>}
       </div>
       {streaming && <div style={{ color: "var(--accent)", marginBottom: 16, fontFamily: "var(--mono)", fontSize: 12 }}>Generating notes<span className="stream-cursor"></span></div>}
       {generationState?.status === "failed" && <div className="error-banner">{generationState.errorDetail}</div>}
+      {compileError && (
+        <div className="error-banner" style={{ whiteSpace: "pre-wrap", fontFamily: "var(--mono)", fontSize: 12 }}>
+          {compileError}
+          <button className="btn ghost" style={{ marginLeft: 8 }} onClick={() => setCompileError(null)}>×</button>
+        </div>
+      )}
       {editing ? (
         <div>
-          <p className="notes-edit-hint mono">Editing raw markdown — highlights stay saved and reappear in Preview.</p>
-          <textarea className="notes-editor" value={draft} onChange={e => updateDraft(e.target.value)} />
+          <p className="notes-edit-hint mono">Editing raw LaTeX — highlights stay saved and reappear in Preview.</p>
+          <CodeMirror6Editor
+            value={draft}
+            onChange={updateDraft}
+            language="stex"
+            placeholder="\\section{Introduction} ..."
+          />
         </div>
       ) : (
         <div className="notes-stage">

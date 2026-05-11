@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import mimetypes
 import os
+import shutil
+import subprocess
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -22,6 +27,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from nano_notebooklm.ai.router import ModelRouter
+from nano_notebooklm.ai.prompt_templates import NOTE_LATEX_PREAMBLE, NOTE_LATEX_POSTAMBLE
 from nano_notebooklm.agents import run_subagent
 from nano_notebooklm.agents.formatter import format_response
 from nano_notebooklm.kb.store import KBStore
@@ -31,6 +37,13 @@ from nano_notebooklm.orchestrator.session_log import SessionLog
 from nano_notebooklm.orchestrator import router_intent
 from nano_notebooklm.orchestrator.tools import build_default_registry
 from nano_notebooklm.ai.openai_backend import OpenAIBackend
+from nano_notebooklm.skills.latex_sanitizer import (
+    check as latex_check,
+    check_unbounded as latex_check_unbounded,
+    LaTeXUnsafeError,
+    MAX_LATEX_BYTES,
+)
+from nano_notebooklm.skills import notes_full_course
 from nano_notebooklm import config
 
 logging.basicConfig(
@@ -69,6 +82,44 @@ app.add_middleware(
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["content-type", "x-request-id"],
 )
+
+
+# fix-all v1 #B7 (R4-4 review-swarm): pre-warm kb.embed_fn at boot so the
+# first /api/mindmap, /api/upload, or graphrag /api/chat doesn't pay the
+# 5-30s sentence-transformer model download + load on the request hot
+# path. Wrapped in asyncio.to_thread so the import + model load don't
+# block the event loop. Failure is non-fatal — embed_fn will lazy-load on
+# first call with a longer latency tax, same as before this hook existed.
+# NANO_NLM_DISABLE_EMBED_WARMUP=1 skips the warm-up entirely (used by the
+# pytest suite, which creates and tears down `app` many times and would
+# otherwise pay the model load on every TestClient reload).
+@app.on_event("startup")
+async def _warm_embed_fn() -> None:
+    if os.environ.get("NANO_NLM_DISABLE_EMBED_WARMUP"):
+        return
+    import asyncio as _aio
+    try:
+        await _aio.to_thread(lambda: kb.embed_fn(["__warmup__"]))
+        logger.info("kb.embed_fn warmed at startup")
+    except Exception:  # noqa: BLE001 — never block boot on a warm-up failure
+        logger.warning("kb.embed_fn warm-up failed; will lazy-load on first request", exc_info=True)
+
+
+# LaTeX-refactor: probe `tectonic` once at boot. The PDF compile endpoint
+# checks this flag and returns 503 immediately when the binary is missing,
+# so the frontend can hide the "高质量编译" button without a per-request
+# subprocess invocation. shutil.which is sync but a single syscall — keeping
+# the probe synchronous keeps app.state.tectonic_available ready before any
+# request lands.
+@app.on_event("startup")
+async def _probe_tectonic() -> None:
+    binary = shutil.which("tectonic")
+    app.state.tectonic_available = bool(binary)
+    app.state.tectonic_path = binary
+    if binary:
+        logger.info("tectonic detected at %s — PDF compile endpoint enabled", binary)
+    else:
+        logger.info("tectonic not found in PATH — /api/notes/export/pdf will return 503")
 
 # ── Upload limits ────────────────────────────────────────────────────
 MAX_UPLOAD_SIZE_MB = 50
@@ -358,9 +409,10 @@ class ChunkResponse(BaseModel):
 
 
 class ChatResponse(BaseModel):
-    """Schema for /api/chat. The four `path` values are constrained by GOAL.md
-    Round 2 #1 — anything else (e.g. typo `cross_course` underscore vs hyphen)
-    will fail Pydantic serialisation before shipping to the frontend.
+    """Schema for /api/chat. The five `path` values are constrained by GOAL.md
+    Round 2 #1 + Round 4 #R4-4 (which added "graphrag") — anything else
+    (e.g. typo `cross_course` underscore vs hyphen) will fail Pydantic
+    serialisation before shipping to the frontend.
 
     `extra="forbid"` is intentional: when a future skill change adds a new
     sidecar field (e.g. `cross_course_origin` for path=cross-course), we want
@@ -402,8 +454,45 @@ class NoteRequest(BaseModel):
     model_config = {"extra": "forbid"}
     course_id: ReqCourseId
     topic: str | None = Field(None, max_length=500)
-    format: str = Field("markdown", pattern=r"^(markdown|text|html)$")
+    # LaTeX-refactor: Note output is now LaTeX only. The field is kept
+    # rather than removed so old clients posting ``"markdown"`` get a clear
+    # 422 (expected "latex") instead of a cryptic "extra fields not
+    # permitted" envelope. New clients can omit it entirely.
+    format: Literal["latex"] = "latex"
     user_lang: Literal["zh", "en"] | None = None
+
+
+class NoteFullCourseRequest(BaseModel):
+    """Request body for POST /api/notes/full-course/stream.
+
+    Distinct from NoteRequest because full-course generation is always
+    course-wide (no `topic` scoping), always LaTeX, and the only optional
+    knob is concurrency. Kept as a separate model so the endpoint can
+    reject a stray `topic` field with a clean 422 instead of silently
+    ignoring it.
+    """
+    model_config = {"extra": "forbid"}
+    course_id: ReqCourseId
+    user_lang: Literal["zh", "en"] | None = None
+    concurrency: int = Field(
+        notes_full_course.DEFAULT_CONCURRENCY,
+        ge=1, le=8,
+        description="Max parallel per-file LLM calls. Capped at 8 to stay "
+                    "well under codex rate limits.",
+    )
+
+
+class NotePdfExportRequest(BaseModel):
+    """Request body for POST /api/notes/export/pdf.
+
+    Source-based, not topic-based: the frontend sends the (possibly user-
+    edited) LaTeX body so compile decouples from a fresh LLM call. The
+    `latex_sanitizer` module enforces the same forbidden-command list the
+    LLM prompt warns about, plus an 80 KB cap.
+    """
+    model_config = {"extra": "forbid"}
+    course_id: ReqCourseId
+    latex_source: str = Field(..., min_length=1)
 
 
 class QuizRequest(BaseModel):
@@ -567,6 +656,110 @@ async def get_sources(course_id: str):
     return {"sources": list(sources.values())}
 
 
+_DOC_ID_RE = __import__("re").compile(r"^[A-Za-z0-9]{1,64}$")
+
+
+def _resolve_source_path(course_id: str, source_file: str) -> Path | None:
+    """Resolve a chunk's `source_file` to an on-disk path.
+
+    Search order: uploads dir (R4-2 upload-only courses) → COURSE_DATA_DIR
+    (preset courses ingested via scripts/ingest_all.py). Returns None when
+    neither resolves to a real file inside its expected root (path-traversal
+    guard via `Path.resolve()` + `relative_to`).
+    """
+    candidates: list[tuple[Path, Path]] = []
+    uploads_root = (config.ARTIFACTS_DIR / "uploads" / course_id).resolve()
+    candidates.append((uploads_root, uploads_root / source_file))
+    if config.COURSE_DATA_DIR and str(config.COURSE_DATA_DIR):
+        preset_root = (Path(config.COURSE_DATA_DIR) / course_id).resolve()
+        candidates.append((preset_root, preset_root / source_file))
+    for root, candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+            resolved.relative_to(root)
+        except (OSError, ValueError):
+            continue
+        if resolved.is_file():
+            return resolved
+    return None
+
+
+@app.get("/api/source/{course_id}/{doc_id}/chunks",
+         tags=["courses"], summary="List all chunks for a source document (ordered)")
+async def get_source_chunks(course_id: str, doc_id: str):
+    """Return every chunk belonging to one source document, ordered by
+    page then chunk_id — powers the Reader's document-browse mode.
+
+    Differs from `/api/chunks/{chunk_id}` (citation viewer with prev/next):
+    here we hand back the *whole* document at once so the Reader can render
+    the full text inline and jump to `activePage` without round-tripping.
+    """
+    course_id = _validate_course_id_path(course_id)
+    if not doc_id or not _DOC_ID_RE.match(doc_id):
+        raise HTTPException(400, f"invalid doc_id: {doc_id[:40]!r}")
+    chunks = kb.get_chunks(course_id)
+    if not chunks:
+        raise HTTPException(404, f"course has no chunks: {course_id}")
+    same_doc = [c for c in chunks if c.doc_id == doc_id]
+    if not same_doc:
+        raise HTTPException(404, f"doc not found in course: {doc_id}")
+    same_doc.sort(key=lambda c: (c.page if c.page is not None else 10**9, c.chunk_id))
+    pages = [c.page for c in same_doc if c.page is not None]
+    file_path = _resolve_source_path(course_id, same_doc[0].source_file)
+    return {
+        "course_id": course_id,
+        "doc_id": doc_id,
+        "source_file": same_doc[0].source_file,
+        "file_type": same_doc[0].file_type.value,
+        "total_chunks": len(same_doc),
+        "page_range": [min(pages), max(pages)] if pages else None,
+        "file_available": file_path is not None,
+        "chunks": [
+            {
+                "chunk_id": c.chunk_id,
+                "text": c.text,
+                "page": c.page,
+                "location": c.location,
+                "section": c.section,
+            }
+            for c in same_doc
+        ],
+    }
+
+
+@app.get("/api/source/{course_id}/{doc_id}/file",
+         tags=["courses"], summary="Serve the original source file (PDF/PPTX/DOCX/MD/PNG)")
+async def get_source_file(course_id: str, doc_id: str):
+    """Stream the original file for in-browser viewers (e.g. pdf.js / native
+    `<iframe>` PDF viewer). Path resolution goes through
+    `_resolve_source_path` which guards against `..`-traversal by resolving
+    each candidate and rejecting anything outside its allowed root.
+    """
+    course_id = _validate_course_id_path(course_id)
+    if not doc_id or not _DOC_ID_RE.match(doc_id):
+        raise HTTPException(400, f"invalid doc_id: {doc_id[:40]!r}")
+    chunks = kb.get_chunks(course_id)
+    target = next((c for c in chunks if c.doc_id == doc_id), None)
+    if target is None:
+        raise HTTPException(404, f"doc not found in course: {doc_id}")
+    path = _resolve_source_path(course_id, target.source_file)
+    if path is None:
+        raise HTTPException(
+            404,
+            "source file not found on disk (may have been deleted after ingest)",
+        )
+    mime, _ = mimetypes.guess_type(str(path))
+    if not mime:
+        mime = "application/octet-stream"
+    return FileResponse(
+        path,
+        media_type=mime,
+        # `inline` keeps the browser's native viewer active for PDFs; we strip
+        # any directory components from the filename Content-Disposition header.
+        headers={"Content-Disposition": f'inline; filename="{Path(target.source_file).name}"'},
+    )
+
+
 # ── Skill endpoints ──────────────────────────────────────────────────
 @app.post("/api/chat", tags=["skills"],
           summary="RAG chat with source citations",
@@ -624,8 +817,10 @@ async def generate_notes(req: NoteRequest):
     if not result.success:
         raise HTTPException(status_code=502, detail=result.error or "note generation failed")
     data = dict(result.data)
-    if "content" in data:
-        data["content"] = format_response(str(data["content"]))
+    # LaTeX-refactor: do NOT call format_response on note content — that
+    # helper repairs markdown (## headers, ** bold, fenced code, $ math)
+    # and would actively mangle a LaTeX body. Notes ship raw LaTeX source
+    # so the frontend can populate CodeMirror + the PDF compile endpoint.
     session_log.append(req.course_id, "generation", {"kind": "notes", "topic": req.topic})
     return data
 
@@ -680,6 +875,315 @@ async def stream_notes(req: NoteRequest):
         "format": req.format,
         "user_lang": req.user_lang,
     }, req.course_id, "notes")
+
+
+@app.post("/api/notes/full-course/stream", tags=["skills"],
+          summary="Generate full-course notes file-by-file (parallel) + merge + review")
+async def stream_full_course_notes(req: NoteFullCourseRequest):
+    """Per-file parallel note generation with progressive NDJSON emission.
+
+    Phases:
+      1. plan          — group chunks by source_file, emit the file list
+      2. per-file      — Semaphore(concurrency)-throttled LLM calls; each
+                         result emits as soon as it finishes (asyncio.as_completed)
+      3. merging       — programmatic \\section{} concat (no LLM cost)
+      4. reviewing     — single LLM polish pass, token-streamed
+      5. done          — final reviewed LaTeX body
+
+    Event shapes (NDJSON, one JSON object per line):
+      {"type":"plan", "files":[{idx, source_file, chunk_count}], "total":N}
+      {"type":"file_start", "idx":i, "source_file":..., "total":N}
+      {"type":"file_done", "idx":i, "source_file":..., "content":"...",
+                            "chunks_used":k}
+      {"type":"file_error", "idx":i, "source_file":..., "error":"<code>"}
+      {"type":"merging", "files_succeeded":m, "files_failed":f}
+      {"type":"reviewing"}
+      {"type":"review_chunk", "delta":"...", "partial":"..."}
+      {"type":"done", "content":"...", "files_succeeded":m, "files_failed":f}
+      {"type":"error", "error":"<code>", "partial":"...", "retryable":true}
+
+    Cost note: ~N+1 LLM calls per request (one per file plus one review).
+    For a 20-file course at default concurrency=4 the wall clock is
+    dominated by the slowest 5 sequential batches plus the review tail.
+    """
+    course_id = req.course_id
+    user_lang = req.user_lang
+    concurrency = req.concurrency
+
+    plans = notes_full_course.plan_for_course(kb, course_id, user_lang=user_lang)
+
+    async def events():
+        partial = ""
+        try:
+            if not plans:
+                yield json.dumps({
+                    "type": "error",
+                    "error": "no_chunks",
+                    "detail": f"course {course_id!r} has no indexed chunks",
+                    "retryable": False,
+                }, ensure_ascii=False) + "\n"
+                return
+
+            yield json.dumps({
+                "type": "plan",
+                "files": [
+                    {"idx": p.idx, "source_file": p.source_file,
+                     "chunk_count": p.chunk_count}
+                    for p in plans
+                ],
+                "total": len(plans),
+                "concurrency": concurrency,
+            }, ensure_ascii=False) + "\n"
+
+            semaphore = asyncio.Semaphore(concurrency)
+            # Bounded queue: per-file work produces 2 events (start + done/error).
+            # 4× plans gives slack for the merging/reviewing/done tail without
+            # an unbounded queue that could mask backpressure bugs.
+            queue: asyncio.Queue = asyncio.Queue(maxsize=max(64, len(plans) * 4))
+            results: list[notes_full_course.FileResult] = [None] * len(plans)  # type: ignore[list-item]
+
+            async def run_one(plan):
+                # Acquire the semaphore first so file_start reflects "a
+                # worker actually picked this file up", not "scheduled at
+                # t=0 alongside the other 19".
+                async with semaphore:
+                    await queue.put({
+                        "type": "file_start",
+                        "idx": plan.idx,
+                        "source_file": plan.source_file,
+                        "total": len(plans),
+                    })
+                    result = await notes_full_course.generate_file(router, plan)
+                    results[plan.idx] = result
+                    if result.content:
+                        await queue.put({
+                            "type": "file_done",
+                            "idx": result.idx,
+                            "source_file": result.source_file,
+                            "content": result.content,
+                            "chunks_used": result.chunk_count,
+                        })
+                    else:
+                        await queue.put({
+                            "type": "file_error",
+                            "idx": result.idx,
+                            "source_file": result.source_file,
+                            "error": result.error or "unknown",
+                        })
+
+            tasks = [asyncio.create_task(run_one(p)) for p in plans]
+            try:
+                done_count = 0
+                while done_count < len(plans):
+                    event = await queue.get()
+                    yield json.dumps(event, ensure_ascii=False) + "\n"
+                    if event["type"] in ("file_done", "file_error"):
+                        done_count += 1
+                # Producers should already be done since each pushed its
+                # terminal event before returning, but await them so any
+                # exception propagates (and so cancellation can join).
+                await asyncio.gather(*tasks, return_exceptions=True)
+            finally:
+                # Client disconnect → StreamingResponse cancels this
+                # generator; cancel outstanding LLM tasks so we don't keep
+                # burning tokens for a closed connection.
+                for t in tasks:
+                    if not t.done():
+                        t.cancel()
+
+            settled = [r for r in results if r is not None]
+            succeeded = [r for r in settled if r.content]
+            failed = [r for r in settled if not r.content]
+
+            if not succeeded:
+                yield json.dumps({
+                    "type": "error",
+                    "error": "all_files_failed",
+                    "detail": f"{len(failed)} of {len(plans)} files failed; "
+                              f"nothing left to merge",
+                    "retryable": True,
+                }, ensure_ascii=False) + "\n"
+                return
+
+            yield json.dumps({
+                "type": "merging",
+                "files_succeeded": len(succeeded),
+                "files_failed": len(failed),
+            }, ensure_ascii=False) + "\n"
+
+            draft = notes_full_course.concat_draft(settled)
+
+            yield json.dumps({"type": "reviewing"}, ensure_ascii=False) + "\n"
+
+            review_inputs = notes_full_course.prepare_review_inputs(
+                course_id=course_id,
+                draft=draft,
+                file_count=len(succeeded),
+                user_lang=user_lang,
+            )
+
+            async for delta in router.complete_stream(
+                review_inputs["prompt"],
+                task_type=review_inputs["task_type"],
+                system=review_inputs["system"],
+                temperature=review_inputs["temperature"],
+                max_tokens=review_inputs["max_tokens"],
+            ):
+                partial += delta
+                yield json.dumps({
+                    "type": "review_chunk",
+                    "delta": delta,
+                    "partial": partial,
+                }, ensure_ascii=False) + "\n"
+
+            # Sanitize the reviewed body with the no-cap variant — a
+            # 20-file course legitimately exceeds the 80KB single-topic
+            # cap, but the forbidden-command threat model still applies.
+            final_content = partial.strip()
+            if not final_content:
+                # Review pass returned nothing — fall back to the raw draft
+                # rather than failing the whole request. Better to give the
+                # user un-polished sections than no notes at all.
+                logger.warning("review pass empty for course %s; "
+                               "falling back to raw concat draft", course_id)
+                final_content = draft
+            try:
+                final_content = latex_check_unbounded(final_content)
+            except LaTeXUnsafeError as e:
+                logger.warning("merged notes failed sanitizer for course %s: %s",
+                               course_id, e.reason)
+                yield json.dumps({
+                    "type": "error",
+                    "error": "latex_unsafe",
+                    "detail": e.reason,
+                    "partial": partial,
+                    "retryable": True,
+                }, ensure_ascii=False) + "\n"
+                return
+
+            session_log.append(course_id, "generation", {
+                "kind": "notes-full-course",
+                "files_succeeded": len(succeeded),
+                "files_failed": len(failed),
+            })
+            yield json.dumps({
+                "type": "done",
+                "content": final_content,
+                "files_succeeded": len(succeeded),
+                "files_failed": len(failed),
+            }, ensure_ascii=False) + "\n"
+
+        except asyncio.CancelledError:
+            # Client disconnect — let it bubble so StreamingResponse cleans up.
+            raise
+        except Exception:  # noqa: BLE001
+            logger.exception("full-course note stream failed for %s", course_id)
+            yield json.dumps({
+                "type": "error",
+                "error": "stream_failed",
+                "partial": partial,
+                "retryable": True,
+            }, ensure_ascii=False) + "\n"
+
+    return StreamingResponse(events(), media_type="application/x-ndjson")
+
+
+# LaTeX-refactor: tectonic-backed PDF compile. Takes the LaTeX body as
+# input (decoupled from LLM regeneration), sanitises it, wraps with the
+# server-owned preamble, runs `tectonic -X compile`, and streams the
+# resulting PDF back. tectonic absence → 503. Sanitizer rejection → 422.
+# Subprocess non-zero exit → 422 with log tail. Timeout → 504.
+_TECTONIC_TIMEOUT_SECONDS = 60
+
+
+@app.post("/api/notes/export/pdf", tags=["skills"],
+          summary="Compile a LaTeX note body to PDF via tectonic")
+async def export_note_pdf(req: NotePdfExportRequest):
+    if not getattr(app.state, "tectonic_available", False):
+        # Surface as JSONResponse rather than HTTPException so the body
+        # carries the structured `{error, request_id, detail}` envelope
+        # the frontend reads. 503 = service unavailable per RFC.
+        return JSONResponse(
+            status_code=503,
+            content={"error": "tectonic_unavailable",
+                     "detail": "tectonic binary not found on the server PATH"},
+        )
+
+    try:
+        cleaned = latex_check(req.latex_source)
+    except LaTeXUnsafeError as exc:
+        return JSONResponse(
+            status_code=422,
+            content={"error": "latex_unsafe", "reason": exc.reason,
+                     "snippet": exc.snippet},
+        )
+
+    document = f"{NOTE_LATEX_PREAMBLE}{cleaned}{NOTE_LATEX_POSTAMBLE}"
+
+    # Each compile gets a fresh tempdir; tectonic writes intermediates
+    # (.aux, .log, .pdf) into --outdir. Use `with` so even a crashing
+    # subprocess can't leak the dir.
+    tectonic_path = app.state.tectonic_path or "tectonic"
+
+    with tempfile.TemporaryDirectory(prefix="nano_nlm_tex_") as tmpdir:
+        tmpdir_path = Path(tmpdir)
+        tex_path = tmpdir_path / "note.tex"
+        tex_path.write_text(document, encoding="utf-8")
+        try:
+            result = subprocess.run(
+                [tectonic_path, "-X", "compile",
+                 "--outdir", str(tmpdir_path),
+                 "--keep-logs", str(tex_path)],
+                capture_output=True,
+                timeout=_TECTONIC_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            logger.warning("tectonic compile timed out after %ss for course=%s",
+                           _TECTONIC_TIMEOUT_SECONDS, req.course_id)
+            return JSONResponse(
+                status_code=504,
+                content={"error": "latex_compile_timeout",
+                         "detail": f"compile exceeded {_TECTONIC_TIMEOUT_SECONDS}s"},
+            )
+
+        if result.returncode != 0:
+            log_bytes = (result.stderr or b"") + (result.stdout or b"")
+            log_tail = log_bytes[-4000:].decode("utf-8", errors="replace")
+            logger.info("tectonic compile exit=%s course=%s",
+                        result.returncode, req.course_id)
+            return JSONResponse(
+                status_code=422,
+                content={"error": "latex_compile_failed",
+                         "log": log_tail,
+                         "exit_code": result.returncode},
+            )
+
+        pdf_path = tmpdir_path / "note.pdf"
+        if not pdf_path.exists():
+            logger.warning("tectonic exit=0 but note.pdf missing for course=%s", req.course_id)
+            return JSONResponse(
+                status_code=502,
+                content={"error": "latex_compile_failed",
+                         "detail": "tectonic returned 0 but no PDF was emitted"},
+            )
+
+        # Read into memory before the tempdir auto-cleans on `with` exit.
+        # PDFs from a single study note are small (typically <2 MB); avoid
+        # the BackgroundTask song-and-dance of holding the dir open.
+        pdf_bytes = pdf_path.read_bytes()
+
+    session_log.append(req.course_id, "generation",
+                       {"kind": "notes-pdf-compile", "bytes": len(pdf_bytes)})
+    safe_name = (req.course_id or "note").replace("/", "_").replace("\\", "_")
+    return StreamingResponse(
+        iter([pdf_bytes]),
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'attachment; filename="{safe_name}.pdf"',
+            "Content-Length": str(len(pdf_bytes)),
+        },
+    )
 
 
 @app.post("/api/quiz/stream", tags=["skills"], summary="Stream a practice quiz")
@@ -1001,7 +1505,18 @@ def apply_edit_ops_with_results(
             if op.get("definition") is not None:
                 patch["definition"] = str(op["definition"])
             if patch:
-                nodes_by_id[nid] = {**existing, **patch, "user_edited": True}
+                merged = {**existing, **patch, "user_edited": True}
+                # fix-all v1 #B5 (R4-4 review-swarm): editing name or
+                # definition invalidates the cached concept_embedding —
+                # `_concept_embed_text` is `f"{name}。{definition}"`, so a
+                # stale embedding would silently misrank the renamed
+                # concept in graph_search. Drop it; graph_search lazy-
+                # recomputes on next chat (single-node addition to the
+                # batch — cost is negligible).
+                if ("name" in patch or "definition" in patch) and \
+                        merged.get("concept_embedding") is not None:
+                    merged["concept_embedding"] = None
+                nodes_by_id[nid] = merged
                 _record(op, "applied")
             else:
                 _record(op, "skipped", "no fields to update")
@@ -1793,6 +2308,9 @@ async def status_endpoint():
         },
         "embedding_mode": config.EMBEDDING_MODE,
         "embedding_model": config.EMBEDDING_MODEL,
+        # LaTeX-refactor: frontend reads this to decide whether to show the
+        # "高质量编译" PDF button (vs. only the browser-print fallback).
+        "tectonic_available": bool(getattr(app.state, "tectonic_available", False)),
         "version": app.version,
     }
 
@@ -1870,7 +2388,13 @@ def _stream_response(skill_name: str, params: dict, course_id: str, kind: str) -
                 partial += delta
                 yield json.dumps({"type": "chunk", "chunk": delta, "partial": partial},
                                  ensure_ascii=False) + "\n"
-            content = format_response(partial)
+            # LaTeX-refactor: notes ship raw LaTeX — format_response would
+            # corrupt it (markdown repairs vs LaTeX syntax). Reports still
+            # go through the markdown repairer.
+            if kind == "notes":
+                content = partial
+            else:
+                content = format_response(partial)
             session_log.append(course_id, "generation",
                                {"kind": kind, "streamed": True, "real": True})
             yield json.dumps({"type": "done", "content": content},
@@ -1894,7 +2418,9 @@ def _stream_response(skill_name: str, params: dict, course_id: str, kind: str) -
             if not result.success:
                 raise RuntimeError(result.error or f"{kind} generation failed")
             content = _skill_stream_content(result.data)
-            if kind in {"notes", "report"}:
+            # LaTeX-refactor: only "report" still uses markdown repair;
+            # notes ship raw LaTeX so the frontend can edit + compile.
+            if kind == "report":
                 content = format_response(content)
             for chunk in _chunk_text(content):
                 partial += chunk

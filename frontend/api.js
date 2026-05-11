@@ -73,6 +73,18 @@ const API = {
     return _stream("/notes/stream", body, onEvent);
   },
 
+  // Full-course note generation: per-file parallel LLM calls (concurrency
+  // capped at 4 by default), programmatic merge, single LLM review pass.
+  // Event vocabulary (see api/server.py /api/notes/full-course/stream):
+  //   plan / file_start / file_done / file_error / merging /
+  //   reviewing / review_chunk / done / error
+  async streamFullCourseNotes(courseId, onEvent = null, { userLang = null, concurrency = null } = {}) {
+    const body = { course_id: courseId };
+    if (userLang) body.user_lang = userLang;
+    if (concurrency != null) body.concurrency = concurrency;
+    return _stream("/notes/full-course/stream", body, onEvent);
+  },
+
   async generateQuiz(courseId, topic = null, numQuestions = 6, difficulty = "medium", { userLang = null } = {}) {
     const body = {
       course_id: courseId, topic, num_questions: numQuestions, difficulty,
@@ -199,6 +211,21 @@ const API = {
 
   async getChunk(chunkId, { signal } = {}) {
     return _request(`/chunks/${encodeURIComponent(chunkId)}`, { signal });
+  },
+
+  async getSourceChunks(courseId, docId, { signal } = {}) {
+    return _request(
+      `/source/${encodeURIComponent(courseId)}/${encodeURIComponent(docId)}/chunks`,
+      { signal },
+    );
+  },
+
+  // Returns a URL string (not a fetch) so the Reader can hand it to an
+  // `<iframe src>` and let the browser's native PDF viewer handle range
+  // requests, scroll, zoom, and the `#page=N` anchor.
+  sourceFileUrl(courseId, docId, { page = null } = {}) {
+    const url = `/api/source/${encodeURIComponent(courseId)}/${encodeURIComponent(docId)}/file`;
+    return page ? `${url}#page=${encodeURIComponent(page)}` : url;
   },
 
   async getStatus() {

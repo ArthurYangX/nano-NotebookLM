@@ -88,7 +88,10 @@ def test_real_stream_notes_pipes_router_deltas(streaming_client, monkeypatch):
 
     async def fake_complete_stream(prompt, task_type="", system="",
                                    temperature=0.7, max_tokens=4096):
-        for piece in ("# Notes\n", "alpha ", "beta ", "gamma."):
+        # LaTeX-refactor: deltas are LaTeX fragments now, not markdown.
+        # Envelope assertions are content-agnostic so this is cosmetic.
+        for piece in (r"\section{Intro}" "\n", r"\textbf{alpha} ",
+                      r"\emph{beta} ", r"$\gamma$."):
             yield piece
 
     monkeypatch.setattr(server_mod.router, "complete_stream", fake_complete_stream)
@@ -101,12 +104,17 @@ def test_real_stream_notes_pipes_router_deltas(streaming_client, monkeypatch):
     # 4 deltas + 1 done event
     chunk_events = [e for e in events if e["type"] == "chunk"]
     assert len(chunk_events) == 4, events
-    assert [e["chunk"] for e in chunk_events] == ["# Notes\n", "alpha ", "beta ", "gamma."]
+    assert [e["chunk"] for e in chunk_events] == [
+        r"\section{Intro}" "\n", r"\textbf{alpha} ",
+        r"\emph{beta} ", r"$\gamma$.",
+    ]
     # `partial` field must accumulate
-    assert chunk_events[1]["partial"] == "# Notes\nalpha "
+    assert chunk_events[1]["partial"] == r"\section{Intro}" "\n" r"\textbf{alpha} "
     # done event terminates the stream with the full content
     assert events[-1]["type"] == "done"
     assert "alpha" in events[-1]["content"] and "gamma" in events[-1]["content"]
+    # LaTeX-refactor: content must be raw LaTeX (no format_response repair)
+    assert r"\section{Intro}" in events[-1]["content"]
 
 
 def test_real_stream_notes_interruption(streaming_client, monkeypatch):

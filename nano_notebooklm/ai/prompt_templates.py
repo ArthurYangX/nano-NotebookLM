@@ -245,28 +245,78 @@ NOTE_GENERATION_PROMPT = """Create structured study notes from the following cou
 
 Course: {course_name}
 Topic: {topic}
-Format: {format}
 
 Source material:
 {source_text}
 
 Requirements:
-1. Include clear **Definitions** for all key terms
-2. Highlight **Key Theorems/Results** with explanations
-3. Include **Examples** from the source material
-4. Add **Cross-references** to related concepts
-5. Mark important points for exam review
-6. Include source references [Source: file, location]
+1. Include clear definitions for all key terms (use the `definition` environment)
+2. Highlight key theorems / lemmas with proofs or proof sketches (use `theorem` / `lemma` / `proof`)
+3. Include examples from the source material (use `example`)
+4. Add cross-references to related concepts
+5. Mark important points for exam review (use `remark`)
+6. Include source references using \\cite{{file:location}} after each non-trivial claim
 
 {format_instructions}"""
 
-NOTE_FORMAT_MARKDOWN = "Output in clean Markdown with proper headers (##, ###), bold for key terms, and bullet points."
+# Strict whitelist LaTeX format prompt. The server wraps the LLM body with
+# NOTE_LATEX_PREAMBLE (below), so the LLM MUST NOT emit \documentclass or
+# any preamble construct. Mismatching this contract is rejected by
+# nano_notebooklm/skills/latex_sanitizer.py.
+NOTE_FORMAT_LATEX = r"""Output **pure LaTeX body** (no preamble, no \documentclass, no \usepackage).
+Use only this allowed macro set:
 
-NOTE_FORMAT_LATEX = r"""Output in LaTeX format using these environments:
-\begin{definition}{Name} ... \end{definition}
-\begin{theorem}{Name} ... \end{theorem}
-\begin{example} ... \end{example}
-\textbf{} for key terms, \cite{} style references."""
+Structural commands:
+  \section{Title}, \subsection{Title}, \textbf{...}, \emph{...}, \cite{file:location}
+
+Environments (in addition to standard math):
+  \begin{definition}[optional name] ... \end{definition}
+  \begin{theorem}[optional name] ... \end{theorem}
+  \begin{lemma}[optional name] ... \end{lemma}
+  \begin{example} ... \end{example}
+  \begin{remark} ... \end{remark}
+  \begin{proof} ... \end{proof}
+  \begin{itemize}\item ... \end{itemize}
+  \begin{enumerate}\item ... \end{enumerate}
+  \begin{equation} ... \end{equation}
+  \begin{align} ... \end{align}
+
+Math: inline $...$ and display \[ ... \] are encouraged.
+
+STRICTLY FORBIDDEN (output will be rejected):
+  \documentclass, \usepackage, \input, \include, \write, \write18,
+  \immediate, \openout, \catcode, \def, \let, \newcommand,
+  \verbatiminput, \InputIfFileExists, \loop, \csname
+
+Do not emit Markdown syntax (`##`, `**bold**`, `- bullet`) — the renderer
+ignores anything outside the macro set above."""
+
+# Server-side preamble used by the tectonic PDF compile endpoint and any other
+# path that needs to stitch the LLM body into a compilable document. Keeps
+# document class + theorem env definitions + CJK out of LLM token budget and
+# out of LLM tampering reach.
+NOTE_LATEX_PREAMBLE = r"""\documentclass[12pt,a4paper]{article}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{amsthm}
+\usepackage{xcolor}
+\usepackage[colorlinks=true,linkcolor=blue,citecolor=teal]{hyperref}
+\usepackage{xeCJK}
+\setCJKmainfont{PingFang SC}[AutoFakeBold,AutoFakeSlant]
+\newtheorem{theorem}{Theorem}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{definition}{Definition}
+\newtheorem{example}{Example}
+\newtheorem{remark}{Remark}
+\renewcommand{\cite}[1]{\textsuperscript{\textcolor{teal}{[#1]}}}
+\setlength{\parskip}{0.5\baselineskip}
+\setlength{\parindent}{0pt}
+\begin{document}
+"""
+
+NOTE_LATEX_POSTAMBLE = r"""
+\end{document}
+"""
 
 # ── Quiz generation ──────────────────────────────────────────────────
 QUIZ_GENERATION_SYSTEM = (
@@ -389,3 +439,60 @@ def USER_LANG_BINDING(lang: str | None) -> str:
         f"different language, translate the relevant ideas into {label} "
         f"before answering — do not echo source-language sentences verbatim."
     )
+
+
+# ── Full-course notes: per-file generation + merge/review ─────────────
+# Each file is generated independently using the existing
+# NOTE_GENERATION_PROMPT + NOTE_FORMAT_LATEX (no new per-file system prompt
+# needed — the per-file step is the same task, just scoped to one source
+# file's chunks). After programmatic concatenation, a single review pass
+# polishes terminology, adds cross-references, and removes duplicate
+# definitions across the merged sections.
+
+NOTE_MERGE_REVIEW_SYSTEM = (
+    "You are polishing a draft of merged study notes assembled from "
+    "independently generated per-file sections. Ensure terminology is "
+    "consistent across sections, add cross-references between related "
+    "concepts, and collapse duplicate definitions to a single canonical "
+    "statement — but never shorten or omit examples, theorems, or proofs."
+)
+
+NOTE_MERGE_REVIEW_PROMPT = r"""Polish the following merged study notes for the course "{course_name}".
+
+The draft below was assembled from {file_count} per-file LaTeX sections (one
+\section{{...}} per source file). Each section was generated independently,
+so you will see overlapping definitions, drifting terminology, and missing
+cross-references.
+
+Your job is to output ONE polished LaTeX body that:
+
+1. Preserves every existing \section{{...}} header verbatim and keeps them
+   in the same order.
+2. Within each section, rewrites prose only as needed to align terminology
+   with the rest of the document (e.g. if §2 calls something an "activation
+   function" and §5 calls the same thing a "non-linearity", standardise on
+   one term and \emph{{note}} the synonym once on first use).
+3. When the same concept is defined in two sections, KEEP the clearer
+   \begin{{definition}}...\end{{definition}} block, and in the other section
+   replace the duplicate definition with a one-line forward reference of
+   the form "See \emph{{<concept>}} in §<n>." DO NOT delete the second
+   section's surrounding context — only the duplicated definition.
+4. Adds inline cross-references (\emph{{see also: <concept>}}) where a
+   concept in one section is used or extended in another. Aim for 1-3
+   cross-refs per section, not exhaustive linking.
+5. Preserves every example, theorem, lemma, proof, and remark environment
+   in full. You may correct typos and tighten wording inside them, but
+   do not remove or replace them.
+6. Preserves every \cite{{file:location}} citation — they anchor highlights
+   in the reader, so dropping one breaks the UI.
+7. Does NOT introduce new \section{{...}} headers, does NOT reorder
+   sections, and does NOT remove any existing section.
+
+Course: {course_name}
+Number of source-file sections: {file_count}
+
+Draft to polish:
+{draft}
+
+{format_instructions}"""
+
