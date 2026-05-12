@@ -469,41 +469,56 @@ def test_findTextRangeInRoot_injects_phantom_block_separator():
 
 
 def test_nav_epoch_threaded_into_pdf_frame_and_text_body():
-    """R5-2 + R5-2 fix-all v1: clicking the same citation twice in the
-    Reader used to no-op because `setActivePage(N)` with N unchanged is a
-    React state no-op → iframe.src and scrollIntoView never re-fire.
+    """R5-2 + R5-2 fix-all v1 (M3) + R5-2 fix-all v8: clicking the same
+    citation twice in the Reader used to no-op because `setActivePage(N)`
+    with N unchanged is a React state no-op → iframe.src and scrollIntoView
+    never re-fire.
 
-    The fix bumps `navEpoch` on every `dispatchNavToReader` and the value
-    threads down to:
-      - DocumentTextBody's useEffect deps so scrollIntoView re-fires
-      - DocumentPdfFrame's useEffect so iframe re-navigates (hash-first,
-        src fallback after fix-all v1 M3)
-
-    Pin all three so a future refactor that drops the nonce can't silently
-    regress the re-click guarantee.
+    The fix bumps `navEpoch` on every `dispatchNavToReader`. From there:
+      - DocumentTextBody's scrollIntoView useEffect deps include navEpoch
+        so the smooth-scroll re-fires on re-click.
+      - DocumentPdfFrame (fix-all v8) threads navEpoch THROUGH
+        `sourceFileUrl({navEpoch})` which appends `?_nav=<epoch>` as a
+        cache-bust QUERY (not just a hash). PDFium only honours `#page=N`
+        at LOAD time, so a different query param forces the browser to
+        treat each navigation as a fresh resource and re-initialise the
+        viewer. The previous `contentWindow.location.hash` fast-path
+        worked on the FIRST click but silently no-op'd on subsequent
+        clicks; this regression pin watches both behaviours.
     """
     app_src = Path("frontend/app.jsx").read_text(encoding="utf-8")
     reader_src = Path("frontend/reader.jsx").read_text(encoding="utf-8")
+    api_src = Path("frontend/api.js").read_text(encoding="utf-8")
     # 1. dispatchNavToReader must bump the epoch.
     assert "setNavEpoch(e => e + 1)" in app_src, \
         "dispatchNavToReader no longer bumps navEpoch — repeat citation clicks will silently no-op"
     # 2. <Reader> must receive the prop.
     assert "navEpoch={navEpoch}" in app_src, \
         "<Reader> no longer receives navEpoch prop"
-    # 3. DocumentTextBody must include navEpoch in its scroll-effect deps.
+    # 3. DocumentTextBody still includes navEpoch in its scroll-effect deps
+    #    (text-mode Reader doesn't use src-reload, so the deps array is
+    #    still the right mechanism for re-click scroll re-firing).
     text_body_match = re.search(
         r"function DocumentTextBody\([\s\S]+?\}\, \[activePage, doc\.doc_id, navEpoch\]",
         reader_src,
     )
     assert text_body_match, \
         "DocumentTextBody scrollIntoView useEffect deps no longer include navEpoch"
-    # 4. DocumentPdfFrame must include navEpoch in its iframe-nav effect deps.
+    # 4. DocumentPdfFrame must thread navEpoch through sourceFileUrl so the
+    #    cache-bust query (`?_nav=<epoch>`) forces PDFium re-init on each
+    #    navigation. Pre-fix this lived in a useEffect with hash-fast-path;
+    #    that approach silently failed on 2nd / 3rd click.
     pdf_frame_match = re.search(
-        r"function DocumentPdfFrame\([\s\S]+?\}\, \[navEpoch, url\]",
+        r"function DocumentPdfFrame\([\s\S]+?navEpoch: navEpoch[\s\S]+?return \(",
         reader_src,
     )
     assert pdf_frame_match, \
-        "DocumentPdfFrame iframe-nav useEffect deps no longer include navEpoch"
+        "DocumentPdfFrame no longer passes navEpoch into sourceFileUrl — re-click will silently no-op"
+    # 5. sourceFileUrl must materialise navEpoch as a `?_nav=<epoch>`
+    #    query (cache-bust). If a future refactor moves it back into the
+    #    hash, PDFium will once again ignore the change post-load.
+    assert "_nav=" in api_src, \
+        "sourceFileUrl no longer appends `_nav=` cache-bust query — PDFium re-init guarantee gone"
 
 
 def test_app_jsx_get_checked_files_returns_null_when_all_checked():

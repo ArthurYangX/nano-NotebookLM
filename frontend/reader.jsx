@@ -130,61 +130,28 @@ function DocumentTextBody({ doc, activePage, highlightedId, onCite, navEpoch }) 
 // "📑 索引" button in the Reader pane; pref persists via
 // StudyState.savePdfOutlineHidden.
 function DocumentPdfFrame({ courseId, docId, sourceFile, activePage, navEpoch, outlineHidden }) {
+  // R5-2 fix-all v8: PDFium reads `#page=N` at LOAD time only. The previous
+  // implementation (M3) tried imperative `contentWindow.location.hash`
+  // navigation post-load and that worked on the FIRST citation click but
+  // silently no-op'd on the 2nd / 3rd — page indicator advanced via React
+  // state but the rendered slide stayed pinned.
+  //
+  // Fix: thread `navEpoch` into `sourceFileUrl` as a `?_nav=<epoch>`
+  // query string so each `dispatchNavToReader` produces a different
+  // URL path+query (not just a different fragment). The browser then
+  // performs a fresh fetch and PDFium re-initialises with the new
+  // `#page=N` hash. HTTP cache (ETag → 304) keeps the wire cost near
+  // zero; the visible cost is PDFium re-parse ~50-300ms. No imperative
+  // useEffect / ref juggling needed — React's regular reconciliation
+  // updates the iframe's `src` attribute when `url` changes, which is
+  // now sufficient because the URL itself differs.
   const url = API.sourceFileUrl(courseId, docId, {
     page: activePage,
     hideOutline: !!outlineHidden,
+    navEpoch: navEpoch,
   });
-  const iframeRef = useRefR(null);
-  const lastUrlRef = useRefR(null);
-  // fix-all v1 M3: re-click on the same citation needs to re-jump the PDF,
-  // but a full `src = url` reassign forces PDFium to re-download + re-parse
-  // the entire file (200-2000ms + flicker). Strategy:
-  //   - First load: set `src` to load the PDF.
-  //   - Same path/query, different `#page=` hash (or repeat click): try
-  //     `contentWindow.location.hash = '#page=N'` which jumps without
-  //     reload. Falls back to full `src=url` reassign on cross-origin /
-  //     not-loaded-yet errors so behaviour stays correct even when the
-  //     fast path isn't available.
-  //   - Different URL path/query (different doc): always reload via src.
-  useEffectR(() => {
-    if (!iframeRef.current) return;
-    const prev = lastUrlRef.current;
-    const splitUrl = (u) => {
-      try {
-        const idx = u.indexOf("#");
-        return idx < 0 ? [u, ""] : [u.slice(0, idx), u.slice(idx + 1)];
-      } catch { return [u, ""]; }
-    };
-    const [prevPath, prevHash] = prev ? splitUrl(prev) : [null, ""];
-    const [nextPath, nextHash] = splitUrl(url);
-    if (prev === null || prevPath !== nextPath) {
-      // Initial load or different doc: full src assign is correct.
-      iframeRef.current.src = url;
-    } else {
-      // Same doc, possibly same hash, possibly different — try hash-only
-      // navigation; on failure (cross-origin / PDFium quirk) fall back to
-      // full src reassign so we never lose the re-click guarantee.
-      let fastPathWorked = false;
-      try {
-        const win = iframeRef.current.contentWindow;
-        if (win && win.location) {
-          // Force hashchange even when hash is unchanged: clear then set.
-          if (nextHash) {
-            win.location.hash = "";
-            win.location.hash = "#" + nextHash;
-            fastPathWorked = true;
-          }
-        }
-      } catch { /* cross-origin or not loaded → fall through */ }
-      if (!fastPathWorked) {
-        iframeRef.current.src = url;
-      }
-    }
-    lastUrlRef.current = url;
-  }, [navEpoch, url]);
   return (
     <iframe
-      ref={iframeRef}
       className="doc-pdf-frame"
       src={url}
       title={sourceFile}

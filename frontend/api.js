@@ -55,7 +55,7 @@ const API = {
     return res.json();
   },
 
-  async chat(question, courseId = null, topK = 5, checkedFiles = null, { signal } = {}, { userLang = null, backend = null } = {}) {
+  async chat(question, courseId = null, topK = 5, checkedFiles = null, { signal } = {}, { userLang = null, backend = null, persona = null } = {}) {
     const body = {
       question, course_id: courseId, top_k: topK, checked_files: checkedFiles,
     };
@@ -63,6 +63,10 @@ const API = {
     // R4-5 part 2: thread the backend chip selection through to ChatRequest.
     // Server-side Pydantic Literal rejects anything other than "codex"/"qwen_raft".
     if (backend === "codex" || backend === "qwen_raft") body.backend = backend;
+    // 2026-05-12: persona chip — empty / null means use server default.
+    if (persona && typeof persona === "string" && persona.trim()) {
+      body.persona = persona.trim();
+    }
     return _post("/chat", body, { signal });
   },
 
@@ -98,8 +102,13 @@ const API = {
   // Full-course note generation: per-file parallel LLM calls (concurrency
   // capped at 4 by default), programmatic merge, single LLM review pass.
   // Event vocabulary (see api/server.py /api/notes/full-course/stream):
-  //   plan / file_start / file_done / file_error / file_cached /
-  //   merging / reviewing / review_chunk / done / error
+  //   plan / file_start / file_delta / file_done / file_error /
+  //   file_cached / merging / reviewing / review_chunk / done / error
+  //
+  // file_delta (2026-05-12): per-file LLM is now token-streamed via
+  // router.complete_stream — each delta arrives as a file_delta event
+  // keyed by idx. The terminal file_done's `content` is the sanitized
+  // final body and overrides any accumulated deltas (truth-pin).
   //
   // Incremental cache (2026-05-11): files whose chunk_hash matches the
   // entry in per_file_cache.json short-circuit to a `file_cached` event
@@ -294,17 +303,32 @@ const API = {
   // (null, NaN, "5; rm -rf /", Infinity) drops the fragment — defensive
   // belt against future callers that bypass `resolveCitationNavigation`
   // (which already pins `page` to a `Number(/[0-9]+/)` match).
-  sourceFileUrl(courseId, docId, { page = null, hideOutline = false } = {}) {
+  sourceFileUrl(courseId, docId, { page = null, hideOutline = false, navEpoch = null } = {}) {
     // PDFium URL fragments stack — `#page=N&navpanes=0` jumps to page N and
-    // collapses the bookmarks/thumbnails side panel. `navpanes=1` shows it.
-    // We omit the `navpanes` part when `hideOutline` is unset so we don't
-    // override the user's PDF-viewer UI preference unnecessarily.
-    const url = `/api/source/${encodeURIComponent(courseId)}/${encodeURIComponent(docId)}/file`;
+    // collapses the bookmarks/thumbnails side panel. We omit the `navpanes`
+    // part when `hideOutline` is unset so we don't override the user's
+    // PDF-viewer UI preference unnecessarily.
+    //
+    // R5-2 fix-all v8: PDFium honours `#page=N` at LOAD time only — any
+    // post-load `iframe.src = '...#page=M'` or `contentWindow.location
+    // .hash = '#page=M'` mutation is unreliable across Chromium versions.
+    // Symptom: 1st citation click jumps pages OK, 2nd/3rd updates the
+    // page indicator (React state) but the rendered slide stays pinned.
+    // Fix: when caller passes `navEpoch`, append it as `?_nav=<epoch>` so
+    // each navigation produces a DIFFERENT URL path+query (not just a
+    // different fragment). Browser performs a fresh fetch; PDFium
+    // re-initialises with the new hash. HTTP cache (ETag → 304) keeps the
+    // wire cost near-zero; the visible cost is PDFium re-parse ~50-300ms.
+    const base = `/api/source/${encodeURIComponent(courseId)}/${encodeURIComponent(docId)}/file`;
+    const query = [];
+    const ep = Number(navEpoch);
+    if (Number.isInteger(ep) && ep > 0) query.push(`_nav=${ep}`);
+    const urlBase = query.length ? `${base}?${query.join("&")}` : base;
     const frags = [];
     const n = Number(page);
     if (Number.isInteger(n) && n >= 1) frags.push(`page=${n}`);
     if (hideOutline) frags.push("navpanes=0");
-    return frags.length ? `${url}#${frags.join("&")}` : url;
+    return frags.length ? `${urlBase}#${frags.join("&")}` : urlBase;
   },
 
   async getStatus() {

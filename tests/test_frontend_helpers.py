@@ -95,6 +95,42 @@ def test_citation_navigation_invalid():
     assert run_node(script).strip() == "ok"
 
 
+def test_citation_navigation_bare_integer_page_after_comma():
+    """R4-6 regression: LaTeX `\\cite{file:5}` is normalised to `"file, 5"`
+    by latex-to-html.normaliseCite — the `p.` prefix is stripped. Before
+    this fix, resolveCitationNavigation's pageMatch only accepted `p.N` /
+    `page N` / `PDF p.N`, so every R4-6-style cite resolved to page=null
+    and every Notes citation jumped to the PDF's first page. The bare-
+    integer fallback (after the first comma) restores correct page jumps.
+    """
+    script = textwrap.dedent(
+        """
+        const h = require('./frontend/study-state.js');
+        const sources = [{id:'doc1', title:'lecture.pdf'}];
+        // R4-6 normalised form: `file, N` with no `p.` prefix.
+        const r1 = h.resolveCitationNavigation('[Source: lecture.pdf, 5]', sources);
+        if (!r1.ok) throw new Error('expected ok');
+        if (r1.page !== 5) throw new Error('bare-integer page miss: ' + r1.page);
+        // Filename containing digits must not leak into page (sourcePart is
+        // before the first comma and the bare-int fallback only looks after).
+        const sources2 = [{id:'doc1', title:'ch3.pdf'}];
+        const r2 = h.resolveCitationNavigation('[Source: ch3.pdf, 7]', sources2);
+        if (r2.page !== 7) throw new Error('digit-in-filename poisoned page: ' + r2.page);
+        // Slide-prefixed form (PPTX citations) also recognised.
+        const r3 = h.resolveCitationNavigation('[Source: deck.pptx, slide 12]', [{id:'d', title:'deck.pptx'}]);
+        if (r3.page !== 12) throw new Error('slide N miss: ' + r3.page);
+        // Chinese 第 N 页 form.
+        const r4 = h.resolveCitationNavigation('[Source: 讲义.pdf, 第 3 页]', [{id:'d', title:'讲义.pdf'}]);
+        if (r4.page !== 3) throw new Error('第 N 页 miss: ' + r4.page);
+        // Existing `p.N` form still works.
+        const r5 = h.resolveCitationNavigation('[Source: lecture.pdf, p.9]', sources);
+        if (r5.page !== 9) throw new Error('p.N regression: ' + r5.page);
+        console.log('ok');
+        """
+    )
+    assert run_node(script).strip() == "ok"
+
+
 def test_citation_navigation_pptx_filename_not_chunk_id():
     """Regression: pre-fix, the bare-chunk fallback regex `\\b(c[0-9A-Za-z_.:-]+)\\b`
     matched any word starting with `c`, so a citation like
@@ -425,6 +461,31 @@ def test_notes_toc_hidden_pref_persists_globally():
     assert run_node(script).strip() == "ok"
 
 
+def test_notes_toolbar_collapsed_pref_persists_globally():
+    """Notes toolbar collapse state persists across reloads under the
+    same global-pref convention as :backend / :kg-legend-hidden /
+    :notes-toc-hidden. Default is false (expanded) so first-time users
+    still see the action buttons."""
+    script = textwrap.dedent(
+        """
+        const h = require('./frontend/study-state.js');
+        const s = h.createMemoryStorage();
+        // Default: toolbar expanded (loadNotesToolbarCollapsed returns false).
+        if (h.loadNotesToolbarCollapsed(s) !== false) throw new Error('default should be expanded');
+        h.saveNotesToolbarCollapsed(s, true);
+        if (h.loadNotesToolbarCollapsed(s) !== true) throw new Error('after save: collapsed');
+        h.saveNotesToolbarCollapsed(s, false);
+        if (h.loadNotesToolbarCollapsed(s) !== false) throw new Error('after toggle: expanded');
+        // Stored under the exact global key.
+        if (s.getItem('nano-nlm:v1:notes-toolbar-collapsed') !== '0') {
+          throw new Error('expected global key, got: ' + JSON.stringify(s.dump()));
+        }
+        console.log('ok');
+        """
+    )
+    assert run_node(script).strip() == "ok"
+
+
 def test_pdf_outline_hidden_pref_defaults_to_hidden():
     """R5-2 fix-all v4 #2: PDFium's bookmark/thumbnail pane is rarely
     useful for short course slides, so we default HIDDEN — user opts in
@@ -483,6 +544,23 @@ def test_source_file_url_appends_navpanes_zero_when_outline_hidden():
         // existing PDFium UI preference).
         const e = sourceFileUrl('c', 'd', { page: 5, hideOutline: false });
         if (e.includes('navpanes')) throw new Error('false hideOutline must not append: ' + e);
+
+        // R5-2 fix-all v8: navEpoch must land in the QUERY (`?_nav=N`)
+        // not the fragment, so each navigation forces a fresh browser
+        // fetch and PDFium re-init. Pin the contract here so a future
+        // refactor that moves it into the hash breaks loudly.
+        const f = sourceFileUrl('c', 'd', { page: 5, navEpoch: 7 });
+        if (!f.includes('?_nav=7')) throw new Error('navEpoch must land in query: ' + f);
+        if (!f.endsWith('#page=5')) throw new Error('hash should still carry page: ' + f);
+
+        // navEpoch=0 → omit (treat as "no nav has happened yet").
+        const g = sourceFileUrl('c', 'd', { page: 5, navEpoch: 0 });
+        if (g.includes('_nav')) throw new Error('navEpoch=0 must NOT inject _nav: ' + g);
+
+        // navEpoch + hideOutline → query + dual frags both present.
+        const h2 = sourceFileUrl('c', 'd', { page: 9, hideOutline: true, navEpoch: 3 });
+        if (!h2.includes('?_nav=3')) throw new Error('combined: missing _nav: ' + h2);
+        if (!h2.endsWith('#page=9&navpanes=0')) throw new Error('combined: hash wrong: ' + h2);
 
         console.log('ok');
         """
