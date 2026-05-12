@@ -69,8 +69,13 @@ _HEAD_CHARS = 100        # truncate each excerpt to this many chars
 # the legacy warning.
 _TOPIC_MIN = 3
 _TOPIC_MAX = 9
-_STAGE_A_TIMEOUT_SECONDS = 15.0  # F3: hard ceiling so a hung codex call
-                                  # can't block /api/mindmap indefinitely
+# R5-2 fix-all v6: Stage A timeout used to be a hard 15s ceiling, but
+# codex cold-start + a 30-chunk-heads prompt routinely brushes past that
+# (a user-reported 84-slide pptx upload landed with zero topic/root
+# nodes because Stage A timed out → single-stage fallback). 30s default
+# is still well below the "hung codex" threshold the original timeout
+# was guarding against. Env-tunable for slower deployments.
+_STAGE_A_TIMEOUT_SECONDS = float(os.getenv("KG_STAGE_A_TIMEOUT_SECONDS", "30"))
 _STAGE_A_PARALLELISM = 3  # R5-1: per-file Stage A concurrency cap so a
                           # 20-file upload doesn't fan out 20 codex
                           # requests at once. Stage A is the only LLM
