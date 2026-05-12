@@ -207,6 +207,12 @@ class QASkill(Skill):
         # routing) stay on the codex main path so the demo chip only
         # affects the answer generation step, not retrieval helpers.
         backend = params.get("backend")
+        # 2026-05-12: user-customisable assistant name. None / empty →
+        # the renderer functions in prompt_templates fall back to
+        # DEFAULT_PERSONA. Threaded through every _answer_* call so the
+        # name is consistent across rag / general / translated /
+        # cross-course / graphrag paths.
+        persona = params.get("persona")
 
         if not question:
             return SkillResult(success=False, error="No question provided")
@@ -223,10 +229,11 @@ class QASkill(Skill):
                 route_reason=decision.reason,
                 user_lang=user_lang,
                 backend=backend,
+                persona=persona,
             )
 
         # ── R4-4 Path graphrag: KG-driven retrieve fires *before* the
-        # BM25/vector path when the course has a knowledge_graph.json.
+        # BM25/vector path when at least one course has a knowledge_graph.json.
         # The KG is the upload pipeline's product (R4-2) — its concept
         # nodes are L2-normalised embeddings the graph_search ranks by
         # cosine, then expands along part-of / prerequisite_of / depends-on
@@ -235,16 +242,31 @@ class QASkill(Skill):
         # cross-concept queries ("how do X and Y relate?") where the
         # surface-lexical RRF would pull two independent passages.
         #
+        # 2026-05-12: All Courses mode (no course_filter) now ALSO runs
+        # graphrag — it iterates every course with a `knowledge_graph
+        # .json`, runs `_maybe_graphrag` in parallel via gather, then
+        # merges by chunk_id (best-score wins) and sorts by cosine.
+        # Pre-fix the only retrieval in All Courses mode was plain
+        # BM25/vector RRF — a short query like "什么是精度" couldn't
+        # cross the per-course score gate (char-bigram noise was too
+        # weak across all 5+ courses) and fell straight through to the
+        # general path. Cost: +200-500ms latency (bounded by slowest KG
+        # × per-task `graph_search` timeout); benefit: KG-quality
+        # retrieval across the whole corpus.
+        #
         # Skip conditions:
-        #   - All Courses mode (no course_filter): no per-course KG to
-        #     consult; the kb.search global path handles it.
         #   - checked_files set: user pinned a file subset; graph_search's
         #     hop expansion cannot honour per-file filtering without
         #     materially degrading the neighbourhood signal.
         # Skip → fall through to existing RAG → translation → cross-course
         # → general chain.
-        if course_filter and not checked_files and _graphrag_enabled():
-            graphrag_results = await self._maybe_graphrag(question, course_filter)
+        if not checked_files and _graphrag_enabled():
+            if course_filter:
+                graphrag_results = await self._maybe_graphrag(question, course_filter)
+                graphrag_scope = course_filter
+            else:
+                graphrag_results = await self._maybe_graphrag_all_courses(question)
+                graphrag_scope = "all-courses"
             # fix-all v1 #A3 + v2 #V3: admission gate uses passes_score_gate
             # with a graphrag-specific cosine floor (default 0.15) instead of
             # the original `len >= 2` check.
@@ -264,14 +286,15 @@ class QASkill(Skill):
                 top1_threshold=_graphrag_score_floor(),
                 min_hits=1,
             ):
-                logger.info("qa.path=graphrag course=%s top1=%.4f hits=%d",
-                            course_filter, graphrag_results[0].score,
+                logger.info("qa.path=graphrag scope=%s top1=%.4f hits=%d",
+                            graphrag_scope, graphrag_results[0].score,
                             len(graphrag_results))
                 return await self._answer_rag(
                     question, course_filter, graphrag_results,
                     path="graphrag",
                     user_lang=user_lang,
                     backend=backend,
+                    persona=persona,
                 )
 
         # ── Path A (rag): retrieve, gate, fall back if low-quality ──
@@ -343,6 +366,7 @@ class QASkill(Skill):
                 question, course_filter, results, path="rag",
                 user_lang=user_lang,
                 backend=backend,
+                persona=persona,
             )
 
         # ── Translation retry (#2): zh query on en course (or vice versa) ──
@@ -362,6 +386,7 @@ class QASkill(Skill):
                 translated_query=translated_query,
                 user_lang=user_lang,
                 backend=backend,
+                persona=persona,
             )
 
         # ── Cross-course fallback (#3): own course + translation both 0 → ──
@@ -382,6 +407,7 @@ class QASkill(Skill):
                 backend=backend,
                 cross_course_origin=origin,
                 user_lang=user_lang,
+                persona=persona,
             )
 
         # ── Final fallback: general ──
@@ -392,6 +418,7 @@ class QASkill(Skill):
             reason="RAG score gate failed and translation retry did not help",
             user_lang=user_lang,
             backend=backend,
+            persona=persona,
         )
 
     # ── Helpers ────────────────────────────────────────────────────────
@@ -464,6 +491,63 @@ class QASkill(Skill):
             logger.warning("graph_search failed for course=%s (%s: %s)",
                            course_filter, type(exc).__name__, exc)
             return None
+
+    async def _maybe_graphrag_all_courses(
+        self,
+        question: str,
+    ) -> list[SearchResult]:
+        """All Courses graphrag: iterate every course with a
+        `knowledge_graph.json`, run `_maybe_graphrag` in parallel via
+        `asyncio.gather`, merge results across courses, and return the
+        top-N by cosine score.
+
+        Returns `[]` when no courses have KGs or all returned empty —
+        caller falls through to plain RAG / cross-course / general the
+        same way single-course graphrag does on a miss.
+
+        Cost: bounded by the slowest per-course `graph_search` +
+        `GRAPHRAG_TIMEOUT_SECONDS` ceiling. Each per-course call already
+        has its own timeout, so the worst-case wall time is one timeout
+        window (10s) even with 20 courses.
+        """
+        from nano_notebooklm import config
+        courses_root = config.ARTIFACTS_DIR / "courses"
+        if not courses_root.exists():
+            return []
+        courses_with_kg: list[str] = []
+        try:
+            for course_dir in courses_root.iterdir():
+                if not course_dir.is_dir():
+                    continue
+                if (course_dir / "knowledge_graph.json").exists():
+                    courses_with_kg.append(course_dir.name)
+        except OSError:
+            return []
+        if not courses_with_kg:
+            return []
+        # Parallel fan-out. `_maybe_graphrag` already swallows per-call
+        # exceptions (returns None on KG-missing / Timeout / load error)
+        # so `return_exceptions=True` only catches the unexpected.
+        tasks = [self._maybe_graphrag(question, cid) for cid in courses_with_kg]
+        per_course = await asyncio.gather(*tasks, return_exceptions=True)
+        # Merge by chunk_id: best cosine score wins. Same chunk could
+        # appear under different per-course searches if the same
+        # source_file lives in multiple courses (rare but harmless to
+        # dedup). For the typical case the chunk_id is unique to one
+        # course, so dedup is a no-op.
+        merged: dict[str, SearchResult] = {}
+        for r in per_course:
+            if isinstance(r, Exception) or r is None:
+                continue
+            for hit in r:
+                existing = merged.get(hit.chunk_id)
+                if existing is None or hit.score > existing.score:
+                    merged[hit.chunk_id] = hit
+        if not merged:
+            return []
+        # Cap at 30 chunks — matches the single-course graphrag cap so
+        # the LLM context size stays bounded irrespective of fan-out.
+        return sorted(merged.values(), key=lambda x: -x.score)[:30]
 
     def _maybe_cross_course_fallback(
         self,
@@ -655,12 +739,13 @@ class QASkill(Skill):
         cross_course_origin: str | None = None,
         user_lang: str | None = None,
         backend: str | None = None,
+        persona: str | None = None,
     ) -> SkillResult:
         context = "\n\n---\n\n".join(
             f"[Source: {r.source_file}, {r.location}]\n{r.text}" for r in results
         )
         memory_context = get_context_prompt(course_filter)
-        system = prompts.QA_SYSTEM
+        system = prompts.qa_system(persona)
         if memory_context:
             system += f"\n\nStudent context:\n{memory_context}"
         binding = prompts.USER_LANG_BINDING(user_lang)
@@ -722,9 +807,10 @@ class QASkill(Skill):
         route_reason: str | None = None,
         user_lang: str | None = None,
         backend: str | None = None,
+        persona: str | None = None,
     ) -> SkillResult:
         memory_context = get_context_prompt(course_filter)
-        system = prompts.GENERAL_QA_SYSTEM
+        system = prompts.general_qa_system(persona)
         if memory_context:
             system += f"\n\nStudent context:\n{memory_context}"
         binding = prompts.USER_LANG_BINDING(user_lang)
@@ -737,7 +823,7 @@ class QASkill(Skill):
         prompt = question
         if route_reason:
             if route_reason.startswith("identity"):
-                system += "\n\n" + prompts.IDENTITY_ADDENDUM
+                system += "\n\n" + prompts.identity_addendum(persona)
             elif route_reason.startswith("meta_course"):
                 system += "\n\n" + prompts.META_COURSE_ADDENDUM.format(
                     course=course_filter or "All Courses",

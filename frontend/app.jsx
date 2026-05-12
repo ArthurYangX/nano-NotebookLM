@@ -1,5 +1,5 @@
 /* global React, Library, Reader, Notes, MindMap, Quiz, ExamPrep, Settings, Assistant, Processing, API, StudyState,
-   SAMPLE_SOURCES, TweaksPanel, useTweaks, TweakSection, TweakSelect,
+   SAMPLE_SOURCES, TweaksPanel, useTweaks, TweakSection,
    TweakRadio, TweakSlider, TweakToggle, NOTES_DATA, QUIZ_DATA, MINDMAP */
 const { useState, useEffect, useRef } = React;
 
@@ -100,86 +100,6 @@ function CitationPreviewModal({ preview, onClose, onOpenInReader }) {
   );
 }
 
-// 🎭 persona chip — small topbar control that displays the user's chosen
-// assistant name and expands to an inline edit popover on click. Commits
-// land in localStorage (handled by parent's `onCommit`) and propagate to
-// /api/chat via the `persona` field; empty value falls back to the
-// server-side DEFAULT_PERSONA.
-function PersonaChip({ persona, placeholder, maxLen, open, onToggle, onClose, onCommit, disabled }) {
-  const [draft, setDraft] = useState(persona);
-  const wrapRef = useRef(null);
-  useEffect(() => {
-    if (open) setDraft(persona);
-  }, [open, persona]);
-  useEffect(() => {
-    if (!open) return undefined;
-    const onDoc = (e) => {
-      if (!wrapRef.current) return;
-      if (!wrapRef.current.contains(e.target)) onClose();
-    };
-    const onKey = (e) => { if (e.key === "Escape") onClose(); };
-    document.addEventListener("mousedown", onDoc);
-    document.addEventListener("keydown", onKey);
-    return () => {
-      document.removeEventListener("mousedown", onDoc);
-      document.removeEventListener("keydown", onKey);
-    };
-  }, [open, onClose]);
-  const label = persona || placeholder;
-  const display = label.length > 12 ? label.slice(0, 11) + "…" : label;
-  const commit = () => {
-    onCommit(draft.trim());
-    onClose();
-  };
-  return (
-    <span className="persona-chip-wrap" ref={wrapRef} style={{ position: "relative" }}>
-      <button
-        type="button"
-        className={"persona-chip mono" + (persona ? " has-custom" : "")}
-        title={persona
-          ? `助手名：${persona}（点击修改）`
-          : `助手名（默认 ${placeholder}，点击自定义）`}
-        onClick={onToggle}
-        disabled={disabled}
-      >
-        🎭 {display}
-      </button>
-      {open && (
-        <div className="persona-popover" role="dialog" aria-label="自定义助手名">
-          <label className="persona-popover-label">助手名（最多 {maxLen} 字符）</label>
-          <input
-            className="persona-popover-input mono"
-            type="text"
-            value={draft}
-            placeholder={placeholder}
-            maxLength={maxLen}
-            autoFocus
-            onChange={(e) => setDraft(e.target.value.slice(0, maxLen))}
-            onKeyDown={(e) => { if (e.key === "Enter") commit(); }}
-          />
-          <div className="persona-popover-actions">
-            <button
-              type="button"
-              className="persona-popover-btn persona-popover-reset"
-              onClick={() => { setDraft(""); onCommit(""); onClose(); }}
-              title="恢复默认（Study Assistant）"
-            >
-              恢复默认
-            </button>
-            <button
-              type="button"
-              className="persona-popover-btn persona-popover-save"
-              onClick={commit}
-            >
-              保存
-            </button>
-          </div>
-        </div>
-      )}
-    </span>
-  );
-}
-
 function App() {
   const tweaks = useTweaks(TWEAK_DEFAULTS);
   const [mode, setMode] = useState("reader");
@@ -249,12 +169,13 @@ function App() {
     try { window.localStorage.setItem("nano-nlm:v1:backend", value); }
     catch (e) {}
   }
-  // 2026-05-12: persona chip (🎭). User-customisable name surfaced to the
-  // LLM via /api/chat's `persona` field — flows through qa_skill into
-  // every system prompt path so "你是谁" returns the chosen name. Empty
-  // → backend falls back to DEFAULT_PERSONA ("Study Assistant"). Length
-  // capped to 40 chars by the server-side Pydantic validator.
-  const PERSONA_DEFAULT = "Study Assistant";
+  // 2026-05-12: user-customisable assistant name. Surfaced via the
+  // Settings tab (⚙ icon button in the topbar opens it); flows to
+  // /api/chat's `persona` field → qa_skill injects it into every system
+  // prompt path so "你是谁" returns the chosen name. Empty → backend
+  // falls back to DEFAULT_PERSONA ("Study Assistant"). Length capped to
+  // 40 chars by the server-side Pydantic validator (PERSONA_MAX_LEN);
+  // the frontend cap mirrors it as defense in depth.
   const PERSONA_MAX = 40;
   const [persona, setPersona] = useState(() => {
     try {
@@ -262,9 +183,14 @@ function App() {
       return (v || "").slice(0, PERSONA_MAX);
     } catch (e) { return ""; }
   });
-  const [personaOpen, setPersonaOpen] = useState(false);
   function commitPersona(value) {
     const next = (value || "").slice(0, PERSONA_MAX);
+    // review-swarm fix-all (LOW R3-C): short-circuit identity writes —
+    // Settings input fires onBlur on every focus loss, including
+    // tabbing through without edits. Without this guard each blur
+    // would cascade a localStorage write + setPersona re-render +
+    // Assistant prop change (no-op but still ~10ms of React work).
+    if (next === persona) return;
     setPersona(next);
     try {
       if (next) window.localStorage.setItem("nano-nlm:v1:persona", next);
@@ -687,6 +613,11 @@ function App() {
   // toolbar can show "⚡ 10 cached · 1 fresh" stats during streaming.
   // Cleared when streaming starts and on course switch.
   const [noteCacheStats, setNoteCacheStats] = useState(null);
+  // Truncation surface: backend tags file_done / done events when the
+  // upstream LLM stopped at max_output_tokens / finish_reason='length'.
+  // Shape: null | { files: string[], review: bool }. Cleared when
+  // streaming starts and on course switch (alongside noteCacheStats).
+  const [notesTruncated, setNotesTruncated] = useState(null);
 
   async function handleGenerateNotes({ force = false } = {}) {
     if (!activeCourse) { alert("Please select a specific course first (not 'All Courses')"); return; }
@@ -713,6 +644,7 @@ function App() {
     }
     setStreamProgress(0);
     setNoteCacheStats(null);
+    setNotesTruncated(null);
     setGenerationState(StudyState.createGenerationState());
     const fileSections = [];
     // fix-all v1 #19: mirror backend's _escape_latex_title (in
@@ -849,6 +781,17 @@ function App() {
             // by stripped whitespace). Always overwrite — truth-pin.
             fileSections[event.idx].content = event.content;
             fileSections[event.idx].source_file = event.source_file || fileSections[event.idx].source_file;
+            fileSections[event.idx].truncated = !!event.truncated;
+          }
+          if (event.truncated) {
+            // Surface in the toolbar chip immediately, not just on `done`,
+            // so the user sees "⚠️ 1 truncated" while later files are
+            // still streaming.
+            setNotesTruncated(prev => {
+              const files = new Set((prev && prev.files) || []);
+              if (event.source_file) files.add(event.source_file);
+              return { files: Array.from(files), review: !!(prev && prev.review) };
+            });
           }
           // Cancel any pending throttled file_delta render — the
           // immediate render below installs the authoritative content.
@@ -893,11 +836,28 @@ function App() {
       setRealNotes(content);
       saveCached(activeCourse, "notes", content);
       StudyState.saveNoteDraft(localStorage, activeCourse, content);
+      // Truncation surface: backend's terminal `done` event carries
+      // `review_truncated: bool` and `files_truncated: string[]`. Merge
+      // them in over whatever the per-file events already accumulated
+      // — `done` is authoritative for the review-pass flag (per-file
+      // events can't know it).
+      if (final && (final.review_truncated || (final.files_truncated && final.files_truncated.length))) {
+        setNotesTruncated({
+          files: Array.isArray(final.files_truncated) ? final.files_truncated : [],
+          review: !!final.review_truncated,
+        });
+      }
       // fix-all v1 #18: backend's /api/notes/full-course/stream writes
       // its own session-log row (kind="notes-full-course"); previously
       // this followed up with a second row (kind="notes") on every
       // success, double-counting in any future kind aggregation.
     } catch (e) {
+      // Clear pending throttled renders BEFORE setting the error state —
+      // otherwise a fire ~250ms later would overwrite the error banner
+      // with a stale partial draft via setRealNotes(rebuildDraftFromFiles()).
+      // (Success path clears them at lines 889-890; mirror that here.)
+      if (reviewSetTimer) { clearTimeout(reviewSetTimer); reviewSetTimer = null; }
+      if (fileDeltaTimer) { clearTimeout(fileDeltaTimer); fileDeltaTimer = null; }
       const msg = "Error: " + e.message;
       setRealNotes(prev => prev || rebuildDraftFromFiles() || msg);
       setGenerationState(s => StudyState.recordGenerationFailure(s, e, (s.failures || 0) + 1));
@@ -1207,9 +1167,11 @@ function App() {
     { id: "exam-prep", label: "Exam Prep", num: "★" },
     { id: "skills", label: "Skills", num: [examAnalysis, reportData, masteryData].filter(Boolean).length || "—" },
     { id: "history", label: "History", num: Object.keys(sessionDays || {}).length || "—" },
-    { id: "settings", label: "Settings", num: "⚙" },
+    // Settings tab retired 2026-05-12 — single entry point is the ⚙
+    // icon-btn in the topbar. The Settings view (effectiveMode==="settings")
+    // still renders normally; only the tab-bar trigger is gone.
   ];
-  const statusView = StudyState.formatStatusBar(backendStatus);
+  const backendDegraded = !backendStatus || !Array.isArray(backendStatus.backends) || backendStatus.backends.length === 0;
   const masteryView = StudyState.formatMasteryState(masteryData || {});
 
   return (
@@ -1289,19 +1251,6 @@ function App() {
           >
             {backend === "qwen_raft" ? "🎓 Qwen" : "🤖 GPT-5.4"}
           </button>
-          {/* 2026-05-12: persona chip. Click expands a popover with an
-              input + reset button; commits go straight to localStorage
-              and propagate to /api/chat via the `persona` field. */}
-          <PersonaChip
-            persona={persona}
-            placeholder={PERSONA_DEFAULT}
-            maxLen={PERSONA_MAX}
-            open={personaOpen}
-            onToggle={() => setPersonaOpen((v) => !v)}
-            onClose={() => setPersonaOpen(false)}
-            onCommit={commitPersona}
-            disabled={streaming}
-          />
           <button className="icon-btn" title="Generate Notes (uses cache when available)" onClick={() => handleGenerateNotes()} disabled={streaming}>📝</button>
           <button
             className="icon-btn"
@@ -1319,6 +1268,26 @@ function App() {
               {noteCacheStats.force ? "🔄" : "⚡"}{noteCacheStats.cached}/{noteCacheStats.total}
             </span>
           )}
+          {notesTruncated && (notesTruncated.review || notesTruncated.files.length > 0) && (
+            <span
+              className="cache-chip mono cache-truncated"
+              title={(() => {
+                const lines = [];
+                if (notesTruncated.files.length > 0) {
+                  lines.push("以下文件因输出 token 上限被截断:");
+                  lines.push(...notesTruncated.files.map(f => "  · " + f));
+                }
+                if (notesTruncated.review) {
+                  lines.push("review 阶段也被截断 — 笔记结尾可能不完整");
+                }
+                lines.push("");
+                lines.push("提示: 设置 NOTES_PER_FILE_MAX_TOKENS / NOTES_REVIEW_MAX_TOKENS 提高上限后重试");
+                return lines.join("\n");
+              })()}
+            >
+              ⚠️ {notesTruncated.files.length + (notesTruncated.review ? 1 : 0)} 截断
+            </span>
+          )}
           {/* Quiz icon-btn hidden 2026-05-12: superseded by Exam Prep.
               handleGenerateQuiz + /api/quiz remain so Knowledge Graph's
               "Practice 3" affordance and the legacy entry can be restored. */}
@@ -1326,6 +1295,16 @@ function App() {
           <button className="icon-btn" title="Exam Analysis" onClick={() => handleSkillEntry("exam-analysis")} disabled={streaming}>⌁</button>
           <button className="icon-btn" title="Course Report" onClick={() => handleSkillEntry("report")} disabled={streaming}>▤</button>
           <button className="icon-btn" title="Mastery Dashboard" onClick={() => handleSkillEntry("mastery")} disabled={streaming}>◎</button>
+          {/* 2026-05-12: settings entry. Single source of truth — the
+              Settings tab was retired from the main tab bar so this icon
+              is the only way in. Persona / language / backend / cache
+              management all live in the Settings view. */}
+          <button
+            className={"icon-btn" + (mode === "settings" ? " active" : "")}
+            title="Settings (helper name, language, backend, cache)"
+            onClick={() => setMode("settings")}
+            disabled={streaming}
+          >⚙</button>
         </div>
       </header>
 
@@ -1529,11 +1508,8 @@ function App() {
           <span className="dot"></span>
           <span>Indexed</span><b>{visibleCourses.length} courses · {totalChunks} chunks</b>
         </div>
-        <div className="item">
+        <div className={"item" + (backendDegraded ? " degraded" : "")}>
           <span>Backend</span><b>{backendStatus ? backendStatus.backends.join(", ") || "none" : "..."}</b>
-        </div>
-        <div className={"item" + (statusView.degraded ? " degraded" : "")}>
-          <span>Status</span><b>{statusView.text}</b>
         </div>
         <div className="item">
           <span>Active</span><b>{activeCourse || "—"}</b>
@@ -3009,7 +2985,16 @@ function SkillsDashboard({ activeCourse, examAnalysis, reportData, masteryData, 
   const cards = [
     { id: "exam-analysis", title: "Exam Analysis", data: examAnalysis },
     { id: "report", title: "Course Report", data: reportData },
-    { id: "mastery", title: "Mastery", data: masteryData },
+    { id: "mastery", title: "Mastery", data: masteryData,
+      legacy: true,
+      // 2026-05-12: Mastery card and Exam Prep tab compute mastery from
+      // two separate sources (mastery_tracker reads session_log; Exam
+      // Prep owns its own exam_bank.json). They don't sync. UX policy:
+      // keep both for one release with a "legacy" hint pointing users to
+      // Exam Prep; retire this card once we're confident the new flow
+      // covers everything.
+      legacyHint: "本卡基于旧 quiz 历史 · 完整闭环见 ★ Exam Prep tab",
+    },
   ];
   return (
     <div className="reader-body" style={{ padding: "28px 40px" }}>
@@ -3017,9 +3002,17 @@ function SkillsDashboard({ activeCourse, examAnalysis, reportData, masteryData, 
         {cards.map(card => (
           <section className="skill-panel" key={card.id}>
             <div className="skill-head">
-              <h3>{card.title}</h3>
+              <h3>
+                {card.title}
+                {card.legacy && (
+                  <span className="legacy-pill mono" title="See Exam Prep tab for the up-to-date mastery loop">legacy</span>
+                )}
+              </h3>
               <button className="btn ghost" disabled={!activeCourse || streaming} onClick={() => onRun(card.id)}>Run</button>
             </div>
+            {card.legacyHint && (
+              <p className="skill-legacy-hint">{card.legacyHint}</p>
+            )}
             {card.id === "mastery" && masteryData ? (
               <div>
                 {masteryView.empty ? <p className="empty-state">{masteryView.text}</p> : (

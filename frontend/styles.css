@@ -1458,6 +1458,26 @@ body::before {
   background: var(--paper);
   padding: 8px 0;
   z-index: 2;
+  align-items: center;
+}
+.notes-toolbar-toggle {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  letter-spacing: 0.02em;
+  padding: 4px 10px;
+  opacity: 0.75;
+}
+.notes-toolbar-toggle:hover { opacity: 1; }
+.notes-toolbar-collapsed {
+  margin-bottom: 8px;
+  padding: 4px 0;
+  /* Collapsed view (Preview mode only — Edit mode force-expands via
+     effectiveCollapsed) has just 1-2 visible buttons: the Tools toggle
+     itself, plus an optional Retry when a generation has failed. Pin
+     them to the right edge so the toolbar feels like a compact
+     "actions" cluster instead of an orphan left-aligned row.
+     User-requested 2026-05-12. */
+  justify-content: flex-end;
 }
 .notes-editor {
   width: 100%;
@@ -3158,6 +3178,10 @@ mark.hl-flash, .hl-jump.hl-flash { animation: hl-flash 0.9s ease-out; }
   background: oklch(0.97 0.04 305);
 }
 
+/* Persona chip CSS removed 2026-05-12: persona editing now lives in the
+   Settings tab (entered via the ⚙ icon-btn in the topbar). The chip's
+   topbar real estate was too noisy for a low-frequency preference. */
+
 /* Incremental note cache chip (2026-05-11). Shows "⚡ N/M" during
    /api/notes/full-course/stream so the user sees at a glance how many
    per-file sections came from per_file_cache.json vs needed a fresh
@@ -3183,6 +3207,16 @@ mark.hl-flash, .hl-jump.hl-flash { animation: hl-flash 0.9s ease-out; }
   border-color: oklch(0.78 0.10 60);
   color: oklch(0.42 0.18 60);
   background: oklch(0.97 0.03 60);
+}
+/* Truncation warning — same chip shell, amber-leaning red so it stands
+   out against the cache-hit greens / cache-miss yellows. `title` tooltip
+   carries the per-file list; no inline expansion to keep the toolbar
+   horizontal density. */
+.cache-chip.cache-truncated {
+  border-color: oklch(0.72 0.16 30);
+  color: oklch(0.42 0.22 30);
+  background: oklch(0.97 0.05 30);
+  cursor: help;
 }
 
 /* ── Exam Prep ─────────────────────────────────────────────────────── */
@@ -3267,6 +3301,30 @@ mark.hl-flash, .hl-jump.hl-flash { animation: hl-flash 0.9s ease-out; }
   border-left: 3px solid var(--ink-4); border-radius: 0 4px 4px 0;
 }
 .topic-archive-note strong { color: var(--ink-2); font-family: var(--mono); margin-right: 6px; }
+
+/* Legacy-feature pill: small inline badge next to a card title that
+ * still works but has a successor (e.g. Mastery card → Exam Prep tab). */
+.legacy-pill {
+  font-size: 9px;
+  padding: 2px 6px;
+  margin-left: 8px;
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+  color: var(--ink-4);
+  background: var(--paper-2);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  vertical-align: middle;
+}
+.skill-legacy-hint {
+  font-size: 11px;
+  color: var(--ink-4);
+  margin: -2px 0 8px;
+  padding: 6px 8px;
+  border-left: 2px solid var(--rule);
+  background: var(--paper-2);
+  border-radius: 0 3px 3px 0;
+}
 
 /* Course-manager hard-delete button */
 .course-delete-btn {

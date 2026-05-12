@@ -200,6 +200,124 @@ def test_chat_uses_graphrag_path_when_kg_present(graphrag_client):
     assert len(body.get("sources", [])) >= 2
 
 
+def test_chat_all_courses_mode_runs_graphrag_across_courses(monkeypatch, tmp_path):
+    """2026-05-12 All Courses graphrag: when course_id is null (All
+    Courses mode), `_maybe_graphrag_all_courses` iterates every course
+    with a `knowledge_graph.json`, runs `_maybe_graphrag` in parallel,
+    merges by chunk_id, and surfaces `path=graphrag`. Pre-fix, All
+    Courses mode skipped graphrag entirely and short queries that
+    relied on KG semantic matching fell through to general."""
+    import importlib
+    from fastapi.testclient import TestClient
+    from nano_notebooklm.types import LLMResponse
+
+    art = tmp_path / "artifacts"
+    courses = art / "courses"
+    courses.mkdir(parents=True)
+
+    # Seed TWO courses, each with its own KG. Both have a chunk that
+    # matches the query — All Courses graphrag should merge both.
+    nodes_a = [
+        _make_node("a_n", "AlphaTopic", "zebra zebra zebra",
+                   concept_type="topic", depth=1, weight=5.0, chunk_id="ca1"),
+    ]
+    edges_a: list = []
+    chunks_a = [_make_chunk_row("ca1", "Alpha course mentions zebra anatomy.",
+                                course_id="cA", source_file="alpha.pdf")]
+    _seed_course(art, "cA", nodes_a, edges_a, chunks_a)
+
+    nodes_b = [
+        _make_node("b_n", "BetaTopic", "zebra topic supporting",
+                   concept_type="topic", depth=1, weight=5.0, chunk_id="cb1"),
+    ]
+    edges_b: list = []
+    chunks_b = [_make_chunk_row("cb1", "Beta course also covers zebra behaviour.",
+                                course_id="cB", source_file="beta.pdf")]
+    _seed_course(art, "cB", nodes_b, edges_b, chunks_b)
+
+    monkeypatch.setenv("ARTIFACTS_DIR", str(art))
+    from nano_notebooklm import config
+    monkeypatch.setattr(config, "ARTIFACTS_DIR", art)
+    from nano_notebooklm.kb import store as kb_store
+    monkeypatch.setattr(kb_store, "_get_default_embed_fn", lambda: _keyword_embed)
+    monkeypatch.setenv("RAG_SCORE_GATE_TOP1", "0.0")
+    monkeypatch.setenv("GRAPHRAG_SCORE_GATE_TOP1", "0.0")
+    monkeypatch.setenv("NANO_NLM_DISABLE_EMBED_WARMUP", "1")
+
+    import api.server as server_mod
+    importlib.reload(server_mod)
+    server_mod.kb.build_index(None)
+    from nano_notebooklm.orchestrator import router_intent as ri
+    ri._LANG_CACHE.clear()
+
+    async def stub_complete(prompt, **kw):
+        return LLMResponse(content="graph-rooted answer", model="fake",
+                           input_tokens=1, output_tokens=1, latency_ms=1.0)
+
+    monkeypatch.setattr(server_mod.router, "complete", stub_complete)
+
+    client = TestClient(server_mod.app)
+    r = client.post("/api/chat", json={"question": "zebra question"})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body.get("path") == "graphrag", (
+        f"All Courses mode should route to graphrag when ≥1 KG matches: {body}"
+    )
+    # Merged result should pull chunks from BOTH courses (not just one);
+    # the per-course source_file names are distinct so we can verify the
+    # fan-out via that field.
+    sources = body.get("sources", [])
+    source_files = {s.get("source_file") for s in sources}
+    assert {"alpha.pdf", "beta.pdf"}.issubset(source_files), (
+        f"expected hits from both courses (alpha.pdf + beta.pdf), got source_files={source_files}"
+    )
+
+
+def test_chat_all_courses_skips_graphrag_when_no_kg_files(monkeypatch, tmp_path):
+    """When NO course has a KG, `_maybe_graphrag_all_courses` returns
+    `[]` and the chain falls through to plain RAG / general."""
+    import importlib
+    from fastapi.testclient import TestClient
+    from nano_notebooklm.types import LLMResponse
+
+    art = tmp_path / "artifacts"
+    courses = art / "courses"
+    courses.mkdir(parents=True)
+    # Seed one course with chunks but NO knowledge_graph.json.
+    (courses / "cNoKG").mkdir()
+    chunks = [_make_chunk_row("cnokg_1", "Plain RAG content about zebras.",
+                              course_id="cNoKG", source_file="x.pdf")]
+    (courses / "cNoKG" / "chunks.json").write_text(
+        json.dumps(chunks, ensure_ascii=False, default=str)
+    )
+
+    monkeypatch.setenv("ARTIFACTS_DIR", str(art))
+    from nano_notebooklm import config
+    monkeypatch.setattr(config, "ARTIFACTS_DIR", art)
+    from nano_notebooklm.kb import store as kb_store
+    monkeypatch.setattr(kb_store, "_get_default_embed_fn", lambda: _keyword_embed)
+    monkeypatch.setenv("RAG_SCORE_GATE_TOP1", "0.0")
+    monkeypatch.setenv("NANO_NLM_DISABLE_EMBED_WARMUP", "1")
+
+    import api.server as server_mod
+    importlib.reload(server_mod)
+    server_mod.kb.build_index(None)
+    from nano_notebooklm.orchestrator import router_intent as ri
+    ri._LANG_CACHE.clear()
+
+    async def stub_complete(prompt, **kw):
+        return LLMResponse(content="rag answer", model="fake",
+                           input_tokens=1, output_tokens=1, latency_ms=1.0)
+    monkeypatch.setattr(server_mod.router, "complete", stub_complete)
+
+    client = TestClient(server_mod.app)
+    r = client.post("/api/chat", json={"question": "zebra question"})
+    assert r.status_code == 200
+    body = r.json()
+    # No KG anywhere → graphrag fan-out returns [] → fall through to rag.
+    assert body.get("path") != "graphrag", body
+
+
 # ── Corner 1: KG file missing → graph_search returns [] ──────────────
 
 
