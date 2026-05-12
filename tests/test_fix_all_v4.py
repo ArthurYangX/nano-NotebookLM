@@ -506,6 +506,40 @@ def test_nav_epoch_threaded_into_pdf_frame_and_text_body():
         "DocumentPdfFrame iframe-nav useEffect deps no longer include navEpoch"
 
 
+def test_app_jsx_get_checked_files_returns_null_when_all_checked():
+    """R5-2 fix-all v7 regression pin.
+
+    The frontend's `getCheckedSourceFiles()` MUST return `null` when every
+    source is checked (the default state on course load). Otherwise the
+    assistant sends `checked_files: [<all>]` to /api/chat, qa_skill reads
+    it as "user pinned a subset", and skips graphrag — short course-
+    specific queries that depend on KG retrieval (e.g. "什么是精度" in
+    机器人) fall through to BM25 / vector / translation / cross-course /
+    general because the char-bigram tokenizer can't bridge the
+    query↔chunk semantic gap that the KG would have spanned.
+
+    Pin the App-level wrapper's "all-checked → null" branch via source
+    grep so a future refactor that drops the comparison line trips this
+    test immediately."""
+    src = Path("frontend/app.jsx").read_text(encoding="utf-8")
+    # The wrapper function exists.
+    m = re.search(
+        r"function getCheckedSourceFiles\(\)\s*\{[\s\S]+?\n  \}\n",
+        src,
+    )
+    assert m, "getCheckedSourceFiles wrapper not found in app.jsx"
+    body = m.group(0)
+    # 1) Empty / non-array → null branch.
+    assert "all.length === 0" in body or "all.length == 0" in body, \
+        "empty-array → null branch missing"
+    # 2) All-checked → null branch (length matches visible source count).
+    assert "all.length === visibleSourceCount" in body, \
+        "all-checked → null branch missing — qa_skill will skip graphrag whenever default state ships full list"
+    # 3) Both return `null`.
+    assert body.count("return null") >= 2, \
+        "expected at least 2 `return null` paths (empty + all-checked)"
+
+
 def test_correct_letter_lives_in_study_state_not_app_jsx():
     """fix-all v1 H5: correctLetter must live in study-state.js (not as a
     local duplicate in app.jsx) so RealQuizView's render-time letter

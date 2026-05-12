@@ -1,4 +1,4 @@
-/* global React, Library, Reader, Notes, MindMap, Quiz, ExamPrep, Assistant, Processing, API, StudyState,
+/* global React, Library, Reader, Notes, MindMap, Quiz, ExamPrep, Settings, Assistant, Processing, API, StudyState,
    SAMPLE_SOURCES, TweaksPanel, useTweaks, TweakSection, TweakSelect,
    TweakRadio, TweakSlider, TweakToggle, NOTES_DATA, QUIZ_DATA, MINDMAP */
 const { useState, useEffect, useRef } = React;
@@ -7,7 +7,6 @@ const TWEAK_DEFAULTS = /*EDITMODE-BEGIN*/{
   "theme": "paper",
   "density": "comfortable",
   "baseSize": 15,
-  "persona": "Dr. Marginalia",
   "mindmapLayout": "radial",
   "noteStyle": "outline",
   "serifHeads": true
@@ -101,6 +100,86 @@ function CitationPreviewModal({ preview, onClose, onOpenInReader }) {
   );
 }
 
+// 🎭 persona chip — small topbar control that displays the user's chosen
+// assistant name and expands to an inline edit popover on click. Commits
+// land in localStorage (handled by parent's `onCommit`) and propagate to
+// /api/chat via the `persona` field; empty value falls back to the
+// server-side DEFAULT_PERSONA.
+function PersonaChip({ persona, placeholder, maxLen, open, onToggle, onClose, onCommit, disabled }) {
+  const [draft, setDraft] = useState(persona);
+  const wrapRef = useRef(null);
+  useEffect(() => {
+    if (open) setDraft(persona);
+  }, [open, persona]);
+  useEffect(() => {
+    if (!open) return undefined;
+    const onDoc = (e) => {
+      if (!wrapRef.current) return;
+      if (!wrapRef.current.contains(e.target)) onClose();
+    };
+    const onKey = (e) => { if (e.key === "Escape") onClose(); };
+    document.addEventListener("mousedown", onDoc);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDoc);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [open, onClose]);
+  const label = persona || placeholder;
+  const display = label.length > 12 ? label.slice(0, 11) + "…" : label;
+  const commit = () => {
+    onCommit(draft.trim());
+    onClose();
+  };
+  return (
+    <span className="persona-chip-wrap" ref={wrapRef} style={{ position: "relative" }}>
+      <button
+        type="button"
+        className={"persona-chip mono" + (persona ? " has-custom" : "")}
+        title={persona
+          ? `助手名：${persona}（点击修改）`
+          : `助手名（默认 ${placeholder}，点击自定义）`}
+        onClick={onToggle}
+        disabled={disabled}
+      >
+        🎭 {display}
+      </button>
+      {open && (
+        <div className="persona-popover" role="dialog" aria-label="自定义助手名">
+          <label className="persona-popover-label">助手名（最多 {maxLen} 字符）</label>
+          <input
+            className="persona-popover-input mono"
+            type="text"
+            value={draft}
+            placeholder={placeholder}
+            maxLength={maxLen}
+            autoFocus
+            onChange={(e) => setDraft(e.target.value.slice(0, maxLen))}
+            onKeyDown={(e) => { if (e.key === "Enter") commit(); }}
+          />
+          <div className="persona-popover-actions">
+            <button
+              type="button"
+              className="persona-popover-btn persona-popover-reset"
+              onClick={() => { setDraft(""); onCommit(""); onClose(); }}
+              title="恢复默认（Study Assistant）"
+            >
+              恢复默认
+            </button>
+            <button
+              type="button"
+              className="persona-popover-btn persona-popover-save"
+              onClick={commit}
+            >
+              保存
+            </button>
+          </div>
+        </div>
+      )}
+    </span>
+  );
+}
+
 function App() {
   const tweaks = useTweaks(TWEAK_DEFAULTS);
   const [mode, setMode] = useState("reader");
@@ -169,6 +248,28 @@ function App() {
     setBackend(value);
     try { window.localStorage.setItem("nano-nlm:v1:backend", value); }
     catch (e) {}
+  }
+  // 2026-05-12: persona chip (🎭). User-customisable name surfaced to the
+  // LLM via /api/chat's `persona` field — flows through qa_skill into
+  // every system prompt path so "你是谁" returns the chosen name. Empty
+  // → backend falls back to DEFAULT_PERSONA ("Study Assistant"). Length
+  // capped to 40 chars by the server-side Pydantic validator.
+  const PERSONA_DEFAULT = "Study Assistant";
+  const PERSONA_MAX = 40;
+  const [persona, setPersona] = useState(() => {
+    try {
+      const v = window.localStorage.getItem("nano-nlm:v1:persona");
+      return (v || "").slice(0, PERSONA_MAX);
+    } catch (e) { return ""; }
+  });
+  const [personaOpen, setPersonaOpen] = useState(false);
+  function commitPersona(value) {
+    const next = (value || "").slice(0, PERSONA_MAX);
+    setPersona(next);
+    try {
+      if (next) window.localStorage.setItem("nano-nlm:v1:persona", next);
+      else window.localStorage.removeItem("nano-nlm:v1:persona");
+    } catch (e) {}
   }
   function commitUserLang(code) {
     if (StudyState.saveUserLang(window.localStorage, code)) {
@@ -552,8 +653,26 @@ function App() {
   // ── Get checked source file names for context filtering ──
   // Delegates to StudyState.getCheckedSourceFiles which returns raw filenames
   // (matching chunk.source_file) so the backend qa_skill filter actually hits.
+  //
+  // R5-2 fix-all v7: when EVERY source is checked (the default state on
+  // course load), the user did NOT pin a subset — return `null` instead of
+  // the full list so qa_skill's "user pinned files → skip graphrag" branch
+  // doesn't fire on the default. Previously the assistant sent the full
+  // checked list to `/api/chat`, qa_skill saw `checked_files = [<all>]`,
+  // skipped graphrag, and short course-specific queries like "什么是精度"
+  // bounced through RAG → translation → cross-course → general because
+  // BM25 char-bigram alone couldn't bridge the query→chunk gap that the KG
+  // would have spanned.
   function getCheckedSourceFiles() {
-    return StudyState.getCheckedSourceFiles(sources);
+    const all = StudyState.getCheckedSourceFiles(sources);
+    if (!Array.isArray(all) || all.length === 0) return null;
+    // Count UI sources actually toggleable: ignore non-source rows just in
+    // case Library state ever wraps another shape.
+    const visibleSourceCount = (sources || []).filter(s => s).length;
+    if (visibleSourceCount > 0 && all.length === visibleSourceCount) {
+      return null;
+    }
+    return all;
   }
 
   // ── API actions ──
@@ -652,6 +771,19 @@ function App() {
         if (!inReview) setRealNotes(rebuildDraftFromFiles());
       }, 0);
     }
+    // file_delta (2026-05-12): per-file streaming now ships ~10-20
+    // deltas/sec per file × up to 4 concurrent files = 40-80 events/sec.
+    // Each setRealNotes invalidates the latexToHtml useMemo and re-runs
+    // the 8-stage regex pipeline on the merged draft, so throttle to
+    // 250ms (mirrors scheduleReviewUpdate) to keep the UI responsive.
+    let fileDeltaTimer = null;
+    function scheduleFileDeltaRender() {
+      if (fileDeltaTimer) return;
+      fileDeltaTimer = setTimeout(() => {
+        fileDeltaTimer = null;
+        if (!inReview) setRealNotes(rebuildDraftFromFiles());
+      }, 250);
+    }
     try {
       const final = await API.streamFullCourseNotes(activeCourse, event => {
         if (event.type === "plan") {
@@ -683,7 +815,20 @@ function App() {
           if (fileSections[event.idx]) {
             fileSections[event.idx].status = "running";
             fileSections[event.idx].source_file = event.source_file || fileSections[event.idx].source_file;
+            // Reset content so file_delta can accumulate from scratch
+            // — protects against a retry that lands on the same idx.
+            fileSections[event.idx].content = "";
           }
+        } else if (event.type === "file_delta") {
+          // 2026-05-12: token-streamed per-file output. Accumulate the
+          // delta into the section's content + render-throttle so the
+          // user sees text growing in real time, not a 20s frozen
+          // "Generating..." followed by a single dump.
+          if (fileSections[event.idx]) {
+            const prev = fileSections[event.idx].content || "";
+            fileSections[event.idx].content = prev + (event.delta || "");
+          }
+          scheduleFileDeltaRender();
         } else if (event.type === "file_cached") {
           // Incremental cache (2026-05-11): backend short-circuits the
           // LLM call when per_file_cache.json has a matching chunk_hash.
@@ -699,9 +844,15 @@ function App() {
         } else if (event.type === "file_done") {
           if (fileSections[event.idx]) {
             fileSections[event.idx].status = "done";
+            // file_done.content is the SANITIZED final body (server-
+            // side check() may differ from the raw accumulated deltas
+            // by stripped whitespace). Always overwrite — truth-pin.
             fileSections[event.idx].content = event.content;
             fileSections[event.idx].source_file = event.source_file || fileSections[event.idx].source_file;
           }
+          // Cancel any pending throttled file_delta render — the
+          // immediate render below installs the authoritative content.
+          if (fileDeltaTimer) { clearTimeout(fileDeltaTimer); fileDeltaTimer = null; }
           scheduleCachedRender();
           setStreamProgress(p => p + 1);
         } else if (event.type === "file_error") {
@@ -736,6 +887,7 @@ function App() {
       // Cancel any pending throttled review render — the next setRealNotes
       // below installs the canonical final content.
       if (reviewSetTimer) { clearTimeout(reviewSetTimer); reviewSetTimer = null; }
+      if (fileDeltaTimer) { clearTimeout(fileDeltaTimer); fileDeltaTimer = null; }
       if (final && final.type === "error") throw new Error(final.error || "stream_failed");
       const content = (final && final.content) || reviewPartial || rebuildDraftFromFiles() || "Notes generation failed.";
       setRealNotes(content);
@@ -1055,6 +1207,7 @@ function App() {
     { id: "exam-prep", label: "Exam Prep", num: "★" },
     { id: "skills", label: "Skills", num: [examAnalysis, reportData, masteryData].filter(Boolean).length || "—" },
     { id: "history", label: "History", num: Object.keys(sessionDays || {}).length || "—" },
+    { id: "settings", label: "Settings", num: "⚙" },
   ];
   const statusView = StudyState.formatStatusBar(backendStatus);
   const masteryView = StudyState.formatMasteryState(masteryData || {});
@@ -1136,6 +1289,19 @@ function App() {
           >
             {backend === "qwen_raft" ? "🎓 Qwen" : "🤖 GPT-5.4"}
           </button>
+          {/* 2026-05-12: persona chip. Click expands a popover with an
+              input + reset button; commits go straight to localStorage
+              and propagate to /api/chat via the `persona` field. */}
+          <PersonaChip
+            persona={persona}
+            placeholder={PERSONA_DEFAULT}
+            maxLen={PERSONA_MAX}
+            open={personaOpen}
+            onToggle={() => setPersonaOpen((v) => !v)}
+            onClose={() => setPersonaOpen(false)}
+            onCommit={commitPersona}
+            disabled={streaming}
+          />
           <button className="icon-btn" title="Generate Notes (uses cache when available)" onClick={() => handleGenerateNotes()} disabled={streaming}>📝</button>
           <button
             className="icon-btn"
@@ -1160,7 +1326,6 @@ function App() {
           <button className="icon-btn" title="Exam Analysis" onClick={() => handleSkillEntry("exam-analysis")} disabled={streaming}>⌁</button>
           <button className="icon-btn" title="Course Report" onClick={() => handleSkillEntry("report")} disabled={streaming}>▤</button>
           <button className="icon-btn" title="Mastery Dashboard" onClick={() => handleSkillEntry("mastery")} disabled={streaming}>◎</button>
-          <button className="icon-btn" title="Settings">✦</button>
         </div>
       </header>
 
@@ -1323,13 +1488,27 @@ function App() {
           {effectiveMode === "history" && (
             <SessionHistory days={sessionDays} />
           )}
+          {effectiveMode === "settings" && (
+            <Settings
+              backendStatus={backendStatus}
+              backend={backend}
+              onCommitBackend={commitBackend}
+              userLang={userLang}
+              onPickLang={commitUserLang}
+              persona={persona}
+              onCommitPersona={commitPersona}
+              hiddenCourseIds={hiddenCourseIds}
+              onUnhideAll={unhideAllCourses}
+              courses={courses}
+            />
+          )}
         </div>
       </main>
 
       {/* ========= Assistant ========= */}
       <Assistant
         mode={effectiveMode}
-        persona={tweaks.persona}
+        persona={persona}
         activeSources={activeSources}
         streaming={streaming}
         streamProgress={streamProgress}
@@ -1381,14 +1560,13 @@ function App() {
             ]} />
           <TweakSlider tweaks={tweaks} tweakKey="baseSize" label="Base font size" min={13} max={18} step={1} unit="px" />
         </TweakSection>
-        <TweakSection title="Assistant">
-          <TweakSelect tweaks={tweaks} tweakKey="persona" label="AI persona"
-            options={[
-              { value: "Dr. Marginalia", label: "Dr. Marginalia · formal" },
-              { value: "Wren", label: "Wren · peer tutor" },
-              { value: "Socrates", label: "Socrates · questioning" },
-            ]} />
-        </TweakSection>
+        {/* 2026-05-12: AI persona dropdown removed — superseded by the
+            user-visible 🎭 persona chip in the topbar (commitPersona +
+            nano-nlm:v1:persona). The Tweaks panel is dev-only (requires
+            __activate_edit_mode) and the wrapper-prop interface here
+            (`tweaks` / `tweakKey`) never matched TweakSelect's actual
+            ({label, value, options, onChange}) signature, so the
+            control was inert in production anyway. */}
         <TweakSection title="Notes layout">
           <TweakRadio tweaks={tweaks} tweakKey="noteStyle" label="Note style"
             options={[
@@ -1994,6 +2172,23 @@ function RealNotesView({ content, streaming, activeCourse, sources, onContentCha
   // course switch; toggle handler writes through immediately.
   const [tocCollapsedIds, setTocCollapsedIds] = React.useState([]);
   const [showDrawer, setShowDrawer] = React.useState(true);
+  // Notes toolbar is collapsible — user complained the 6-button row eats
+  // vertical real estate above the LaTeX preview. Persisted globally
+  // (same convention as kg-legend-hidden / notes-toc-hidden); default
+  // expanded so first-time users still discover the actions.
+  // Optional-chain the StudyState helpers so a stale browser cache
+  // (old study-state.js + new app.jsx) degrades to default-expanded
+  // instead of crashing RealNotesView with TypeError.
+  const [toolbarCollapsed, setToolbarCollapsedRaw] = React.useState(
+    () => StudyState.loadNotesToolbarCollapsed?.(localStorage) ?? false,
+  );
+  const setToolbarCollapsed = React.useCallback(updater => {
+    setToolbarCollapsedRaw(prev => {
+      const next = typeof updater === "function" ? updater(prev) : updater;
+      StudyState.saveNotesToolbarCollapsed?.(localStorage, next);
+      return next;
+    });
+  }, []);
   const [selMenu, setSelMenu] = React.useState(null); // {x, y, text, before, after}
   const [popover, setPopover] = React.useState(null); // {x, y, hl}
   const previewRef = React.useRef(null);
@@ -2553,22 +2748,42 @@ function RealNotesView({ content, streaming, activeCourse, sources, onContentCha
 
   return (
     <div ref={rootRef} className="reader-body notes-reader-body">
-      <div className="notes-toolbar">
-        <button className="btn ghost" onClick={() => { setEditing(!editing); setSelMenu(null); setPopover(null); }}>{editing ? "Preview" : "Edit"}</button>
-        <button className="btn ghost" onClick={downloadLatex} title="下载 .tex 源文件">.tex</button>
-        <button className="btn ghost" onClick={printPdfFromBrowser} title="浏览器打印（快速预览）">PDF (print)</button>
+      {/* Edit mode forces the toolbar expanded — the Edit/Preview button is
+          the only escape hatch out of Edit mode, so hiding it behind the
+          collapse would trap the user. In Preview mode the user's
+          persisted preference (toolbarCollapsed) is honored. */}
+      {(() => { const effectiveCollapsed = toolbarCollapsed && !editing; return (
+      <div className={`notes-toolbar${effectiveCollapsed ? " notes-toolbar-collapsed" : ""}`}>
         <button
-          className="btn ghost"
-          onClick={compilePdfWithTectonic}
-          disabled={tectonicAvailable === false}
-          title={tectonicAvailable === false
-            ? "Tectonic 不可用：服务器未安装 LaTeX 编译器"
-            : "服务端 LaTeX 编译（学术排版）"}
-        >PDF (compile)</button>
-        <button className="btn ghost" onClick={() => setShowToc(v => !v)} disabled={editing}>{showToc ? "Hide TOC" : "Show TOC"}</button>
-        <button className="btn ghost" onClick={() => setShowDrawer(v => !v)} disabled={editing}>{showDrawer ? "Hide Highlights" : `Highlights · ${highlights.length}`}</button>
+          type="button"
+          className="btn ghost notes-toolbar-toggle"
+          onClick={() => setToolbarCollapsed(v => !v)}
+          disabled={editing}
+          title={editing
+            ? "Edit 模式下工具栏始终展开"
+            : (effectiveCollapsed ? "展开工具栏" : "隐藏工具栏")}
+          aria-expanded={!effectiveCollapsed}
+        >{effectiveCollapsed ? "▸ Tools" : "▾ Tools"}</button>
+        {!effectiveCollapsed && (
+          <>
+            <button className="btn ghost" onClick={() => { setEditing(!editing); setSelMenu(null); setPopover(null); }}>{editing ? "Preview" : "Edit"}</button>
+            <button className="btn ghost" onClick={downloadLatex} title="下载 .tex 源文件">.tex</button>
+            <button className="btn ghost" onClick={printPdfFromBrowser} title="浏览器打印（快速预览）">PDF (print)</button>
+            <button
+              className="btn ghost"
+              onClick={compilePdfWithTectonic}
+              disabled={tectonicAvailable === false}
+              title={tectonicAvailable === false
+                ? "Tectonic 不可用：服务器未安装 LaTeX 编译器"
+                : "服务端 LaTeX 编译（学术排版）"}
+            >PDF (compile)</button>
+            <button className="btn ghost" onClick={() => setShowToc(v => !v)} disabled={editing}>{showToc ? "Hide TOC" : "Show TOC"}</button>
+            <button className="btn ghost" onClick={() => setShowDrawer(v => !v)} disabled={editing}>{showDrawer ? "Hide Highlights" : `Highlights · ${highlights.length}`}</button>
+          </>
+        )}
         {generationState?.retryable && <button className="btn primary" onClick={onRetry}>Retry</button>}
       </div>
+      ); })()}
       {streaming && <div style={{ color: "var(--accent)", marginBottom: 16, fontFamily: "var(--mono)", fontSize: 12 }}>Generating notes<span className="stream-cursor"></span></div>}
       {generationState?.status === "failed" && <div className="error-banner">{generationState.errorDetail}</div>}
       {compileError && (
