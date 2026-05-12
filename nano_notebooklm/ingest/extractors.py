@@ -167,11 +167,52 @@ SUPPORTED_EXTENSIONS = {".pdf", ".pptx", ".ppt", ".docx", ".md", ".markdown", ".
 
 
 def collect_files(directory: str | Path) -> list[Path]:
-    """Recursively collect all supported files from a directory."""
+    """Recursively collect all supported files from a directory.
+
+    R5-2 fix-all v4 dedup pass: when both `<stem>.pptx` (or `.ppt`) AND
+    `<stem>.pdf` live in the same parent directory we keep ONLY the pptx
+    and drop the pdf. Rationale:
+
+    - PPTX carries semantically richer content (speaker notes, structure,
+      slide titles) — better signal for chunking + KG extraction.
+    - Users routinely export a pptx → pdf and drag both into the upload
+      dialog. Pre-fix this indexed every slide twice (once via python-
+      pptx, once via pdfplumber), inflating chunks.json, the FAISS
+      index, and the sources panel (two rows for "the same lecture").
+    - The Reader still gets a PDF view: pptx_pdf.convert_pptx_to_pdf
+      renders a sidecar at upload time, served via
+      `_resolve_pptx_pdf_sidecar` — the user-uploaded pdf is redundant.
+
+    The drop is silent at this layer (chunker-level) but the upload
+    pipeline can surface counts via `len(collect_files(upload_dir))` vs
+    file count if it wants to warn the user.
+    """
     directory = Path(directory)
     files = []
     for ext in SUPPORTED_EXTENSIONS:
         for f in directory.rglob(f"*{ext}"):
             if not any(skip in f.parts for skip in SKIP_DIRS):
                 files.append(f)
-    return sorted(files)
+    return _dedupe_pptx_pdf_pairs(sorted(files))
+
+
+def _dedupe_pptx_pdf_pairs(files: list[Path]) -> list[Path]:
+    """Drop a `<stem>.pdf` when a sibling `<stem>.pptx` (or `.ppt`) exists.
+
+    Sibling = same parent directory + same stem (case-sensitive on the
+    file system the caller hands us). Comparison is exact-stem only; if
+    a user wants both `lecture1.pptx` and `lecture1-handout.pdf` to be
+    indexed, they remain (different stems).
+    """
+    by_dir_stem_pptx: set[tuple[Path, str]] = set()
+    for f in files:
+        if f.suffix.lower() in (".pptx", ".ppt"):
+            by_dir_stem_pptx.add((f.parent, f.stem))
+    if not by_dir_stem_pptx:
+        return files
+    kept = []
+    for f in files:
+        if f.suffix.lower() == ".pdf" and (f.parent, f.stem) in by_dir_stem_pptx:
+            continue
+        kept.append(f)
+    return kept

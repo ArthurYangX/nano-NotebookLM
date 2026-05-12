@@ -1977,7 +1977,19 @@ function RealNotesView({ content, streaming, activeCourse, sources, onContentCha
   const [highlights, setHighlights] = React.useState([]);
   const [tocItems, setTocItems] = React.useState([]);
   const [activeTocId, setActiveTocId] = React.useState(null);
-  const [showToc, setShowToc] = React.useState(true);
+  // Persisted per-browser (global key, not per-course) so the user's
+  // "I find the TOC too noisy" preference survives a reload. Default is
+  // visible — the TOC is the killer feature, hide only on demand.
+  const [showToc, setShowTocRaw] = React.useState(
+    () => !StudyState.loadNotesTocHidden(localStorage),
+  );
+  const setShowToc = React.useCallback(updater => {
+    setShowTocRaw(prev => {
+      const next = typeof updater === "function" ? updater(prev) : updater;
+      StudyState.saveNotesTocHidden(localStorage, !next);
+      return next;
+    });
+  }, []);
   // Per-course collapsed-section ids. Loaded from localStorage on
   // course switch; toggle handler writes through immediately.
   const [tocCollapsedIds, setTocCollapsedIds] = React.useState([]);

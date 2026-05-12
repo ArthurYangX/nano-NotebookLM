@@ -1931,6 +1931,25 @@ mark.hl-flash, .hl-jump.hl-flash { animation: hl-flash 0.9s ease-out; }
 .page.pdf-mode .ornament {
   display: none;
 }
+/* PDF outline toggle (R5-2 fix-all v4 #2): small inline pill placed just
+ * above the iframe so it doesn't compete with PDFium's own toolbar. */
+.pdf-outline-toggle {
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 4px 10px;
+  margin: 4px 0 0;
+  font-size: 11px;
+  border: 1px solid var(--rule);
+  background: var(--paper-2);
+  color: var(--ink-2);
+  border-radius: 12px;
+  cursor: pointer;
+  transition: border-color 80ms, background 80ms;
+}
+.pdf-outline-toggle:hover {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent-ink);
+}
 /* PDF mode breaks out of the 680px prose cap so the embedded viewer has
    room to render real PDF pages. Text/intro modes keep the narrow column. */
 .page.pdf-mode {

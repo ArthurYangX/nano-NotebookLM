@@ -83,7 +83,14 @@
 
   function resolveCitationNavigation(refText, sources) {
     const raw = String(refText || "").replace(/^\[Source:\s*/i, "").replace(/\]$/, "").trim();
-    const chunkMatch = raw.match(/\bchunk\s+([A-Za-z0-9_.:-]+)/i) || raw.match(/\b(c[0-9A-Za-z_.:-]+)\b/);
+    // chunk_id format is `chunk_<course>_<doc>_<seq>` (chunker.py:89). The bare
+    // fallback used to be `\b(c[0-9A-Za-z_.:-]+)\b` which also matched any
+    // word starting with "c" — e.g. `ch3.pptx` in `[Source: ch3.pptx, p.5]`,
+    // sending the Reader to /api/chunks/ch3.pptx and producing "chunk not
+    // found: ch3.pptx". Tighten both patterns to require the literal `chunk_`
+    // prefix or the explicit `chunk <id>` form.
+    const chunkMatch = raw.match(/\bchunk\s+(chunk_[A-Za-z0-9_-]+|c[0-9][A-Za-z0-9_-]*)/i)
+                    || raw.match(/\b(chunk_[A-Za-z0-9_-]+)\b/);
     const pageMatch = raw.match(/\bp(?:age|\.)?\s*([0-9]+)/i) || raw.match(/PDF\s*p\.?\s*([0-9]+)/i);
     const page = pageMatch ? Number(pageMatch[1]) : null;
     const sourcePart = raw.split(",")[0].replace(/^Source:\s*/i, "").trim();
@@ -118,6 +125,14 @@
     if (!source.docId) return { canPreview: false, reason: "" };
     if (!source.courseId) return { canPreview: false, reason: "" };
     if (source.fileType === "pdf") return { canPreview: true, reason: "" };
+    // PPTX with a LibreOffice-rendered sidecar can preview in the modal —
+    // the file endpoint transparently serves the sidecar with mime=pdf
+    // (see _resolve_pptx_pdf_sidecar in api/server.py). Without a sidecar
+    // (no soffice on the host, or conversion failed) we still fall through
+    // to Reader text-mode.
+    if (source.fileType === "pptx" && source.viewableAsPdf) {
+      return { canPreview: true, reason: "" };
+    }
     const labelMap = { pptx: "PPTX", docx: "DOCX", md: "Markdown", txt: "纯文本" };
     const label = labelMap[source.fileType] || source.fileType;
     return {
@@ -1161,6 +1176,36 @@
     return courses.filter(c => c && !hidden.has(c.id));
   }
 
+  // ── Global UI toggles for index/outline panels ─────────────────────
+  // Two boolean prefs, both global (per-browser, not per-course) so the
+  // user picks once and the choice carries across the corpus. Matches the
+  // pattern of `nano-nlm:v1:kg-legend-hidden` + `nano-nlm:v1:backend`.
+  const NOTES_TOC_HIDDEN_KEY = `${PREFIX}:notes-toc-hidden`;
+  const PDF_OUTLINE_HIDDEN_KEY = `${PREFIX}:pdf-outline-hidden`;
+
+  function loadNotesTocHidden(storage) {
+    try { return storage.getItem(NOTES_TOC_HIDDEN_KEY) === "1"; }
+    catch { return false; }
+  }
+  function saveNotesTocHidden(storage, hidden) {
+    try { storage.setItem(NOTES_TOC_HIDDEN_KEY, hidden ? "1" : "0"); return true; }
+    catch { return false; }
+  }
+  function loadPdfOutlineHidden(storage) {
+    // Default: hidden. PDFium's bookmark/thumbnail pane is rarely useful
+    // for our short course slides and eats horizontal space, so the user
+    // has to opt INTO it. Backward-compat: if the key is absent OR "1"
+    // we hide; only "0" reveals.
+    try {
+      const v = storage.getItem(PDF_OUTLINE_HIDDEN_KEY);
+      return v == null ? true : v === "1";
+    } catch { return true; }
+  }
+  function savePdfOutlineHidden(storage, hidden) {
+    try { storage.setItem(PDF_OUTLINE_HIDDEN_KEY, hidden ? "1" : "0"); return true; }
+    catch { return false; }
+  }
+
   function clearHiddenCourses(storage) {
     try { storage.removeItem(HIDDEN_COURSES_KEY); return true; }
     catch (e) {
@@ -1399,6 +1444,10 @@
     DEFAULT_LANG_CHOICES,
     loadHiddenCourses,
     findCoursesWithCache,
+    loadNotesTocHidden,
+    saveNotesTocHidden,
+    loadPdfOutlineHidden,
+    savePdfOutlineHidden,
     saveHiddenCourses,
     isCourseHidden,
     setCourseHidden,

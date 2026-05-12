@@ -95,6 +95,36 @@ def test_citation_navigation_invalid():
     assert run_node(script).strip() == "ok"
 
 
+def test_citation_navigation_pptx_filename_not_chunk_id():
+    """Regression: pre-fix, the bare-chunk fallback regex `\\b(c[0-9A-Za-z_.:-]+)\\b`
+    matched any word starting with `c`, so a citation like
+    `[Source: ch3.pptx, p.5]` produced `highlightedId='ch3.pptx'` and the
+    Reader hit /api/chunks/ch3.pptx → 404 "chunk not found: ch3.pptx".
+    Real chunk_ids always start with `chunk_` (chunker.py:89) — pin that
+    contract here so a future loose-regex regression trips the test."""
+    script = textwrap.dedent(
+        """
+        const h = require('./frontend/study-state.js');
+        const sources = [{id:'doc1', title:'ch3.pptx'}];
+        const result = h.resolveCitationNavigation('[Source: ch3.pptx, p.5]', sources);
+        if (!result.ok) throw new Error('expected resolution to succeed');
+        if (result.activeId !== 'doc1') throw new Error('wrong source id');
+        if (result.page !== 5) throw new Error('wrong page');
+        // ch3.pptx is a filename, NOT a chunk_id — fallback must emit the
+        // synthetic <sourceId>:<page> sentinel that Reader strips.
+        if (result.highlightedId !== 'doc1:5') throw new Error(
+          'pptx filename leaked into highlightedId: ' + result.highlightedId);
+        // And a real chunk_id-shaped citation still parses.
+        const real = h.resolveCitationNavigation(
+          '[Source: ch3.pptx, p.5, chunk chunk_cs231n_abcd1234_00007]', sources);
+        if (real.highlightedId !== 'chunk_cs231n_abcd1234_00007')
+          throw new Error('real chunk_id misparsed: ' + real.highlightedId);
+        console.log('ok');
+        """
+    )
+    assert run_node(script).strip() == "ok"
+
+
 def test_should_preview_citation():
     """Pin the modal-vs-Reader routing predicate.
 
@@ -114,8 +144,16 @@ def test_should_preview_citation():
         const pdf = h.shouldPreviewCitation(pdfSrc);
         if (!pdf.canPreview) throw new Error('pdf source must preview');
         const pptx = h.shouldPreviewCitation(pptxSrc);
-        if (pptx.canPreview) throw new Error('pptx must fall through');
+        if (pptx.canPreview) throw new Error('pptx without sidecar must fall through');
         if (!pptx.reason.includes('PPTX')) throw new Error('pptx reason missing label');
+        // PPTX WITH sidecar (LibreOffice rendered at upload time) must
+        // be allowed to preview — /api/source/.../file serves the
+        // sidecar with mime=application/pdf so the iframe path works.
+        const pptxSidecar = {id:'a_c2', docId:'c2', courseId:'a',
+                             fileType:'pptx', viewableAsPdf:true};
+        const pptxOk = h.shouldPreviewCitation(pptxSidecar);
+        if (!pptxOk.canPreview) throw new Error(
+          'pptx with viewableAsPdf=true must preview, got: ' + JSON.stringify(pptxOk));
         const missing = h.shouldPreviewCitation(noDocId);
         if (missing.canPreview) throw new Error('missing docId must fall through');
         const missingCourse = h.shouldPreviewCitation(noCourseId);
@@ -357,6 +395,95 @@ def test_find_courses_with_cache_resurfaces_preset_work():
         if (JSON.stringify(found) !== JSON.stringify(want)) {
           throw new Error('expected ' + JSON.stringify(want) + ' got ' + JSON.stringify(found));
         }
+        console.log('ok');
+        """
+    )
+    assert run_node(script).strip() == "ok"
+
+
+def test_notes_toc_hidden_pref_persists_globally():
+    """R5-2 fix-all v4 #2: the user's "I find the TOC too noisy" pref
+    must survive a reload. Key is global (no course segment) so it
+    applies everywhere, mirroring backend / kg-legend-hidden."""
+    script = textwrap.dedent(
+        """
+        const h = require('./frontend/study-state.js');
+        const s = h.createMemoryStorage();
+        // Default: TOC visible (loadNotesTocHidden returns false).
+        if (h.loadNotesTocHidden(s) !== false) throw new Error('default should be visible');
+        h.saveNotesTocHidden(s, true);
+        if (h.loadNotesTocHidden(s) !== true) throw new Error('after save: hidden');
+        h.saveNotesTocHidden(s, false);
+        if (h.loadNotesTocHidden(s) !== false) throw new Error('after toggle: visible');
+        // Stored under the exact global key.
+        if (s.getItem('nano-nlm:v1:notes-toc-hidden') !== '0') {
+          throw new Error('expected global key, got: ' + JSON.stringify(s.dump()));
+        }
+        console.log('ok');
+        """
+    )
+    assert run_node(script).strip() == "ok"
+
+
+def test_pdf_outline_hidden_pref_defaults_to_hidden():
+    """R5-2 fix-all v4 #2: PDFium's bookmark/thumbnail pane is rarely
+    useful for short course slides, so we default HIDDEN — user opts in
+    via the floating toggle in Reader. Backward-compat: absent key OR
+    explicit "1" both hide; only "0" reveals."""
+    script = textwrap.dedent(
+        """
+        const h = require('./frontend/study-state.js');
+        const s = h.createMemoryStorage();
+        // Absent key → hidden.
+        if (h.loadPdfOutlineHidden(s) !== true) throw new Error('default should be hidden');
+        h.savePdfOutlineHidden(s, false);
+        if (h.loadPdfOutlineHidden(s) !== false) throw new Error('after reveal save: visible');
+        h.savePdfOutlineHidden(s, true);
+        if (h.loadPdfOutlineHidden(s) !== true) throw new Error('after hide save: hidden');
+        console.log('ok');
+        """
+    )
+    assert run_node(script).strip() == "ok"
+
+
+def test_source_file_url_appends_navpanes_zero_when_outline_hidden():
+    """Pin the fragment-shape contract so the Reader's PDF iframe always
+    gets `#navpanes=0` when the user collapses the outline, but never
+    smuggles the param in when they want the panes visible."""
+    script = textwrap.dedent(
+        """
+        // We test the API helper directly. Need to stub window since api.js
+        // is browser-flavoured; load via vm with a minimal globalThis fill.
+        const fs = require('fs');
+        const src = fs.readFileSync('./frontend/api.js', 'utf-8');
+        // Extract the sourceFileUrl function via a regex (simpler than vm).
+        const m = src.match(/sourceFileUrl\\([\\s\\S]+?\\n  \\},/);
+        if (!m) throw new Error('sourceFileUrl not found');
+        const fn = new Function('encodeURIComponent', 'Number',
+          `let frags=[]; const o = { sourceFileUrl${m[0].slice('sourceFileUrl'.length).replace(/,$/, '')} }; return o.sourceFileUrl;`);
+        const sourceFileUrl = fn(encodeURIComponent, Number);
+
+        // Neither flag → bare URL.
+        const a = sourceFileUrl('c', 'd');
+        if (a.includes('#')) throw new Error('bare URL must have no fragment: ' + a);
+
+        // Only page → page=N alone.
+        const b = sourceFileUrl('c', 'd', { page: 5 });
+        if (!b.endsWith('#page=5')) throw new Error('page-only frag wrong: ' + b);
+
+        // Only hideOutline → navpanes=0 alone.
+        const c = sourceFileUrl('c', 'd', { hideOutline: true });
+        if (!c.endsWith('#navpanes=0')) throw new Error('outline-only frag wrong: ' + c);
+
+        // Both → page=N&navpanes=0 in order.
+        const d = sourceFileUrl('c', 'd', { page: 5, hideOutline: true });
+        if (!d.endsWith('#page=5&navpanes=0')) throw new Error('both frags wrong: ' + d);
+
+        // hideOutline=false → no navpanes param (don't pin the user's
+        // existing PDFium UI preference).
+        const e = sourceFileUrl('c', 'd', { page: 5, hideOutline: false });
+        if (e.includes('navpanes')) throw new Error('false hideOutline must not append: ' + e);
+
         console.log('ok');
         """
     )

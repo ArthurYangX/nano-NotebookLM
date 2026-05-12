@@ -123,8 +123,17 @@ function DocumentTextBody({ doc, activePage, highlightedId, onCite, navEpoch }) 
 // PDF mode: hand the file off to the browser's native PDF viewer via
 // `<iframe>` + `#page=N` anchor. Avoids bundling pdf.js (~2MB) while still
 // getting search, zoom, scroll, and native rendering for free.
-function DocumentPdfFrame({ courseId, docId, sourceFile, activePage, navEpoch }) {
-  const url = API.sourceFileUrl(courseId, docId, { page: activePage });
+//
+// `outlineHidden` (R5-2 fix-all v4 #2): when truthy we append `#navpanes=0`
+// to suppress PDFium's bookmark/thumbnail side panel so the slide canvas
+// gets the full horizontal room. User can toggle via the small floating
+// "📑 索引" button in the Reader pane; pref persists via
+// StudyState.savePdfOutlineHidden.
+function DocumentPdfFrame({ courseId, docId, sourceFile, activePage, navEpoch, outlineHidden }) {
+  const url = API.sourceFileUrl(courseId, docId, {
+    page: activePage,
+    hideOutline: !!outlineHidden,
+  });
   const iframeRef = useRefR(null);
   const lastUrlRef = useRefR(null);
   // fix-all v1 M3: re-click on the same citation needs to re-jump the PDF,
@@ -194,6 +203,20 @@ function DocumentPdfFrame({ courseId, docId, sourceFile, activePage, navEpoch })
 }
 
 function Reader({ sources, activeCourse, activeId, activePage, onHighlight, highlightedId, onCite, notice, navEpoch }) {
+  // Persisted global preference: collapse PDFium's bookmarks/thumbnails
+  // side panel (default hidden — see StudyState.loadPdfOutlineHidden).
+  const [pdfOutlineHidden, setPdfOutlineHiddenRaw] = useStateR(
+    () => (typeof StudyState !== "undefined"
+      ? StudyState.loadPdfOutlineHidden(localStorage)
+      : true),
+  );
+  function togglePdfOutline() {
+    setPdfOutlineHiddenRaw(prev => {
+      const next = !prev;
+      try { StudyState.savePdfOutlineHidden(localStorage, next); } catch { /* private mode */ }
+      return next;
+    });
+  }
   const source = (sources || []).find(s => s.id === activeId) || (sources || [])[0];
 
   // Strip the `<sourceId>:<page>` synthetic ids that resolveCitationNavigation
@@ -272,7 +295,14 @@ function Reader({ sources, activeCourse, activeId, activePage, onHighlight, high
   }, [chunkData]);
 
   const showRealChunk = !!chunkData && !!chunkData.chunk;
-  const showPdfFrame = !showRealChunk && docData && docData.file_type === "pdf" && docData.file_available;
+  // viewable_as_pdf=true covers two cases: native pdf source files AND
+  // pptx files that LibreOffice rendered to a sidecar at upload time.
+  // The /api/source/.../file endpoint transparently returns the sidecar
+  // with mime=application/pdf, so the iframe path is identical.
+  const showPdfFrame = !showRealChunk && docData && docData.file_available && (
+    docData.viewable_as_pdf === true ||
+    (docData.file_type === "pdf" && docData.viewable_as_pdf !== false)
+  );
   const showTextDoc = !showRealChunk && !showPdfFrame && docData && (docData.chunks || []).length > 0;
   const showIntro = !showRealChunk && !showPdfFrame && !showTextDoc;
 
@@ -327,13 +357,25 @@ function Reader({ sources, activeCourse, activeId, activePage, onHighlight, high
         {showRealChunk && <ChunkBlock data={chunkData} />}
 
         {showPdfFrame && (
-          <DocumentPdfFrame
-            courseId={activeCourse}
-            docId={activeId}
-            sourceFile={docData.source_file}
-            activePage={activePage}
-            navEpoch={navEpoch}
-          />
+          <React.Fragment>
+            <button
+              className="pdf-outline-toggle mono"
+              onClick={togglePdfOutline}
+              title={pdfOutlineHidden
+                ? "显示 PDF 书签 / 缩略图侧栏"
+                : "隐藏 PDF 书签 / 缩略图侧栏"}
+            >
+              {pdfOutlineHidden ? "📑 显示索引" : "📑 隐藏索引"}
+            </button>
+            <DocumentPdfFrame
+              courseId={activeCourse}
+              docId={activeId}
+              sourceFile={docData.source_file}
+              activePage={activePage}
+              navEpoch={navEpoch}
+              outlineHidden={pdfOutlineHidden}
+            />
+          </React.Fragment>
         )}
 
         {showTextDoc && (

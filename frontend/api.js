@@ -294,11 +294,17 @@ const API = {
   // (null, NaN, "5; rm -rf /", Infinity) drops the fragment — defensive
   // belt against future callers that bypass `resolveCitationNavigation`
   // (which already pins `page` to a `Number(/[0-9]+/)` match).
-  sourceFileUrl(courseId, docId, { page = null } = {}) {
+  sourceFileUrl(courseId, docId, { page = null, hideOutline = false } = {}) {
+    // PDFium URL fragments stack — `#page=N&navpanes=0` jumps to page N and
+    // collapses the bookmarks/thumbnails side panel. `navpanes=1` shows it.
+    // We omit the `navpanes` part when `hideOutline` is unset so we don't
+    // override the user's PDF-viewer UI preference unnecessarily.
     const url = `/api/source/${encodeURIComponent(courseId)}/${encodeURIComponent(docId)}/file`;
+    const frags = [];
     const n = Number(page);
-    if (!Number.isInteger(n) || n < 1) return url;
-    return `${url}#page=${n}`;
+    if (Number.isInteger(n) && n >= 1) frags.push(`page=${n}`);
+    if (hideOutline) frags.push("navpanes=0");
+    return frags.length ? `${url}#${frags.join("&")}` : url;
   },
 
   async getStatus() {
