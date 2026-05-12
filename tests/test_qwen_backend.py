@@ -1,7 +1,14 @@
 """Round 4 #R4-5 — Qwen-RAFT remote backend contract tests.
 
 All tests are offline: ``httpx.AsyncClient`` is monkeypatched with a stub
-that records call args and returns canned ``data: [...]`` envelopes.
+that records call args and returns canned OpenAI chat-completion envelopes.
+
+History (R4-5 fix-all v3, 2026-05-12): rewritten to cover the OpenAI-
+compatible ``/v1/chat/completions`` protocol after the backend switched
+off the Gradio ``/api/predict`` route. The R4-5 part 2 integration tests
+at the bottom of the file (after the SSE block) are protocol-agnostic
+because they stub ``router.backends`` rather than the HTTP layer; they
+survived the protocol change unchanged.
 """
 
 from __future__ import annotations
@@ -10,6 +17,7 @@ import asyncio
 import json
 from typing import Any
 
+import httpx
 import pytest
 
 from nano_notebooklm.ai.qwen_raft_backend import (
@@ -32,20 +40,70 @@ class _StubResponse:
         return self._body or {}
 
 
-class _StubAsyncClient:
-    """Records POST/GET calls and returns the canned response chain.
+class _StubStreamingResponse:
+    """Mimics httpx's streaming Response inside ``client.stream(...)``.
 
-    ``responses`` is consumed in FIFO order. If you only pass one
-    response it's reused for every call (matches the common case where
-    the test just wants to assert one round-trip).
+    ``lines`` is the sequence of SSE lines yielded by ``aiter_lines()``;
+    callers pass full ``data: {...}`` strings (no trailing newlines).
     """
 
-    def __init__(self, *, responses: list[_StubResponse] | _StubResponse | None = None,
-                 raise_on_call: Exception | None = None):
+    def __init__(self, status_code: int, lines: list[str] | None = None,
+                 raise_on_iter: Exception | None = None):
+        self.status_code = status_code
+        self._lines = lines or []
+        self._raise_on_iter = raise_on_iter
+
+    async def aiter_lines(self):
+        if self._raise_on_iter is not None:
+            raise self._raise_on_iter
+        for line in self._lines:
+            yield line
+
+
+class _StreamContextManager:
+    """The object returned by ``client.stream(...)`` — an async context
+    manager whose ``__aenter__`` yields the streaming response. ``stream``
+    itself may also surface a transport error here (mirroring httpx's
+    behavior where connection failures raise on enter, not on construct)."""
+
+    def __init__(self, response: _StubStreamingResponse | None = None,
+                 raise_on_enter: Exception | None = None):
+        self._response = response
+        self._raise = raise_on_enter
+
+    async def __aenter__(self):
+        if self._raise is not None:
+            raise self._raise
+        return self._response
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+class _StubAsyncClient:
+    """Records POST/GET/stream calls and returns canned responses.
+
+    ``responses`` is consumed in FIFO order for post/get. If you only pass
+    one response it's reused for every call.
+
+    ``stream_response`` is a single (response, raise) pair used by
+    ``client.stream(...)``.
+    """
+
+    def __init__(
+        self,
+        *,
+        responses: list[_StubResponse] | _StubResponse | None = None,
+        raise_on_call: Exception | None = None,
+        stream_response: _StubStreamingResponse | None = None,
+        stream_raises: Exception | None = None,
+    ):
         if isinstance(responses, _StubResponse):
             responses = [responses]
         self._responses = list(responses or [])
         self._raise = raise_on_call
+        self._stream_response = stream_response
+        self._stream_raises = stream_raises
         self.calls: list[dict[str, Any]] = []
 
     async def __aenter__(self):
@@ -66,13 +124,22 @@ class _StubAsyncClient:
             raise self._raise
         return self._next_response()
 
+    def stream(self, method: str, url: str, *, json=None, headers=None, **kw):
+        self.calls.append({
+            "method": f"STREAM_{method}", "url": url, "json": json,
+            "headers": headers, **kw,
+        })
+        return _StreamContextManager(
+            response=self._stream_response, raise_on_enter=self._stream_raises,
+        )
+
     async def aclose(self):
         # No-op; cached-client design calls this on backend.aclose().
         return None
 
     def _next_response(self):
         if not self._responses:
-            return _StubResponse(200, {"data": ["fallback"]})
+            return _StubResponse(200, _chat_envelope("fallback"))
         if len(self._responses) == 1:
             return self._responses[0]
         return self._responses.pop(0)
@@ -87,6 +154,43 @@ def _install_stub(monkeypatch, stub: _StubAsyncClient):
     monkeypatch.setattr(httpx, "AsyncClient", _factory)
 
 
+def _chat_envelope(content: str, *, model: str = "Qwen2.5-7B-RAFT",
+                   prompt_tokens: int = 0, completion_tokens: int = 0) -> dict:
+    """Build a minimal OpenAI chat-completion JSON envelope."""
+    return {
+        "id": "chatcmpl-stub",
+        "object": "chat.completion",
+        "created": 1234567890,
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": content},
+            "finish_reason": "stop",
+        }],
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        },
+    }
+
+
+def _sse_chunk(delta: str) -> str:
+    """One SSE ``data:`` line carrying a chat-completion chunk."""
+    payload = {
+        "id": "chatcmpl-stub",
+        "object": "chat.completion.chunk",
+        "created": 1234567890,
+        "model": "Qwen2.5-7B-RAFT",
+        "choices": [{
+            "index": 0,
+            "delta": {"content": delta},
+            "finish_reason": None,
+        }],
+    }
+    return f"data: {json.dumps(payload)}"
+
+
 # ── configured / not_configured gate ───────────────────────────────
 
 
@@ -96,8 +200,21 @@ def test_qwen_backend_not_configured_when_url_empty():
 
 
 def test_qwen_backend_configured_when_url_set():
-    b = QwenRaftBackend(url="https://example.gradio.live", token="")
+    b = QwenRaftBackend(url="http://example.com:8001", token="")
     assert b.configured is True
+
+
+def test_qwen_backend_strips_trailing_v1_suffix():
+    """Operators may follow OpenAI convention and include /v1 in the URL.
+    The backend prepends /v1 itself, so we strip it to keep the health
+    probe pointing at /health (which is unversioned)."""
+    b = QwenRaftBackend(url="http://example.com:8001/v1", token="")
+    assert b.url == "http://example.com:8001"
+
+
+def test_qwen_backend_strips_trailing_slash():
+    b = QwenRaftBackend(url="http://example.com:8001/", token="")
+    assert b.url == "http://example.com:8001"
 
 
 @pytest.mark.asyncio
@@ -112,52 +229,80 @@ async def test_complete_raises_not_configured_when_url_empty():
 
 
 @pytest.mark.asyncio
-async def test_complete_posts_to_api_predict_with_data_envelope(monkeypatch):
-    stub = _StubAsyncClient(responses=_StubResponse(200, {"data": ["hello, world"], "duration": 0.42}))
+async def test_complete_posts_to_v1_chat_completions(monkeypatch):
+    stub = _StubAsyncClient(
+        responses=_StubResponse(200, _chat_envelope("hello, world",
+                                                    prompt_tokens=12,
+                                                    completion_tokens=4)),
+    )
     _install_stub(monkeypatch, stub)
 
-    b = QwenRaftBackend(url="https://example.gradio.live", token="t1", fn_index=0)
+    b = QwenRaftBackend(url="http://example.com:8001", token="t1")
     resp = await b.complete("hi", system="you are helpful")
 
     assert resp.content == "hello, world"
-    assert resp.model == "qwen2.5-7b-raft"
+    assert resp.model == "Qwen2.5-7B-RAFT"
+    assert resp.input_tokens == 12
+    assert resp.output_tokens == 4
     assert resp.latency_ms >= 0
-    # One POST to /api/predict.
+
+    # One POST to /v1/chat/completions.
     assert len(stub.calls) == 1
     call = stub.calls[0]
     assert call["method"] == "POST"
-    assert call["url"] == "https://example.gradio.live/api/predict"
-    # Body wraps prompt+system into a single string under data[0].
-    assert isinstance(call["json"], dict)
-    assert call["json"].get("fn_index") == 0
-    data = call["json"].get("data")
-    assert isinstance(data, list) and len(data) == 1
-    assert "you are helpful" in data[0]
-    assert "hi" in data[0]
+    assert call["url"] == "http://example.com:8001/v1/chat/completions"
+
+    # Body is the OpenAI envelope — model + messages list, no Gradio fields.
+    body = call["json"]
+    assert isinstance(body, dict)
+    assert "fn_index" not in body
+    assert "data" not in body
+    assert body["model"] == "qwen2.5-7b-raft"   # config default
+    assert body["stream"] is False
+
+    msgs = body["messages"]
+    assert msgs == [
+        {"role": "system", "content": "you are helpful"},
+        {"role": "user", "content": "hi"},
+    ]
+
     # Authorization header threaded through.
     assert call["headers"].get("Authorization") == "Bearer t1"
+    assert call["headers"].get("Content-Type") == "application/json"
 
 
 @pytest.mark.asyncio
-async def test_complete_accepts_chatbot_history_response_shape(monkeypatch):
-    """Some Gradio chatbots emit data as [[[user, assistant], ...]] instead
-    of a bare string. The backend unwraps the last assistant turn."""
-    history = [["hi", "hello back"], ["wassup", "all good thanks"]]
-    stub = _StubAsyncClient(responses=_StubResponse(200, {"data": [history]}))
+async def test_complete_omits_system_when_empty(monkeypatch):
+    """No system prompt → messages list contains only the user turn."""
+    stub = _StubAsyncClient(responses=_StubResponse(200, _chat_envelope("ok")))
     _install_stub(monkeypatch, stub)
-
-    b = QwenRaftBackend(url="https://example.gradio.live")
-    resp = await b.complete("doesn't matter")
-    assert resp.content == "all good thanks"
+    b = QwenRaftBackend(url="http://example.com:8001")
+    await b.complete("just user")
+    msgs = stub.calls[0]["json"]["messages"]
+    assert msgs == [{"role": "user", "content": "just user"}]
 
 
 @pytest.mark.asyncio
-async def test_complete_accepts_dict_message_shape(monkeypatch):
-    stub = _StubAsyncClient(responses=_StubResponse(200, {"data": [{"content": "from dict"}]}))
+async def test_complete_passes_temperature_and_max_tokens(monkeypatch):
+    """Unlike the previous Gradio backend, temperature + max_tokens
+    actually round-trip to the upstream sampler."""
+    stub = _StubAsyncClient(responses=_StubResponse(200, _chat_envelope("ok")))
     _install_stub(monkeypatch, stub)
-    b = QwenRaftBackend(url="https://example.gradio.live")
-    resp = await b.complete("hi")
-    assert resp.content == "from dict"
+    b = QwenRaftBackend(url="http://example.com:8001")
+    await b.complete("hi", temperature=0.42, max_tokens=999)
+    body = stub.calls[0]["json"]
+    assert body["temperature"] == 0.42
+    assert body["max_tokens"] == 999
+
+
+@pytest.mark.asyncio
+async def test_complete_strips_v1_suffix_so_chat_url_resolves(monkeypatch):
+    """URL with trailing /v1 should not produce //v1/v1/chat/completions."""
+    stub = _StubAsyncClient(responses=_StubResponse(200, _chat_envelope("ok")))
+    _install_stub(monkeypatch, stub)
+    b = QwenRaftBackend(url="http://example.com:8001/v1")
+    await b.complete("hi")
+    assert stub.calls[0]["url"] == "http://example.com:8001/v1/chat/completions"
 
 
 # ── error paths ────────────────────────────────────────────────────
@@ -168,7 +313,7 @@ async def test_complete_raises_timeout_code_on_httpx_timeout(monkeypatch):
     import httpx
     stub = _StubAsyncClient(raise_on_call=httpx.TimeoutException("slow"))
     _install_stub(monkeypatch, stub)
-    b = QwenRaftBackend(url="https://example.gradio.live", timeout=0.1)
+    b = QwenRaftBackend(url="http://example.com:8001", timeout=0.1)
     with pytest.raises(QwenBackendError) as ei:
         await b.complete("hi")
     assert ei.value.code == "timeout"
@@ -179,7 +324,7 @@ async def test_complete_raises_transport_failed_on_connection_error(monkeypatch)
     import httpx
     stub = _StubAsyncClient(raise_on_call=httpx.ConnectError("refused"))
     _install_stub(monkeypatch, stub)
-    b = QwenRaftBackend(url="https://example.gradio.live")
+    b = QwenRaftBackend(url="http://example.com:8001")
     with pytest.raises(QwenBackendError) as ei:
         await b.complete("hi")
     assert ei.value.code == "transport_failed"
@@ -189,28 +334,60 @@ async def test_complete_raises_transport_failed_on_connection_error(monkeypatch)
 async def test_complete_raises_upstream_5xx_on_server_error(monkeypatch):
     stub = _StubAsyncClient(responses=_StubResponse(503, {"error": "model loading"}))
     _install_stub(monkeypatch, stub)
-    b = QwenRaftBackend(url="https://example.gradio.live")
+    b = QwenRaftBackend(url="http://example.com:8001")
     with pytest.raises(QwenBackendError) as ei:
         await b.complete("hi")
     assert ei.value.code == "upstream_5xx"
 
 
 @pytest.mark.asyncio
-async def test_complete_raises_empty_response_when_data_missing(monkeypatch):
-    stub = _StubAsyncClient(responses=_StubResponse(200, {"data": []}))
+async def test_complete_raises_upstream_4xx_on_client_error(monkeypatch):
+    stub = _StubAsyncClient(responses=_StubResponse(422, {"error": "bad request"}))
     _install_stub(monkeypatch, stub)
-    b = QwenRaftBackend(url="https://example.gradio.live")
+    b = QwenRaftBackend(url="http://example.com:8001")
+    with pytest.raises(QwenBackendError) as ei:
+        await b.complete("hi")
+    assert ei.value.code == "upstream_4xx"
+
+
+@pytest.mark.asyncio
+async def test_complete_raises_empty_response_when_choices_missing(monkeypatch):
+    stub = _StubAsyncClient(responses=_StubResponse(200, {"choices": []}))
+    _install_stub(monkeypatch, stub)
+    b = QwenRaftBackend(url="http://example.com:8001")
     with pytest.raises(QwenBackendError) as ei:
         await b.complete("hi")
     assert ei.value.code == "empty_response"
 
 
 @pytest.mark.asyncio
-async def test_qwen_backend_error_does_not_leak_url_in_message():
+async def test_complete_raises_empty_response_when_body_not_dict(monkeypatch):
+    # Body that JSON-decodes to a non-dict (a bare list) → empty_response,
+    # not malformed_response. The latter is reserved for actual JSON parse
+    # failures upstream of the shape check.
+    stub = _StubAsyncClient(responses=_StubResponse(200, "[1, 2, 3]"))
+    _install_stub(monkeypatch, stub)
+    b = QwenRaftBackend(url="http://example.com:8001")
+    with pytest.raises(QwenBackendError) as ei:
+        await b.complete("hi")
+    assert ei.value.code == "empty_response"
+
+
+@pytest.mark.asyncio
+async def test_complete_raises_malformed_response_on_invalid_json(monkeypatch):
+    stub = _StubAsyncClient(responses=_StubResponse(200, "not-valid-json"))
+    _install_stub(monkeypatch, stub)
+    b = QwenRaftBackend(url="http://example.com:8001")
+    with pytest.raises(QwenBackendError) as ei:
+        await b.complete("hi")
+    assert ei.value.code == "malformed_response"
+
+
+def test_qwen_backend_error_does_not_leak_url_in_code():
     """fix-all v4 #A3 discipline applied to qwen too: the stable code
     must be exposed but the error str() (which goes to client through
     the error event) must not echo the secret URL."""
-    err = QwenBackendError("timeout", "https://secret.gradio.live failed to respond")
+    err = QwenBackendError("timeout", "http://secret.host:8001 failed")
     # `code` is the API-visible identifier; the human message lives in
     # str(err) and only goes to server log (caller in api/server.py
     # must NOT echo str(err) into the response body, see fix-all v4 #A3).
@@ -228,13 +405,44 @@ async def test_health_check_returns_not_configured_when_url_empty():
 
 
 @pytest.mark.asyncio
-async def test_health_check_returns_ok_on_200(monkeypatch):
-    stub = _StubAsyncClient(responses=_StubResponse(200))
+async def test_health_check_returns_ok_when_model_loaded(monkeypatch):
+    # M5 (review-swarm 2026-05-12): the success envelope must NOT echo
+    # upstream body.model — a misbehaving AutoDL host could otherwise
+    # smuggle a filesystem path or fingerprint to /api/status. Backend
+    # always surfaces the operator-configured model_name instead.
+    stub = _StubAsyncClient(
+        responses=_StubResponse(200, {
+            "ok": True, "model": "/etc/passwd",  # adversarial upstream string
+            "device": "cuda", "loaded": True,
+        }),
+    )
     _install_stub(monkeypatch, stub)
-    b = QwenRaftBackend(url="https://example.gradio.live")
+    b = QwenRaftBackend(url="http://example.com:8001")
     h = await b.health_check()
     assert h["ok"] is True
     assert h["status"] == 200
+    # Operator-configured value wins; upstream malicious string never surfaced.
+    assert h["model"] == "qwen2.5-7b-raft"
+    assert "/etc/passwd" not in str(h)
+    # Probed /health, not /.
+    assert stub.calls[0]["url"] == "http://example.com:8001/health"
+
+
+@pytest.mark.asyncio
+async def test_health_check_returns_model_not_loaded_during_warmup(monkeypatch):
+    """serve_openai.py returns loaded=False during the ~20-30s startup
+    window. Frontend should be able to show a distinct 'warming up' chip."""
+    stub = _StubAsyncClient(
+        responses=_StubResponse(200, {
+            "ok": True, "model": "Qwen2.5-7B-RAFT",
+            "device": "cuda", "loaded": False,
+        }),
+    )
+    _install_stub(monkeypatch, stub)
+    b = QwenRaftBackend(url="http://example.com:8001")
+    h = await b.health_check()
+    assert h["ok"] is False
+    assert h["reason"] == "model_not_loaded"
 
 
 @pytest.mark.asyncio
@@ -242,7 +450,7 @@ async def test_health_check_returns_unreachable_on_exception(monkeypatch):
     import httpx
     stub = _StubAsyncClient(raise_on_call=httpx.ConnectError("nope"))
     _install_stub(monkeypatch, stub)
-    b = QwenRaftBackend(url="https://example.gradio.live")
+    b = QwenRaftBackend(url="http://example.com:8001")
     h = await b.health_check()
     assert h["ok"] is False
     assert h["reason"] == "unreachable"
@@ -253,10 +461,20 @@ async def test_health_check_returns_timeout_on_httpx_timeout(monkeypatch):
     import httpx
     stub = _StubAsyncClient(raise_on_call=httpx.TimeoutException("slow"))
     _install_stub(monkeypatch, stub)
-    b = QwenRaftBackend(url="https://example.gradio.live")
+    b = QwenRaftBackend(url="http://example.com:8001")
     h = await b.health_check()
     assert h["ok"] is False
     assert h["reason"] == "timeout"
+
+
+@pytest.mark.asyncio
+async def test_health_check_returns_unreachable_on_non_2xx(monkeypatch):
+    stub = _StubAsyncClient(responses=_StubResponse(500))
+    _install_stub(monkeypatch, stub)
+    b = QwenRaftBackend(url="http://example.com:8001")
+    h = await b.health_check()
+    assert h["ok"] is False
+    assert h["reason"] == "unreachable"
 
 
 # ── complete_structured best-effort ────────────────────────────────
@@ -264,9 +482,11 @@ async def test_health_check_returns_timeout_on_httpx_timeout(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_complete_structured_returns_dict_on_clean_json(monkeypatch):
-    stub = _StubAsyncClient(responses=_StubResponse(200, {"data": ['{"answer": "yes"}']}))
+    stub = _StubAsyncClient(
+        responses=_StubResponse(200, _chat_envelope('{"answer": "yes"}')),
+    )
     _install_stub(monkeypatch, stub)
-    b = QwenRaftBackend(url="https://example.gradio.live")
+    b = QwenRaftBackend(url="http://example.com:8001")
     out = await b.complete_structured("ask")
     assert out == {"answer": "yes"}
 
@@ -274,42 +494,387 @@ async def test_complete_structured_returns_dict_on_clean_json(monkeypatch):
 @pytest.mark.asyncio
 async def test_complete_structured_strips_code_fence(monkeypatch):
     fenced = "```json\n{\"answer\": \"with fence\"}\n```"
-    stub = _StubAsyncClient(responses=_StubResponse(200, {"data": [fenced]}))
+    stub = _StubAsyncClient(responses=_StubResponse(200, _chat_envelope(fenced)))
     _install_stub(monkeypatch, stub)
-    b = QwenRaftBackend(url="https://example.gradio.live")
+    b = QwenRaftBackend(url="http://example.com:8001")
     out = await b.complete_structured("ask")
     assert out == {"answer": "with fence"}
 
 
 @pytest.mark.asyncio
 async def test_complete_structured_returns_error_dict_on_non_json(monkeypatch):
-    stub = _StubAsyncClient(responses=_StubResponse(200, {"data": ["plain prose not json"]}))
+    stub = _StubAsyncClient(
+        responses=_StubResponse(200, _chat_envelope("plain prose not json")),
+    )
     _install_stub(monkeypatch, stub)
-    b = QwenRaftBackend(url="https://example.gradio.live")
+    b = QwenRaftBackend(url="http://example.com:8001")
     out = await b.complete_structured("ask")
     assert out["error"] == "non_json_output"
     assert out["raw"].startswith("plain prose")
 
 
-# ── complete_stream falls back to single chunk ─────────────────────
+# ── complete_stream (real SSE) ─────────────────────────────────────
 
 
 @pytest.mark.asyncio
-async def test_complete_stream_yields_full_content_as_one_chunk(monkeypatch):
-    stub = _StubAsyncClient(responses=_StubResponse(200, {"data": ["streamed once"]}))
+async def test_complete_stream_yields_per_chunk_deltas(monkeypatch):
+    """Real streaming: each ``data: {...}`` line produces one yielded
+    delta. The ``[DONE]`` terminator ends the stream."""
+    lines = [
+        _sse_chunk("Hel"),
+        "",                          # SSE blank-line separator → ignored
+        _sse_chunk("lo, "),
+        _sse_chunk("world"),
+        "data: [DONE]",
+    ]
+    stub = _StubAsyncClient(
+        stream_response=_StubStreamingResponse(200, lines=lines),
+    )
     _install_stub(monkeypatch, stub)
-    b = QwenRaftBackend(url="https://example.gradio.live")
+
+    b = QwenRaftBackend(url="http://example.com:8001")
     chunks = []
     async for delta in b.complete_stream("hi"):
         chunks.append(delta)
-    assert chunks == ["streamed once"]
+    assert chunks == ["Hel", "lo, ", "world"]
+
+    # One streaming POST to /v1/chat/completions with stream=True.
+    assert len(stub.calls) == 1
+    call = stub.calls[0]
+    assert call["method"] == "STREAM_POST"
+    assert call["url"] == "http://example.com:8001/v1/chat/completions"
+    assert call["json"]["stream"] is True
+
+
+@pytest.mark.asyncio
+async def test_complete_stream_skips_empty_deltas(monkeypatch):
+    """Final chunks often have ``delta: {}`` (no content, just finish_reason).
+    The backend must not yield empty strings — that would pollute the
+    NDJSON stream with zero-length chunks."""
+    empty_final = json.dumps({
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+    })
+    lines = [
+        _sse_chunk("real"),
+        f"data: {empty_final}",
+        "data: [DONE]",
+    ]
+    stub = _StubAsyncClient(
+        stream_response=_StubStreamingResponse(200, lines=lines),
+    )
+    _install_stub(monkeypatch, stub)
+    b = QwenRaftBackend(url="http://example.com:8001")
+    chunks = [c async for c in b.complete_stream("hi")]
+    assert chunks == ["real"]
+
+
+@pytest.mark.asyncio
+async def test_complete_stream_ignores_malformed_chunk(monkeypatch):
+    """A single malformed ``data:`` line should not abort the whole
+    stream — log + skip, keep yielding good chunks."""
+    lines = [
+        _sse_chunk("good"),
+        "data: not-valid-json",
+        _sse_chunk("more"),
+        "data: [DONE]",
+    ]
+    stub = _StubAsyncClient(
+        stream_response=_StubStreamingResponse(200, lines=lines),
+    )
+    _install_stub(monkeypatch, stub)
+    b = QwenRaftBackend(url="http://example.com:8001")
+    chunks = [c async for c in b.complete_stream("hi")]
+    assert chunks == ["good", "more"]
+
+
+@pytest.mark.asyncio
+async def test_complete_stream_raises_upstream_5xx_before_first_chunk(monkeypatch):
+    stub = _StubAsyncClient(
+        stream_response=_StubStreamingResponse(503, lines=[]),
+    )
+    _install_stub(monkeypatch, stub)
+    b = QwenRaftBackend(url="http://example.com:8001")
+    with pytest.raises(QwenBackendError) as ei:
+        async for _ in b.complete_stream("hi"):
+            pass
+    assert ei.value.code == "upstream_5xx"
+
+
+@pytest.mark.asyncio
+async def test_complete_stream_raises_not_configured_when_url_empty():
+    b = QwenRaftBackend(url="")
+    with pytest.raises(QwenBackendError) as ei:
+        async for _ in b.complete_stream("hi"):
+            pass
+    assert ei.value.code == "not_configured"
+
+
+@pytest.mark.asyncio
+async def test_complete_stream_terminates_without_done_marker(monkeypatch):
+    """If the upstream forgets to emit ``[DONE]`` (e.g. connection closes
+    cleanly mid-stream), we should still terminate cleanly when the
+    iterator exhausts — not hang forever."""
+    lines = [_sse_chunk("partial"), _sse_chunk(" only")]
+    stub = _StubAsyncClient(
+        stream_response=_StubStreamingResponse(200, lines=lines),
+    )
+    _install_stub(monkeypatch, stub)
+    b = QwenRaftBackend(url="http://example.com:8001")
+    chunks = [c async for c in b.complete_stream("hi")]
+    assert chunks == ["partial", " only"]
+
+
+# ══════════════════════════════════════════════════════════════════════
+# R4-5 fix-all v3 review-swarm follow-up (2026-05-12)
+# Coverage for H1 / M1 / M3+L1 / M4 / M5 / L2 / L3 / L4 / L5 findings.
+# ══════════════════════════════════════════════════════════════════════
+
+
+# ── H1: legacy gradio.live URL warns at __init__ ────────────────────
+
+
+def test_qwen_backend_warns_on_legacy_gradio_host(caplog):
+    """Operators upgrading in-place with QWEN_RAFT_URL pointing at the
+    old Gradio service must see a warning — otherwise every chat
+    silently falls back to codex with no log hint."""
+    import logging as _logging
+    with caplog.at_level(_logging.WARNING, logger="nano_notebooklm.ai.qwen_raft_backend"):
+        QwenRaftBackend(url="https://your-autodl.gradio.live")
+    msgs = [r.message for r in caplog.records]
+    assert any("gradio" in m.lower() for m in msgs), \
+        f"expected legacy-gradio warning, got: {msgs}"
+
+
+def test_qwen_backend_does_not_warn_on_serve_openai_host(caplog):
+    """A normal serve_openai.py host must NOT trigger the warning."""
+    import logging as _logging
+    with caplog.at_level(_logging.WARNING, logger="nano_notebooklm.ai.qwen_raft_backend"):
+        QwenRaftBackend(url="http://autodl-host.example:8001")
+    msgs = [r.message for r in caplog.records]
+    assert not any("gradio" in m.lower() for m in msgs), \
+        f"unexpected gradio warning on non-gradio host: {msgs}"
+
+
+# ── M1: empty / whitespace content triggers empty_response ───────────
+
+
+@pytest.mark.asyncio
+async def test_complete_raises_empty_response_on_empty_content(monkeypatch):
+    """A blank `message.content` (Qwen safety filter rejection,
+    max_tokens=1 truncation) must trigger empty_response so the
+    qwen→codex fallback chain in qa_skill fires."""
+    stub = _StubAsyncClient(responses=_StubResponse(200, _chat_envelope("")))
+    _install_stub(monkeypatch, stub)
+    b = QwenRaftBackend(url="http://example.com:8001")
+    with pytest.raises(QwenBackendError) as ei:
+        await b.complete("hi")
+    assert ei.value.code == "empty_response"
+
+
+@pytest.mark.asyncio
+async def test_complete_raises_empty_response_on_whitespace_content(monkeypatch):
+    stub = _StubAsyncClient(
+        responses=_StubResponse(200, _chat_envelope("   \n\t  ")),
+    )
+    _install_stub(monkeypatch, stub)
+    b = QwenRaftBackend(url="http://example.com:8001")
+    with pytest.raises(QwenBackendError) as ei:
+        await b.complete("hi")
+    assert ei.value.code == "empty_response"
+
+
+# ── M3 + L1: stream error attribution + logs ─────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_complete_stream_raises_transport_failed_on_connect_error(
+    monkeypatch, caplog,
+):
+    """ConnectError at stream-open should map to transport_failed (parity
+    with complete()), not stream_failed."""
+    import logging as _logging
+    stub = _StubAsyncClient(stream_raises=httpx.ConnectError("refused"))
+    _install_stub(monkeypatch, stub)
+    b = QwenRaftBackend(url="http://example.com:8001")
+    with caplog.at_level(_logging.WARNING, logger="nano_notebooklm.ai.qwen_raft_backend"):
+        with pytest.raises(QwenBackendError) as ei:
+            async for _ in b.complete_stream("hi"):
+                pass
+    assert ei.value.code == "transport_failed"
+    # Log line carries the exception class name (not str(exc)) per PII rule.
+    msgs = [r.message for r in caplog.records]
+    assert any("transport_failed" in m for m in msgs), msgs
+    # The bare token "refused" (str(exc)) must NOT have been formatted in.
+    assert not any("refused" in m for m in msgs), msgs
+
+
+@pytest.mark.asyncio
+async def test_complete_stream_raises_timeout_on_mid_stream_timeout(
+    monkeypatch, caplog,
+):
+    """A stall during aiter_lines (slow first-token on cold GPU) must
+    map to timeout, not stream_failed."""
+    import logging as _logging
+    stub = _StubAsyncClient(
+        stream_response=_StubStreamingResponse(
+            200, raise_on_iter=httpx.ReadTimeout("stalled"),
+        ),
+    )
+    _install_stub(monkeypatch, stub)
+    b = QwenRaftBackend(url="http://example.com:8001")
+    with caplog.at_level(_logging.WARNING, logger="nano_notebooklm.ai.qwen_raft_backend"):
+        with pytest.raises(QwenBackendError) as ei:
+            async for _ in b.complete_stream("hi"):
+                pass
+    assert ei.value.code == "timeout"
+    msgs = [r.message for r in caplog.records]
+    assert any("timeout" in m for m in msgs), msgs
+
+
+@pytest.mark.asyncio
+async def test_complete_stream_raises_stream_failed_on_remote_protocol_error(
+    monkeypatch, caplog,
+):
+    """Mid-stream connection drop (server killed connection ungracefully)
+    must map to stream_failed."""
+    import logging as _logging
+    stub = _StubAsyncClient(
+        stream_response=_StubStreamingResponse(
+            200, raise_on_iter=httpx.RemoteProtocolError("conn lost mid-stream"),
+        ),
+    )
+    _install_stub(monkeypatch, stub)
+    b = QwenRaftBackend(url="http://example.com:8001")
+    with caplog.at_level(_logging.WARNING, logger="nano_notebooklm.ai.qwen_raft_backend"):
+        with pytest.raises(QwenBackendError) as ei:
+            async for _ in b.complete_stream("hi"):
+                pass
+    assert ei.value.code == "stream_failed"
+    msgs = [r.message for r in caplog.records]
+    assert any("stream_failed" in m for m in msgs), msgs
+    # PII rule: str(exc) "conn lost mid-stream" must not be in the log.
+    assert not any("conn lost" in m for m in msgs), msgs
+
+
+# ── M4: health 200 with malformed JSON body ──────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_health_check_returns_unreachable_on_malformed_json(monkeypatch):
+    """If QWEN_RAFT_URL accidentally points at an HTML page (wrong port,
+    proxy default page), /health returns 200 but the body isn't JSON.
+    Must surface as unreachable so the chip greys out."""
+    stub = _StubAsyncClient(
+        responses=_StubResponse(200, "<html>nginx default page</html>"),
+    )
+    _install_stub(monkeypatch, stub)
+    b = QwenRaftBackend(url="http://example.com:8001")
+    h = await b.health_check()
+    assert h["ok"] is False
+    assert h["reason"] == "unreachable"
+    assert h["status"] == 200
+
+
+# ── M4: streaming Auth header round-trip ─────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_complete_stream_passes_authorization_header(monkeypatch):
+    """If QWEN_RAFT_TOKEN is set, complete_stream() must include the
+    bearer header just like complete() does — easy to miss in a future
+    refactor that factors header construction into complete() only."""
+    lines = [_sse_chunk("ok"), "data: [DONE]"]
+    stub = _StubAsyncClient(
+        stream_response=_StubStreamingResponse(200, lines=lines),
+    )
+    _install_stub(monkeypatch, stub)
+    b = QwenRaftBackend(url="http://example.com:8001", token="bearer-stub")
+    chunks = [c async for c in b.complete_stream("hi")]
+    assert chunks == ["ok"]
+    # Streaming call recorded with the auth header.
+    call = stub.calls[0]
+    assert call["method"] == "STREAM_POST"
+    assert call["headers"].get("Authorization") == "Bearer bearer-stub"
+
+
+# ── L4: health loaded missing → fail-closed model_not_loaded ─────────
+
+
+@pytest.mark.asyncio
+async def test_health_check_treats_missing_loaded_as_not_loaded(monkeypatch):
+    """If a future serve_openai.py version drops the `loaded` field, we
+    default to False (fail-closed) so the operator sees the schema gap
+    via the model_not_loaded chip state instead of a falsely-green light."""
+    stub = _StubAsyncClient(
+        responses=_StubResponse(200, {"ok": True, "model": "qwen2.5-7b-raft"}),
+    )
+    _install_stub(monkeypatch, stub)
+    b = QwenRaftBackend(url="http://example.com:8001")
+    h = await b.health_check()
+    assert h["ok"] is False
+    assert h["reason"] == "model_not_loaded"
+
+
+# ── L5: SSE Accept header on stream path ─────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_complete_stream_sends_sse_accept_header(monkeypatch):
+    """Per the SSE spec, the client should declare Accept: text/event-stream
+    so strict reverse-proxies don't downgrade to application/json."""
+    lines = [_sse_chunk("ok"), "data: [DONE]"]
+    stub = _StubAsyncClient(
+        stream_response=_StubStreamingResponse(200, lines=lines),
+    )
+    _install_stub(monkeypatch, stub)
+    b = QwenRaftBackend(url="http://example.com:8001")
+    _ = [c async for c in b.complete_stream("hi")]
+    call = stub.calls[0]
+    assert call["headers"].get("Accept") == "text/event-stream"
+
+
+@pytest.mark.asyncio
+async def test_complete_non_stream_keeps_json_accept_header(monkeypatch):
+    """Non-streaming path keeps Accept: application/json — only the SSE
+    path overrides."""
+    stub = _StubAsyncClient(responses=_StubResponse(200, _chat_envelope("ok")))
+    _install_stub(monkeypatch, stub)
+    b = QwenRaftBackend(url="http://example.com:8001")
+    await b.complete("hi")
+    call = stub.calls[0]
+    assert call["headers"].get("Accept") == "application/json"
+
+
+# ── L3: _get_client serializes concurrent cold-start callers ─────────
+
+
+@pytest.mark.asyncio
+async def test_get_client_lock_serializes_cold_start(monkeypatch):
+    """Two coroutines hitting complete() simultaneously before any client
+    exists must not each construct an AsyncClient — the loser would leak
+    its 100-connection pool until process exit."""
+    import httpx as _httpx
+    construct_count = {"n": 0}
+    stub = _StubAsyncClient(responses=_StubResponse(200, _chat_envelope("ok")))
+
+    def _factory(*a, **kw):
+        construct_count["n"] += 1
+        return stub
+
+    monkeypatch.setattr(_httpx, "AsyncClient", _factory)
+    b = QwenRaftBackend(url="http://example.com:8001")
+    # Fire two concurrent complete() calls; both observe self._client is None.
+    await asyncio.gather(b.complete("a"), b.complete("b"))
+    assert construct_count["n"] == 1, \
+        f"expected 1 AsyncClient construction under lock, got {construct_count['n']}"
 
 
 # ══════════════════════════════════════════════════════════════════════
 # R4-5 part 2 integration tests — wire QwenRaftBackend into /api/chat,
 # /api/status, ChatRequest Literal, and the qwen→codex fallback chain.
 # All use the FastAPI TestClient + monkeypatch router.backends so no
-# real HTTP or LLM is touched.
+# real HTTP or LLM is touched. Protocol-agnostic — these survived the
+# Gradio → OpenAI switch unchanged.
 # ══════════════════════════════════════════════════════════════════════
 
 
@@ -320,7 +885,7 @@ from fastapi.testclient import TestClient
 from nano_notebooklm.types import LLMResponse
 
 
-def _build_chat_client(monkeypatch, tmp_path, *, qwen_url="https://qwen.example",
+def _build_chat_client(monkeypatch, tmp_path, *, qwen_url="http://qwen.example:8001",
                       fake_embed_fn=None):
     """Stand up /api/chat against an isolated artifacts dir with both
     backends configured. Returns (TestClient, server_mod). Callers can
@@ -568,6 +1133,7 @@ def test_chat_with_no_backend_uses_default_routing(monkeypatch, tmp_path):
 
 # ══════════════════════════════════════════════════════════════════════
 # R4-5 fix-all v2 (review-swarm follow-up) — cached httpx.AsyncClient.
+# Body shapes updated for OpenAI chat-completion envelope (fix-all v3).
 # ══════════════════════════════════════════════════════════════════════
 
 
@@ -579,9 +1145,7 @@ async def test_qwen_client_is_reused_across_calls(monkeypatch):
     import httpx
 
     construct_count = {"n": 0}
-    stub = _StubAsyncClient(
-        responses=_StubResponse(200, {"data": ["ok"]})
-    )
+    stub = _StubAsyncClient(responses=_StubResponse(200, _chat_envelope("ok")))
 
     def _factory(*a, **kw):
         construct_count["n"] += 1
@@ -589,7 +1153,7 @@ async def test_qwen_client_is_reused_across_calls(monkeypatch):
 
     monkeypatch.setattr(httpx, "AsyncClient", _factory)
 
-    b = QwenRaftBackend(url="https://example.gradio.live")
+    b = QwenRaftBackend(url="http://example.com:8001")
     # First call → constructs the cached client.
     await b.complete("hi")
     first = b._client
@@ -601,7 +1165,8 @@ async def test_qwen_client_is_reused_across_calls(monkeypatch):
     assert b._client is first
     assert construct_count["n"] == 1
 
-    # health_check shares the same cached client.
+    # health_check shares the same cached client. (use a /health body)
+    stub._responses = [_StubResponse(200, {"ok": True, "loaded": True})]
     await b.health_check()
     assert b._client is first
     assert construct_count["n"] == 1
@@ -615,7 +1180,7 @@ async def test_qwen_aclose_releases_cached_client(monkeypatch):
     import httpx
 
     construct_count = {"n": 0}
-    stub = _StubAsyncClient(responses=_StubResponse(200, {"data": ["ok"]}))
+    stub = _StubAsyncClient(responses=_StubResponse(200, _chat_envelope("ok")))
 
     def _factory(*a, **kw):
         construct_count["n"] += 1
@@ -623,7 +1188,7 @@ async def test_qwen_aclose_releases_cached_client(monkeypatch):
 
     monkeypatch.setattr(httpx, "AsyncClient", _factory)
 
-    b = QwenRaftBackend(url="https://example.gradio.live")
+    b = QwenRaftBackend(url="http://example.com:8001")
     await b.complete("hi")
     assert construct_count["n"] == 1
     await b.aclose()
