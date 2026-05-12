@@ -234,6 +234,79 @@ function App() {
     StudyState.clearHiddenCourses(localStorage);
     setHiddenCourseIds([]);
   }
+
+  // R5-2 fix-all v3: hard-delete a course (artifacts + indices + per-course
+  // localStorage cache). User-driven only — invoked from the "管理" modal
+  // after a `window.confirm` (we hold a 2-step confirm for safety: first
+  // confirm the action, then require the user to type the course name).
+  // Side effects:
+  //   1. Backend DELETE /api/courses/{cid} rmtrees artifacts/courses/<cid>/
+  //      + per-course indices, then rebuilds global index.
+  //   2. Frontend clears every `nano-nlm:v1:<cid>:*` key so the resurfacing
+  //      helper (findCoursesWithCache) doesn't immediately re-add the
+  //      course on the next mount.
+  //   3. Drops the course from `courses` state; if it was active, falls
+  //      back to the first remaining visible course (or null = All).
+  async function handleDeleteCourse(courseId) {
+    if (!courseId) return;
+    const step1 = window.confirm(
+      `彻底删除课程 "${courseId}"？\n\n` +
+      `这会移除：\n` +
+      ` - artifacts/courses/${courseId}/  (chunks / KG / notes / quizzes / exam bank)\n` +
+      ` - 该课程的 FAISS + BM25 索引\n` +
+      ` - 浏览器中该课程的所有 localStorage 缓存\n\n` +
+      `该操作不可撤销。若是预置课程，删除后无法回滚（rollback hatch 失效）。`
+    );
+    if (!step1) return;
+    const typed = window.prompt(
+      `再次确认：请输入完整课程 ID（区分大小写）以执行删除：\n${courseId}`
+    );
+    if (typed == null) return;
+    if (typed.trim() !== courseId) {
+      alert(`输入不匹配：你输入了 "${typed}" 但期望 "${courseId}"。已取消。`);
+      return;
+    }
+    try {
+      const data = await API.deleteCourse(courseId);
+      // 1. Drop from courses state immediately.
+      setCourses(prev => prev.filter(c => c.id !== courseId));
+      // 2. If deleted course was active, fall back to the first remaining
+      //    visible course (or All Courses).
+      if (activeCourse === courseId) {
+        const hidden = new Set(hiddenCourseIds);
+        const next = courses.find(c => c.id !== courseId && !hidden.has(c.id));
+        setActiveCourse(next ? next.id : null);
+      }
+      // 3. Purge per-course localStorage cache (notes / highlights / KG /
+      //    quiz / exam-prep / notes-toc-collapsed / notes-scroll-y / etc).
+      try {
+        const prefix = `nano-nlm:v1:${courseId}:`;
+        const victims = [];
+        for (let i = 0; i < localStorage.length; i++) {
+          const k = localStorage.key(i);
+          if (k && k.startsWith(prefix)) victims.push(k);
+        }
+        victims.forEach(k => localStorage.removeItem(k));
+      } catch { /* private browsing / quota — non-fatal */ }
+      // 4. Also un-hide it in case it was in hiddenCourseIds (so a
+      //    future course with the same id doesn't start hidden).
+      if (hiddenCourseIds.includes(courseId)) {
+        const next = StudyState.setCourseHidden(localStorage, courseId, false);
+        setHiddenCourseIds(next);
+      }
+      const removedCount = (data.removed || []).length;
+      alert(`已删除课程 "${courseId}"（${removedCount} 个文件 / 目录）。`);
+    } catch (e) {
+      const status = e && e.status;
+      if (status === 404) {
+        alert(`课程 "${courseId}" 已不存在（可能在另一标签页已删除）。`);
+        // Best-effort refresh so the state catches up.
+        setCourses(prev => prev.filter(c => c.id !== courseId));
+      } else {
+        alert(`删除失败：${e.message || "未知错误"}`);
+      }
+    }
+  }
   // If the active course just got hidden, jump to the first visible one
   // (or to All Courses if every course is now hidden).
   useEffect(() => {
@@ -404,6 +477,7 @@ function App() {
                 meta: `${s.chunks} chunks`,
                 checked: true,
                 collection: cid,
+                viewableAsPdf: !!s.viewable_as_pdf,
               });
             });
           });
@@ -455,6 +529,7 @@ function App() {
         meta: `${s.chunks} chunks`,
         checked: true, // All checked by default
         collection: "main",
+        viewableAsPdf: !!s.viewable_as_pdf,
       }));
       setSources(srcs);
       if (srcs.length > 0) setActiveId(srcs[0].id);
@@ -969,11 +1044,14 @@ function App() {
   const visibleCourses = courses.filter(c => !hiddenSet.has(c.id));
   const totalChunks = visibleCourses.reduce((sum, c) => sum + (c.chunks || 0), 0);
 
+  // Quiz tab hidden 2026-05-12: Exam Prep (R5-2) supersedes it with topic
+  // mastery tracking, variant generation, and per-question history. Backend
+  // /api/quiz endpoint, frontend/quiz.jsx, and tests stay in place as a
+  // rollback hatch — only the entry point is removed from the nav.
   const tabs = [
     { id: "reader", label: "Reader", num: activeCourse ? "§" : "—" },
     { id: "notes", label: "Notes", num: realNotes ? "✓" : "—" },
     { id: "mindmap", label: "Knowledge Graph", num: realMindmap ? "✓" : "—" },
-    { id: "quiz", label: "Quiz", num: realQuiz && realQuiz.length ? `Q·${realQuiz.length}` : "—" },
     { id: "exam-prep", label: "Exam Prep", num: "★" },
     { id: "skills", label: "Skills", num: [examAnalysis, reportData, masteryData].filter(Boolean).length || "—" },
     { id: "history", label: "History", num: Object.keys(sessionDays || {}).length || "—" },
@@ -1075,7 +1153,9 @@ function App() {
               {noteCacheStats.force ? "🔄" : "⚡"}{noteCacheStats.cached}/{noteCacheStats.total}
             </span>
           )}
-          <button className="icon-btn" title="Generate Quiz" onClick={handleGenerateQuiz} disabled={streaming}>❓</button>
+          {/* Quiz icon-btn hidden 2026-05-12: superseded by Exam Prep.
+              handleGenerateQuiz + /api/quiz remain so Knowledge Graph's
+              "Practice 3" affordance and the legacy entry can be restored. */}
           <button className="icon-btn" title="Build Knowledge Graph" onClick={handleGenerateMindmap} disabled={streaming}>🧠</button>
           <button className="icon-btn" title="Exam Analysis" onClick={() => handleSkillEntry("exam-analysis")} disabled={streaming}>⌁</button>
           <button className="icon-btn" title="Course Report" onClick={() => handleSkillEntry("report")} disabled={streaming}>▤</button>
@@ -1175,7 +1255,10 @@ function App() {
                   highlightedId={highlightedNode}
                   onNodeClick={setHighlightedNode}
                   onSourceClick={handleMindmapSource}
-                  onPractice={(topic) => handleGenerateQuiz(topic)}
+                  /* onPractice unwired 2026-05-12 — Quiz tab hidden; KG's
+                     "Practice 3" affordance hides via mindmap.jsx's
+                     `onPractice && (...)` guard until Exam Prep wires
+                     up a per-concept practice CTA. */
                   onDataChange={(data) => {
                     setRealMindmap(data);
                     if (activeCourse && data) saveCached(activeCourse, "mindmap", data);
@@ -1369,7 +1452,8 @@ function App() {
             <p className="lang-modal-hint">
               勾掉的课程会从顶栏下拉里隐藏 —
               <b>仅前端</b>过滤，后端 <code>artifacts/courses/</code> 下的数据完整保留。
-              换浏览器或清 localStorage 后会重置。
+              换浏览器或清 localStorage 后会重置。<br />
+              红色 <b>🗑 删除</b> 按钮则是<b>彻底删除</b>：移除磁盘文件 + 索引 + 浏览器缓存，不可撤销。
             </p>
             <div style={{ display: "flex", flexDirection: "column", gap: 6, margin: "12px 0" }}>
               {courses.length === 0 && (
@@ -1381,27 +1465,41 @@ function App() {
                 const hidden = hiddenCourseIds.includes(c.id);
                 const flag = c.lang === "zh" ? "🇨🇳" : c.lang === "mixed" ? "🌐" : "🇺🇸";
                 return (
-                  <label
+                  <div
                     key={c.id}
                     style={{
                       display: "flex", alignItems: "center", gap: 8,
                       padding: "6px 8px", border: "1px solid var(--paper-3)",
-                      borderRadius: 4, cursor: "pointer",
+                      borderRadius: 4,
                       opacity: hidden ? 0.55 : 1,
                     }}
                   >
-                    <input
-                      type="checkbox"
-                      checked={!hidden}
-                      onChange={() => toggleCourseHidden(c.id)}
-                    />
-                    <span className="mono" style={{ fontSize: 12 }}>
-                      {flag} {c.name}
-                    </span>
-                    <span className="mono" style={{ marginLeft: "auto", fontSize: 11, color: "var(--ink-3)" }}>
-                      {c.chunks} chunks
-                    </span>
-                  </label>
+                    <label style={{ display: "flex", alignItems: "center", gap: 8, flex: 1, cursor: "pointer" }}>
+                      <input
+                        type="checkbox"
+                        checked={!hidden}
+                        onChange={() => toggleCourseHidden(c.id)}
+                      />
+                      <span className="mono" style={{ fontSize: 12 }}>
+                        {flag} {c.name}
+                      </span>
+                      {c.auto_resurfaced && (
+                        <span className="mono" style={{ fontSize: 10, color: "var(--ink-4)", fontStyle: "italic" }}>
+                          (cached preset)
+                        </span>
+                      )}
+                      <span className="mono" style={{ marginLeft: "auto", fontSize: 11, color: "var(--ink-3)" }}>
+                        {c.chunks != null ? `${c.chunks} chunks` : ""}
+                      </span>
+                    </label>
+                    <button
+                      className="mono course-delete-btn"
+                      onClick={() => handleDeleteCourse(c.id)}
+                      title={`彻底删除课程 ${c.id}（磁盘 + 索引 + 浏览器缓存）`}
+                    >
+                      🗑 删除
+                    </button>
+                  </div>
                 );
               })}
             </div>

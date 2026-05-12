@@ -149,6 +149,22 @@ async def _probe_tectonic() -> None:
     else:
         logger.info("tectonic not found in PATH — /api/notes/export/pdf will return 503")
 
+
+# PPTX → PDF sidecar converter (LibreOffice). Same pattern as tectonic:
+# probe once at boot, surface availability via /api/status so the upload
+# pipeline can decide whether to attempt sidecar generation and the
+# Reader knows whether to expect viewable_as_pdf=True for pptx docs.
+@app.on_event("startup")
+async def _probe_soffice() -> None:
+    from nano_notebooklm.ingest.pptx_pdf import find_soffice
+    binary = find_soffice()
+    app.state.soffice_path = binary
+    app.state.pptx_pdf_available = bool(binary)
+    if binary:
+        logger.info("soffice detected at %s — pptx upload will generate pdf sidecar", binary)
+    else:
+        logger.info("soffice not found — pptx will fall back to text-mode Reader (install LibreOffice to enable)")
+
 # ── Upload limits ────────────────────────────────────────────────────
 MAX_UPLOAD_SIZE_MB = 50
 MAX_UPLOAD_SIZE_BYTES = MAX_UPLOAD_SIZE_MB * 1024 * 1024
@@ -830,6 +846,74 @@ async def list_courses(
     return {"courses": result}
 
 
+@app.delete(
+    "/api/courses/{course_id}",
+    tags=["courses"],
+    summary="Permanently delete a course (artifacts + indices)",
+)
+async def delete_course(course_id: str):
+    """Hard-delete a course: remove `artifacts/courses/<cid>/` directory,
+    its per-course FAISS + BM25 indices, then rebuild the global index so
+    subsequent search / chat sees the new corpus.
+
+    This is **destructive and irreversible**: notes, quizzes, KG, exam
+    bank, ingested chunks, source files — all gone. The frontend "管理"
+    modal must show a `window.confirm` dialog before invoking. Preset
+    courses (config.PRESET_COURSE_IDS) are still deletable here — they
+    were physically kept as a Round-4 rollback hatch, but if the user
+    explicitly chooses to delete one we honor that.
+    """
+    import shutil as _shutil
+    import asyncio as _asyncio
+
+    course_id = _validate_course_id_path(course_id)
+    course_dir = config.ARTIFACTS_DIR / "courses" / course_id
+    if not course_dir.exists():
+        raise HTTPException(404, f"course not found: {course_id}")
+
+    # Track which files we actually removed so the response can confirm.
+    removed: list[str] = []
+
+    def _do_delete():
+        # 1. Drop the course's artifact directory (chunks / KG / notes /
+        #    quizzes / exam_bank / mindmap_edits / file_hashes — everything
+        #    under artifacts/courses/<cid>/).
+        if course_dir.exists():
+            _shutil.rmtree(course_dir)
+            removed.append(f"courses/{course_id}/")
+
+        # 2. Drop the per-course index files. The global indices are
+        #    rebuilt below from disk so they'll exclude this course.
+        idx_dir = config.ARTIFACTS_DIR / "indices"
+        faiss_dir = idx_dir / "faiss" / course_id
+        if faiss_dir.exists():
+            _shutil.rmtree(faiss_dir)
+            removed.append(f"indices/faiss/{course_id}/")
+        for suffix in (".json", ".pkl"):
+            bm25_path = idx_dir / "bm25" / f"{course_id}{suffix}"
+            if bm25_path.exists():
+                bm25_path.unlink()
+                removed.append(f"indices/bm25/{course_id}{suffix}")
+
+        # 3. Rebuild the global hybrid index from what's left on disk.
+        #    Without this, in-memory _all_chunks still references the
+        #    deleted course's chunks → search/chat keeps returning them.
+        try:
+            kb.build_index(None)
+        except Exception as exc:
+            # build_index already logs; we surface the partial-success in
+            # the response. The directory is gone, just the index didn't
+            # rebuild — operator can `python scripts/ingest_all.py` later.
+            logger.warning(
+                "post-delete index rebuild failed for %s: %s",
+                course_id, type(exc).__name__,
+            )
+
+    await _asyncio.to_thread(_do_delete)
+    session_log.append(course_id, "deletion", {"kind": "course-delete", "removed": removed})
+    return {"deleted": True, "course_id": course_id, "removed": removed}
+
+
 @app.get("/api/sources/{course_id}", tags=["courses"], summary="List source files for a course")
 async def get_sources(course_id: str):
     course_id = _validate_course_id_path(course_id)
@@ -839,12 +923,22 @@ async def get_sources(course_id: str):
     sources: dict[str, dict] = {}
     for c in chunks:
         if c.source_file not in sources:
+            # `viewable_as_pdf=True` lets the Notes citation modal mount
+            # the in-place PDF iframe for pptx-with-sidecar instead of
+            # falling back to Reader text-mode (shouldPreviewCitation
+            # in study-state.js reads this hint).
+            ftype = c.file_type.value
+            viewable_as_pdf = ftype == "pdf" or (
+                ftype == "pptx"
+                and _resolve_pptx_pdf_sidecar(course_id, c.source_file) is not None
+            )
             sources[c.source_file] = {
                 "id": c.doc_id,
-                "type": c.file_type.value,
+                "type": ftype,
                 "title": c.source_file,
                 "chunks": 0,
                 "checked": True,
+                "viewable_as_pdf": viewable_as_pdf,
             }
         sources[c.source_file]["chunks"] += 1
     return {"sources": list(sources.values())}
@@ -878,6 +972,88 @@ def _resolve_source_path(course_id: str, source_file: str) -> Path | None:
     return None
 
 
+def _preview_dir_for(course_id: str) -> Path:
+    """The per-course directory holding pptx → pdf sidecars.
+
+    Lives under `artifacts/courses/<id>/previews/` (NOT under uploads/) so
+    `kb.ingest_course(uploads_dir, ...)`'s recursive scan never picks the
+    sidecar up as a second-class PDF and double-indexes the slide content.
+    """
+    return config.ARTIFACTS_DIR / "courses" / course_id / "previews"
+
+
+# Per-(course, source_file) lock so a flurry of Reader clicks across
+# tabs doesn't spawn N parallel soffice procs against the same deck.
+# Bounded soft-cap mirrors _UPLOAD_LOCKS — see _maybe_evict_upload_lock.
+_LAZY_RENDER_INFLIGHT: dict[tuple[str, str], bool] = {}
+_LAZY_RENDER_INFLIGHT_MAX = 256
+
+
+def _schedule_lazy_pptx_render(course_id: str, source_file: str, source_path: Path) -> None:
+    """Fire-and-forget background sidecar conversion for a preset / pre-R5
+    pptx doc that never went through the upload pipeline's sidecar pass.
+
+    Idempotent: if a render is already in-flight for this (course, file)
+    pair the call is a no-op. The caller does NOT await the task; this
+    request returns viewable_as_pdf=False and the user's next visit picks
+    up the cached sidecar.
+    """
+    key = (course_id, source_file)
+    if _LAZY_RENDER_INFLIGHT.get(key):
+        return
+    if len(_LAZY_RENDER_INFLIGHT) > _LAZY_RENDER_INFLIGHT_MAX:
+        # Drop one stale entry to keep growth bounded; safe because
+        # entries only mark in-flight state, not pending work.
+        try:
+            _LAZY_RENDER_INFLIGHT.pop(next(iter(_LAZY_RENDER_INFLIGHT)))
+        except (StopIteration, KeyError):
+            pass
+    _LAZY_RENDER_INFLIGHT[key] = True
+    preview_dir = _preview_dir_for(course_id)
+
+    async def _render() -> None:
+        from nano_notebooklm.ingest.pptx_pdf import convert_pptx_to_pdf
+        try:
+            await asyncio.to_thread(
+                convert_pptx_to_pdf, source_path, preview_dir,
+            )
+        except Exception:  # noqa: BLE001 — background task must never crash worker
+            logger.exception("pptx_pdf.lazy_render_failed course=%s file=%s",
+                             course_id, source_file)
+        finally:
+            _LAZY_RENDER_INFLIGHT.pop(key, None)
+
+    try:
+        asyncio.create_task(_render())
+    except RuntimeError:
+        # No running loop (only happens in some sync test contexts) —
+        # drop the in-flight flag so a later request can retry.
+        _LAZY_RENDER_INFLIGHT.pop(key, None)
+
+
+def _resolve_pptx_pdf_sidecar(course_id: str, source_file: str) -> Path | None:
+    """For a .pptx `source_file`, return the sidecar PDF path if generated.
+
+    Returns None for non-pptx inputs and when no sidecar exists. Same
+    path-traversal guard as `_resolve_source_path` (resolve + relative_to
+    the preview root) so a hand-crafted `source_file="../../etc/passwd"`
+    cannot escape the preview dir.
+    """
+    if not source_file or Path(source_file).suffix.lower() != ".pptx":
+        return None
+    from nano_notebooklm.ingest.pptx_pdf import sidecar_path
+    preview_root = _preview_dir_for(course_id).resolve() if _preview_dir_for(course_id).exists() else None
+    if preview_root is None:
+        return None
+    candidate = sidecar_path(_preview_dir_for(course_id), source_file)
+    try:
+        resolved = candidate.resolve()
+        resolved.relative_to(preview_root)
+    except (OSError, ValueError):
+        return None
+    return resolved if resolved.is_file() else None
+
+
 @app.get("/api/source/{course_id}/{doc_id}/chunks",
          tags=["courses"], summary="List all chunks for a source document (ordered)")
 async def get_source_chunks(course_id: str, doc_id: str):
@@ -900,6 +1076,25 @@ async def get_source_chunks(course_id: str, doc_id: str):
     same_doc.sort(key=lambda c: (c.page if c.page is not None else 10**9, c.chunk_id))
     pages = [c.page for c in same_doc if c.page is not None]
     file_path = _resolve_source_path(course_id, same_doc[0].source_file)
+    # PPTX rendering: when LibreOffice produced a sidecar PDF during
+    # upload, the Reader can mount the browser's native PDF viewer
+    # (DocumentPdfFrame) instead of falling back to text-mode chunk dump.
+    # `viewable_as_pdf=True` flips that switch on the frontend; the file
+    # endpoint will then transparently serve the sidecar with mime=pdf.
+    sidecar = _resolve_pptx_pdf_sidecar(course_id, same_doc[0].source_file)
+    # Preset-course migration: existing courses (CS231N etc.) were ingested
+    # before sidecar generation existed. Kick off a background conversion
+    # the FIRST time a pptx doc is opened in Reader so the next visit gets
+    # the better viewer. Fire-and-forget — this request still returns
+    # viewable_as_pdf=False, frontend renders text mode, and the user's
+    # second click into the same doc picks up the cached sidecar.
+    if (
+        sidecar is None
+        and same_doc[0].file_type.value == "pptx"
+        and file_path is not None
+        and getattr(app.state, "pptx_pdf_available", False)
+    ):
+        _schedule_lazy_pptx_render(course_id, same_doc[0].source_file, file_path)
     return {
         "course_id": course_id,
         "doc_id": doc_id,
@@ -907,7 +1102,10 @@ async def get_source_chunks(course_id: str, doc_id: str):
         "file_type": same_doc[0].file_type.value,
         "total_chunks": len(same_doc),
         "page_range": [min(pages), max(pages)] if pages else None,
-        "file_available": file_path is not None,
+        "file_available": file_path is not None or sidecar is not None,
+        "viewable_as_pdf": sidecar is not None or (
+            file_path is not None and same_doc[0].file_type.value == "pdf"
+        ),
         "chunks": [
             {
                 "chunk_id": c.chunk_id,
@@ -943,15 +1141,26 @@ async def get_source_file(course_id: str, doc_id: str):
     target = next((c for c in chunks if c.doc_id == doc_id), None)
     if target is None:
         raise HTTPException(404, f"doc not found in course: {doc_id}")
-    path = _resolve_source_path(course_id, target.source_file)
-    if path is None:
-        raise HTTPException(
-            404,
-            "source file not found on disk (may have been deleted after ingest)",
-        )
-    mime, _ = mimetypes.guess_type(str(path))
-    if not mime:
-        mime = "application/octet-stream"
+    # PPTX-as-PDF: when LibreOffice produced a sidecar at upload time,
+    # serve the PDF rendering with mime=application/pdf so Chrome/Safari
+    # mount their native viewer in <iframe>. The original .pptx is still
+    # on disk under uploads/ — we just prefer the renderable sibling.
+    # The Content-Disposition filename keeps the original .pptx name so
+    # "Save as" downloads under the user-recognisable filename.
+    sidecar = _resolve_pptx_pdf_sidecar(course_id, target.source_file)
+    if sidecar is not None:
+        path = sidecar
+        mime = "application/pdf"
+    else:
+        path = _resolve_source_path(course_id, target.source_file)
+        if path is None:
+            raise HTTPException(
+                404,
+                "source file not found on disk (may have been deleted after ingest)",
+            )
+        mime, _ = mimetypes.guess_type(str(path))
+        if not mime:
+            mime = "application/octet-stream"
     return FileResponse(
         path,
         media_type=mime,
@@ -2604,6 +2813,14 @@ async def upload_files(course_id: str, files: Annotated[list[UploadFile], File(.
     if saved == 0:
         raise HTTPException(400, "No valid files saved")
 
+    # ── Pre-stream: best-effort pptx → pdf sidecar generation ──
+    # Runs INSIDE the chunking stage from the user's perspective (the
+    # subprocess is dispatched via asyncio.to_thread before the chunking
+    # stage event fires). Failures are silent — Reader text-mode is the
+    # fallback. We snapshot the .pptx file list here so concurrent uploads
+    # to the same course can't race on the rename.
+    pptx_to_render = sorted(p for p in upload_dir.glob("*.pptx") if p.is_file())
+
     # ── Stream: 4 ingest stages, NDJSON one event per line ──
     async def _events():
         # fix-all v1 #A3: track which stage is current so the error event
@@ -2622,8 +2839,30 @@ async def upload_files(course_id: str, files: Annotated[list[UploadFile], File(.
         async with _upload_lock_for(course_id):
             try:
                 # Stage 1: chunking (synchronous; off-loaded to worker).
+                # PPTX → PDF sidecar conversion runs inside this stage too
+                # so the Reader's pdf-iframe path is ready by the time the
+                # user clicks into Reader. Sidecar gen is best-effort: a
+                # missing soffice or a single broken deck only logs a
+                # warning, never aborts the upload (Reader text-mode is
+                # the fallback).
                 current_stage = "chunking"
                 yield _ndjson({"type": "stage", "stage": "chunking", "progress": 0})
+                if pptx_to_render and getattr(app.state, "pptx_pdf_available", False):
+                    yield _ndjson({
+                        "type": "stage", "stage": "chunking", "progress": 25,
+                        "detail": {"sub": f"rendering {len(pptx_to_render)} pptx preview(s)"},
+                    })
+                    from nano_notebooklm.ingest.pptx_pdf import convert_directory
+                    preview_dir = _preview_dir_for(course_id)
+                    sidecar_results = await _asyncio.to_thread(
+                        convert_directory, upload_dir, preview_dir,
+                    )
+                    rendered = sum(1 for v in sidecar_results.values() if v is not None)
+                    yield _ndjson({
+                        "type": "stage", "stage": "chunking", "progress": 50,
+                        "detail": {"pptx_previews_rendered": rendered,
+                                   "pptx_previews_total": len(sidecar_results)},
+                    })
                 course_obj = await _asyncio.to_thread(
                     kb.ingest_course, str(upload_dir), course_id
                 )
@@ -2922,6 +3161,10 @@ async def status_endpoint():
         # LaTeX-refactor: frontend reads this to decide whether to show the
         # "高质量编译" PDF button (vs. only the browser-print fallback).
         "tectonic_available": bool(getattr(app.state, "tectonic_available", False)),
+        # PPTX → PDF sidecar converter (LibreOffice). When True, uploaded
+        # pptx files get a renderable PDF preview and the Reader's
+        # native iframe viewer instead of falling back to chunk-text mode.
+        "pptx_pdf_available": bool(getattr(app.state, "pptx_pdf_available", False)),
         # fix-all v2 #V2: surface embed warm state so operators see a
         # degraded backend without grepping logs. None = warm-up still
         # in flight (fire-and-forget hasn't resolved yet); False = failed.

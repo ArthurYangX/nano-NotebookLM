@@ -243,9 +243,81 @@ def test_exam_prep_quiz_next_without_topics_returns_400(client):
     assert r.status_code == 400
 
 
+def test_delete_course_removes_artifacts_and_rebuilds_index(client, tmp_path):
+    """R5-2 fix-all v3: DELETE /api/courses/{cid} must remove the on-disk
+    course directory + per-course indices, then rebuild the global hybrid
+    index so subsequent search/chat doesn't keep returning the dead chunks.
+    """
+    # Confirm the seeded course is reachable first.
+    r = client.get("/api/courses")
+    assert "testcourse" in [c["id"] for c in r.json()["courses"]]
+    sources_before = client.get("/api/sources/testcourse").json()["sources"]
+    assert len(sources_before) > 0
+
+    # Delete it.
+    r = client.delete("/api/courses/testcourse")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["deleted"] is True
+    assert body["course_id"] == "testcourse"
+    # `removed` should contain at least the course dir entry.
+    removed_paths = " ".join(body["removed"])
+    assert "courses/testcourse" in removed_paths
+
+    # Course is gone from /api/courses.
+    r = client.get("/api/courses")
+    assert "testcourse" not in [c["id"] for c in r.json()["courses"]]
+
+    # And sources returns empty (course-id is valid shape, just no data).
+    r = client.get("/api/sources/testcourse")
+    assert r.status_code == 200
+    assert r.json()["sources"] == []
+
+
+def test_delete_course_unknown_returns_404(client):
+    r = client.delete("/api/courses/no-such-course")
+    assert r.status_code == 404
+    body = r.json()
+    assert "no-such-course" in (body.get("detail") or body.get("error") or "")
+
+
+def test_delete_course_rejects_traversal(client):
+    """Path-traversal payloads must 400 before any filesystem call."""
+    r = client.delete("/api/courses/..hack")
+    assert r.status_code == 400
+    assert "request_id" in r.json()
+
+
 def test_exam_prep_seed_rejects_oversized_topic_ids_list(client):
     """fix-all v1 L2: bound `topic_ids` to 32 entries × 64 chars per item
     so a flood client can't waste server time on linear scans."""
     big = {"course_id": "testcourse", "topic_ids": ["t"] * 50}
     r = client.post("/api/exam-prep/seed", json=big)
     assert r.status_code == 422
+
+
+def test_status_surfaces_pptx_pdf_available(client):
+    """Frontend uses this flag to decide whether to advertise sidecar PDF
+    rendering for pptx in the upload-CTA copy. Just pin the field is
+    present and is a bool — actual True/False depends on host."""
+    r = client.get("/api/status")
+    assert r.status_code == 200
+    body = r.json()
+    assert "pptx_pdf_available" in body
+    assert isinstance(body["pptx_pdf_available"], bool)
+
+
+def test_sources_emits_viewable_as_pdf_field(client, tmp_path, monkeypatch):
+    """The Notes citation modal's `shouldPreviewCitation` reads
+    `viewable_as_pdf` to decide whether a pptx click can land in the
+    in-place PDF iframe (sidecar present) vs falling back to Reader.
+    Sample chunks are PDFs so we expect viewable_as_pdf=True for them."""
+    r = client.get("/api/sources/testcourse")
+    assert r.status_code == 200
+    sources = r.json()["sources"]
+    assert sources, "test fixture should expose at least one source"
+    for s in sources:
+        assert "viewable_as_pdf" in s, f"missing flag on {s['title']}"
+        # Sample chunks are all PDFs in conftest — every entry must be
+        # viewable_as_pdf=True. A pptx-without-sidecar would be False.
+        assert s["viewable_as_pdf"] is True, s

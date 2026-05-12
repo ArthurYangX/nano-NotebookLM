@@ -3249,6 +3249,27 @@ mark.hl-flash, .hl-jump.hl-flash { animation: hl-flash 0.9s ease-out; }
 }
 .topic-archive-note strong { color: var(--ink-2); font-family: var(--mono); margin-right: 6px; }
 
+/* Course-manager hard-delete button */
+.course-delete-btn {
+  font-size: 10px;
+  padding: 4px 8px;
+  border: 1px solid var(--crimson-soft);
+  background: transparent;
+  color: var(--crimson);
+  border-radius: 4px;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: background 80ms, border-color 80ms;
+}
+.course-delete-btn:hover {
+  background: var(--crimson-soft);
+  border-color: var(--crimson);
+}
+.course-delete-btn:active {
+  background: var(--crimson);
+  color: var(--paper);
+}
+
 /* Active quiz */
 .exam-prep-quiz { padding: 4px 0; }
 .exam-prep-quiz-head {

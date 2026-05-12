@@ -41,6 +41,20 @@ const API = {
     return _request(`/sources/${encodeURIComponent(courseId)}`);
   },
 
+  // Hard-delete a course (artifacts + indices). Frontend MUST confirm
+  // first — this is irreversible. Returns `{deleted, course_id, removed[]}`.
+  async deleteCourse(courseId) {
+    const res = await fetch(`${API_BASE}/courses/${encodeURIComponent(courseId)}`, { method: "DELETE" });
+    if (!res.ok) {
+      let detail = null;
+      try { const b = await res.json(); detail = b.detail || b.error; } catch {}
+      const err = new Error(detail || `HTTP ${res.status}`);
+      err.status = res.status;
+      throw err;
+    }
+    return res.json();
+  },
+
   async chat(question, courseId = null, topK = 5, checkedFiles = null, { signal } = {}, { userLang = null, backend = null } = {}) {
     const body = {
       question, course_id: courseId, top_k: topK, checked_files: checkedFiles,
