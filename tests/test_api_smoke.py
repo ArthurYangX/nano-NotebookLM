@@ -307,6 +307,97 @@ def test_status_surfaces_pptx_pdf_available(client):
     assert isinstance(body["pptx_pdf_available"], bool)
 
 
+def test_status_surfaces_settings_readonly_fields(client, monkeypatch):
+    """Settings page (A 档, 2026-05-12) reads model / base-URL / key-state
+    from /api/status to render badges. Contract:
+      - API key fields are booleans (configured / not), never the value
+      - base URL + model names are strings
+      - qwen fields are gated on QWEN_RAFT_URL being set
+    Critically: the real key string must NEVER appear in the JSON body.
+    """
+    sentinel_openai = "sk-test-openai-SHOULD-NOT-LEAK-1234"
+    sentinel_anthropic = "sk-ant-SHOULD-NOT-LEAK-5678"
+
+    from nano_notebooklm import config
+    monkeypatch.setattr(config, "OPENAI_API_KEY", sentinel_openai)
+    monkeypatch.setattr(config, "ANTHROPIC_API_KEY", sentinel_anthropic)
+
+    r = client.get("/api/status")
+    assert r.status_code == 200
+    body = r.json()
+
+    # New read-only Settings surface — type contract
+    assert isinstance(body.get("openai_api_key_configured"), bool)
+    assert body["openai_api_key_configured"] is True
+    assert isinstance(body.get("anthropic_api_key_configured"), bool)
+    assert body["anthropic_api_key_configured"] is True
+    assert isinstance(body.get("openai_base_url"), str)
+    assert isinstance(body.get("openai_model"), str)
+    assert isinstance(body.get("claude_model"), str)
+    assert isinstance(body.get("default_backend"), str)
+    # review-swarm L1 (fix-all): pin base_url truthiness so a future refactor
+    # that defaults it to "" doesn't silently degrade the Settings page render.
+    assert body["openai_base_url"], "openai_base_url should be a non-empty URL"
+    assert body["openai_base_url"].startswith(("http://", "https://"))
+
+    # Key values must never appear in the response body
+    raw = r.text
+    assert sentinel_openai not in raw, "OPENAI_API_KEY leaked into /api/status body"
+    assert sentinel_anthropic not in raw, "ANTHROPIC_API_KEY leaked into /api/status body"
+
+
+def test_status_qwen_fields_gated_on_url(client, monkeypatch):
+    """Qwen-specific model name + host must be None when QWEN_RAFT_URL
+    is empty (= operator hasn't opted in). Avoids dangling 'qwen2.5-7b-raft'
+    label on the Settings page when no backend exists."""
+    from nano_notebooklm import config
+    monkeypatch.setattr(config, "QWEN_RAFT_URL", "")
+    r = client.get("/api/status")
+    assert r.status_code == 200
+    body = r.json()
+    assert body.get("qwen_raft_configured") is False
+    assert body.get("qwen_raft_model_name") is None
+    assert body.get("qwen_raft_url_host") is None
+
+
+def test_status_qwen_url_host_strips_credentials_and_path(client, monkeypatch):
+    """review-swarm M2 (fix-all): host-only extraction must strip userinfo,
+    port, path, and query — these can carry credentials/tokens. The intent
+    of `qwen_raft_url_host` is to surface a recognizable host to the
+    Settings page badge, NOT the full URL with embedded credentials."""
+    creds_url = "https://leakuser:leakpass@host.example.com:48293/v1/chat?token=leaktoken"
+    from nano_notebooklm import config
+    monkeypatch.setattr(config, "QWEN_RAFT_URL", creds_url)
+
+    r = client.get("/api/status")
+    assert r.status_code == 200
+    body = r.json()
+
+    # 正向：仅 hostname，剥光 scheme/userinfo/port/path/query
+    assert body["qwen_raft_url_host"] == "host.example.com"
+
+    # 反向：凭据、端口、完整路径不得出现在响应中
+    raw = r.text
+    for sentinel in ["leakuser", "leakpass", "leaktoken", "48293", "/v1/chat", "https://leakuser"]:
+        assert sentinel not in raw, (
+            f"qwen URL component {sentinel!r} leaked into /api/status body"
+        )
+
+
+def test_status_api_keys_unconfigured_when_env_empty(client, monkeypatch):
+    """review-swarm L1 (fix-all): pin the bool() coercion semantics — empty
+    string MUST evaluate to False. Defends against a refactor that switches
+    to `is not None` (which would mark `""` as configured)."""
+    from nano_notebooklm import config
+    monkeypatch.setattr(config, "OPENAI_API_KEY", "")
+    monkeypatch.setattr(config, "ANTHROPIC_API_KEY", "")
+    r = client.get("/api/status")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["openai_api_key_configured"] is False
+    assert body["anthropic_api_key_configured"] is False
+
+
 def test_sources_emits_viewable_as_pdf_field(client, tmp_path, monkeypatch):
     """The Notes citation modal's `shouldPreviewCitation` reads
     `viewable_as_pdf` to decide whether a pptx click can land in the

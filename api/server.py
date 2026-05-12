@@ -3147,6 +3147,18 @@ async def status_endpoint():
                 qwen_available = False
             app.state.qwen_health_cache = (now, qwen_available)
 
+    # Settings page (A 档, 2026-05-12): expose model + base-URL + API-key
+    # *configuration state* so the frontend Settings tab can render
+    # "已配置 / 未配置" badges without ever seeing the secret values. Booleans
+    # only for API keys — `bool(config.OPENAI_API_KEY)` collapses the empty
+    # string default to False without leaking the actual key.
+    qwen_url_host: str | None = None
+    if config.QWEN_RAFT_URL:
+        try:
+            qwen_url_host = urllib_parse.urlparse(config.QWEN_RAFT_URL).hostname
+        except Exception:
+            qwen_url_host = None
+
     return {
         "backends": list(router.backends.keys()),
         "courses": len(courses),
@@ -3173,6 +3185,15 @@ async def status_endpoint():
         # disabled state + tooltip wording.
         "qwen_raft_configured": qwen_configured,
         "qwen_raft_available": qwen_available,
+        # Settings page read-only model/key/base-URL surface.
+        "default_backend": config.DEFAULT_BACKEND,
+        "openai_model": config.OPENAI_MODEL,
+        "openai_base_url": config.OPENAI_BASE_URL,
+        "openai_api_key_configured": bool(config.OPENAI_API_KEY),
+        "claude_model": config.CLAUDE_MODEL,
+        "anthropic_api_key_configured": bool(config.ANTHROPIC_API_KEY),
+        "qwen_raft_model_name": config.QWEN_RAFT_MODEL_NAME if qwen_configured else None,
+        "qwen_raft_url_host": qwen_url_host,
         "version": app.version,
     }
 
