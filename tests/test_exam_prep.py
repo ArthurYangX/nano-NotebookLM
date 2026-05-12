@@ -772,6 +772,69 @@ async def test_next_quiz_include_mastered_when_explicit_topic_ids(isolated_artif
     assert "q_mastered" in explicit_qids
 
 
+def test_variant_semaphore_anchors_to_running_loop():
+    """R5-2 review-swarm v2 follow-up F3: pre-fix `_VARIANT_SEMAPHORE` was a
+    single module-global lazy-init that bound to whichever loop first hit
+    it. Subsequent `asyncio.run()` calls inherited the previous loop's
+    Future internals and could crash "Future attached to a different loop".
+
+    The fix keys by `id(loop)` AND holds the loop itself in the dict
+    value — so a freshly-running loop seeing a stale id-match falls
+    through to "build fresh" because the cached loop reference differs.
+
+    We test the in-loop contract (same call → same sem) plus the anchor
+    contract (dict value's loop reference equals the current running
+    loop). A purely `id != id` cross-loop test is fundamentally flaky
+    because CPython can reuse a freed address."""
+    import asyncio as _aio
+    from nano_notebooklm.skills.exam_prep import _get_variant_semaphore, _VARIANT_SEMAPHORES
+
+    _VARIANT_SEMAPHORES.clear()
+    captured: dict = {}
+
+    async def grab():
+        s1 = _get_variant_semaphore()
+        s2 = _get_variant_semaphore()
+        captured["same_call_same_sem"] = (s1 is s2)
+        captured["loop"] = _aio.get_running_loop()
+        captured["dict_loop"] = next(iter(_VARIANT_SEMAPHORES.values()))[0]
+
+    _aio.run(grab())
+    assert captured["same_call_same_sem"], "two calls within one loop must return the same Semaphore"
+    assert captured["dict_loop"] is captured["loop"], (
+        "dict value must anchor to the running loop so id() reuse can't "
+        "alias a stale semaphore"
+    )
+
+
+def test_course_locks_anchored_and_capped():
+    """R5-2 review-swarm v2 follow-up F3: same loop-anchor trick as
+    `_VARIANT_SEMAPHORES`. `_COURSE_LOCKS` also has a soft 512-cap so a
+    long-lived process doesn't accumulate one entry per (loop_id,
+    course_id) ever seen."""
+    import asyncio as _aio
+    from nano_notebooklm.skills.exam_prep import (
+        _COURSE_LOCKS, _COURSE_LOCKS_MAX, _lock_for,
+    )
+    _COURSE_LOCKS.clear()
+    captured: dict = {}
+
+    async def grab_then_overflow():
+        # Anchor check: dict value's loop is the current loop.
+        _lock_for("anchor_course")
+        captured["loop"] = _aio.get_running_loop()
+        captured["dict_loop"] = next(iter(_COURSE_LOCKS.values()))[0]
+        # Push past the cap to verify eviction kicks in.
+        for i in range(_COURSE_LOCKS_MAX + 50):
+            _lock_for(f"course_{i}")
+
+    _aio.run(grab_then_overflow())
+    assert captured["dict_loop"] is captured["loop"]
+    assert len(_COURSE_LOCKS) <= _COURSE_LOCKS_MAX + 1, (
+        f"expected dict to stay near cap, got {len(_COURSE_LOCKS)}"
+    )
+
+
 @pytest.mark.asyncio
 async def test_submit_does_not_hang_when_variant_gen_stalls(isolated_artifacts, monkeypatch):
     """The original bug: a stuck codex call made `asyncio.gather` wait

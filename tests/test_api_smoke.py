@@ -274,6 +274,30 @@ def test_delete_course_removes_artifacts_and_rebuilds_index(client, tmp_path):
     assert r.json()["sources"] == []
 
 
+def test_delete_course_also_removes_uploads_dir(client):
+    """R5-2 review-swarm v2 follow-up F1: pre-fix `delete_course` only
+    rmtree'd `artifacts/courses/<cid>/` and left `artifacts/uploads/<cid>/`
+    on disk — so the docstring lied about "source files all gone" and a
+    same-id re-upload silently picked up the old originals. The fix also
+    rmtrees uploads/."""
+    from nano_notebooklm import config as _cfg
+    uploads = _cfg.ARTIFACTS_DIR / "uploads" / "testcourse"
+    uploads.mkdir(parents=True, exist_ok=True)
+    (uploads / "fake.pptx").write_bytes(b"stub")
+    assert (uploads / "fake.pptx").exists()
+
+    r = client.delete("/api/courses/testcourse")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    removed_str = " ".join(body["removed"])
+    assert "courses/testcourse" in removed_str
+    assert "uploads/testcourse" in removed_str, (
+        f"uploads/ not in removed list: {body['removed']}; "
+        "pre-F1 the uploads dir survived course deletion"
+    )
+    assert not uploads.exists()
+
+
 def test_delete_course_unknown_returns_404(client):
     r = client.delete("/api/courses/no-such-course")
     assert r.status_code == 404

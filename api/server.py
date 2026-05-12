@@ -29,6 +29,8 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from nano_notebooklm.ai.router import ModelRouter
+from nano_notebooklm.ai.base import TruncationSignal
+from nano_notebooklm.ai import prompt_templates as prompts
 from nano_notebooklm.ai.prompt_templates import NOTE_LATEX_PREAMBLE, NOTE_LATEX_POSTAMBLE
 from nano_notebooklm.agents import run_subagent
 from nano_notebooklm.agents.formatter import format_response
@@ -489,11 +491,37 @@ class ChatRequest(BaseModel):
             'Qwen2.5-7B-RAFT (requires QWEN_RAFT_URL configured).'
         ),
     )
+    # 2026-05-12: user-customisable assistant name surfaced via the
+    # ⚙ Settings tab (topbar icon-btn → effectiveMode==="settings");
+    # flows through qa_skill into tutor_persona() / identity_addendum()
+    # on all 5 paths. None / empty → backend falls back to
+    # prompt_templates.DEFAULT_PERSONA. Length capped at PERSONA_MAX_LEN
+    # (40) so a hostile localStorage value can't bloat the system prompt.
+    # prompt_templates._safe_persona also strips control / bidi
+    # codepoints as defense in depth against prompt injection (review-
+    # swarm fix-all #1) — this Pydantic validator is the primary check.
+    persona: str | None = Field(
+        default=None,
+        max_length=prompts.PERSONA_MAX_LEN,
+        description=(
+            "Optional custom name for the assistant (e.g. user's pet "
+            "name for the tutor). Empty / None falls back to the "
+            "configured DEFAULT_PERSONA. Trimmed and length-capped."
+        ),
+    )
 
     @field_validator("question")
     @classmethod
     def question_must_not_be_blank(cls, value: str) -> str:
         return _strip_nonempty(value, "question")
+
+    @field_validator("persona")
+    @classmethod
+    def persona_normalise(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        cleaned = value.strip()
+        return cleaned or None
 
 
 class ChatSource(BaseModel):
@@ -853,8 +881,9 @@ async def list_courses(
 )
 async def delete_course(course_id: str):
     """Hard-delete a course: remove `artifacts/courses/<cid>/` directory,
-    its per-course FAISS + BM25 indices, then rebuild the global index so
-    subsequent search / chat sees the new corpus.
+    `artifacts/uploads/<cid>/` (raw uploads), its per-course FAISS + BM25
+    indices, then rebuild the global index so subsequent search / chat
+    sees the new corpus.
 
     This is **destructive and irreversible**: notes, quizzes, KG, exam
     bank, ingested chunks, source files — all gone. The frontend "管理"
@@ -862,17 +891,36 @@ async def delete_course(course_id: str):
     courses (config.PRESET_COURSE_IDS) are still deletable here — they
     were physically kept as a Round-4 rollback hatch, but if the user
     explicitly chooses to delete one we honor that.
+
+    R5-2 review-swarm v2 follow-up F1:
+    - Acquires `_upload_lock_for(course_id)` for the destructive window
+      so a concurrent `POST /api/upload/{cid}` can't write into the
+      course while we rmtree it.
+    - Also rmtrees `artifacts/uploads/<cid>/` (the raw user-uploaded
+      pptx / pdf / docx live there). Pre-fix the docstring claimed
+      "source files — all gone" but uploads/ survived, so a same-id
+      re-upload silently saw the old files and the dedup pass
+      (`_dedupe_pptx_pdf_pairs`) couldn't even discover them.
+    - Pops `_LAZY_RENDER_INFLIGHT` keys for this course so any in-flight
+      lazy sidecar render's `finally` doesn't try to write to the
+      vanished previews/ dir, and a same-id re-upload immediately gets
+      a fresh render attempt rather than hitting a stale True flag.
     """
     import shutil as _shutil
     import asyncio as _asyncio
 
     course_id = _validate_course_id_path(course_id)
     course_dir = config.ARTIFACTS_DIR / "courses" / course_id
-    if not course_dir.exists():
+    uploads_dir = config.ARTIFACTS_DIR / "uploads" / course_id
+    if not course_dir.exists() and not uploads_dir.exists():
         raise HTTPException(404, f"course not found: {course_id}")
 
     # Track which files we actually removed so the response can confirm.
     removed: list[str] = []
+    # Pop lazy-render flags BEFORE rmtree so a render task in flight is
+    # allowed to fail in its own finally without leaking the dict entry.
+    for key in [k for k in _LAZY_RENDER_INFLIGHT if k[0] == course_id]:
+        _LAZY_RENDER_INFLIGHT.pop(key, None)
 
     def _do_delete():
         # 1. Drop the course's artifact directory (chunks / KG / notes /
@@ -881,6 +929,14 @@ async def delete_course(course_id: str):
         if course_dir.exists():
             _shutil.rmtree(course_dir)
             removed.append(f"courses/{course_id}/")
+
+        # 1b. Drop the raw uploads directory (pptx / pdf / docx the user
+        #     dragged in originally). Pre-F1 this survived the delete →
+        #     the docstring lied and a same-id re-upload silently picked
+        #     up the old files.
+        if uploads_dir.exists():
+            _shutil.rmtree(uploads_dir)
+            removed.append(f"uploads/{course_id}/")
 
         # 2. Drop the per-course index files. The global indices are
         #    rebuilt below from disk so they'll exclude this course.
@@ -909,7 +965,14 @@ async def delete_course(course_id: str):
                 course_id, type(exc).__name__,
             )
 
-    await _asyncio.to_thread(_do_delete)
+    # F1: acquire the upload lock so concurrent uploads to the same
+    # course_id wait until we finish — and vice versa, we wait for any
+    # in-flight upload to release. After release we evict the lock so the
+    # dict doesn't accumulate one entry per deleted course.
+    upload_lock = _upload_lock_for(course_id)
+    async with upload_lock:
+        await _asyncio.to_thread(_do_delete)
+    _maybe_evict_upload_lock(course_id)
     session_log.append(course_id, "deletion", {"kind": "course-delete", "removed": removed})
     return {"deleted": True, "course_id": course_id, "removed": removed}
 
@@ -1198,6 +1261,7 @@ async def chat(req: ChatRequest):
         "checked_files": req.checked_files,
         "user_lang": req.user_lang,
         "backend": req.backend,
+        "persona": req.persona,
     })
     if not result.success:
         raise HTTPException(status_code=502, detail=result.error or "qa skill failed")
@@ -1466,8 +1530,12 @@ async def stream_full_course_notes(req: NoteFullCourseRequest, request: Request)
     Event shapes (NDJSON, one JSON object per line):
       {"type":"plan", "files":[{idx, source_file, chunk_count}], "total":N}
       {"type":"file_start", "idx":i, "source_file":..., "total":N}
+      {"type":"file_delta", "idx":i, "source_file":..., "delta":"..."}
+                            # client accumulates per-idx; ~10 deltas/sec
       {"type":"file_done", "idx":i, "source_file":..., "content":"...",
                             "chunks_used":k}
+                            # `content` is the SANITIZED final body —
+                            # always authoritative over accumulated deltas.
       {"type":"file_error", "idx":i, "source_file":..., "error":"<code>"}
       {"type":"merging", "files_succeeded":m, "files_failed":f}
       {"type":"reviewing"}
@@ -1574,10 +1642,12 @@ async def stream_full_course_notes(req: NoteFullCourseRequest, request: Request)
                     }, ensure_ascii=False) + "\n"
 
                 semaphore = asyncio.Semaphore(concurrency)
-                # Bounded queue: per-file work produces 2 events (start + done/error).
-                # 4× plans gives slack for the merging/reviewing/done tail without
-                # an unbounded queue that could mask backpressure bugs.
-                queue: asyncio.Queue = asyncio.Queue(maxsize=max(64, len(fresh_plans) * 4))
+                # Bounded queue: per-file work now produces 1 file_start + N
+                # file_delta + 1 file_done/file_error events. The main loop
+                # drains the queue on every iteration, so even ~1000 deltas
+                # per file rarely accumulate — but cap generously to absorb
+                # bursts while still surfacing real backpressure bugs.
+                queue: asyncio.Queue = asyncio.Queue(maxsize=max(256, len(fresh_plans) * 64))
 
                 async def run_one(plan):
                     # Acquire the semaphore first so file_start reflects "a
@@ -1590,30 +1660,59 @@ async def stream_full_course_notes(req: NoteFullCourseRequest, request: Request)
                             "source_file": plan.source_file,
                             "total": len(plans),
                         })
-                        result = await notes_full_course.generate_file(router, plan)
+                        # 2026-05-12: stream the per-file LLM call so the UI
+                        # gets progressive `file_delta` events instead of
+                        # waiting 5-30s for a single file_done dump. The
+                        # streaming generator yields ("delta", str) chunks
+                        # followed by a terminal ("result", FileResult)
+                        # with sanitization applied to the accumulated body.
+                        result = None
+                        async for kind, payload in notes_full_course.generate_file_stream(router, plan):
+                            if kind == "delta":
+                                await queue.put({
+                                    "type": "file_delta",
+                                    "idx": plan.idx,
+                                    "source_file": plan.source_file,
+                                    "delta": payload,
+                                })
+                            elif kind == "result":
+                                result = payload
+                        if result is None:
+                            # Defensive: generate_file_stream always yields a
+                            # ("result", ...) terminal, but guard against a
+                            # future refactor that breaks that invariant.
+                            result = notes_full_course.FileResult(
+                                idx=plan.idx, source_file=plan.source_file,
+                                chunk_count=plan.chunk_count,
+                                content=None, error="stream_no_result",
+                            )
                         results[plan.idx] = result
                         if result.content:
-                            # Write fresh result to the cache. Best-effort:
-                            # cache write failure (disk full, etc.) shouldn't
-                            # break the generation — log and continue.
-                            try:
-                                await notes_full_course.write_cache_entry(
-                                    course_id, plan.source_file,
-                                    chunk_hash_value=plan.cache_key,
-                                    content=result.content,
-                                    model=getattr(router, "current_model", ""),
-                                )
-                            except Exception:  # noqa: BLE001
-                                logger.warning(
-                                    "write_cache_entry failed course=%s file=%s",
-                                    course_id, plan.source_file, exc_info=True,
-                                )
+                            # Truncated body: don't cache it (next refresh
+                            # without `force` would replay the truncated
+                            # entry instead of trying again with the new
+                            # higher cap). Skip cache write, still emit
+                            # file_done so the user sees the partial body.
+                            if not result.truncated:
+                                try:
+                                    await notes_full_course.write_cache_entry(
+                                        course_id, plan.source_file,
+                                        chunk_hash_value=plan.cache_key,
+                                        content=result.content,
+                                        model=getattr(router, "current_model", ""),
+                                    )
+                                except Exception:  # noqa: BLE001
+                                    logger.warning(
+                                        "write_cache_entry failed course=%s file=%s",
+                                        course_id, plan.source_file, exc_info=True,
+                                    )
                             await queue.put({
                                 "type": "file_done",
                                 "idx": result.idx,
                                 "source_file": result.source_file,
                                 "content": result.content,
                                 "chunks_used": result.chunk_count,
+                                "truncated": bool(result.truncated),
                             })
                         else:
                             await queue.put({
@@ -1621,6 +1720,7 @@ async def stream_full_course_notes(req: NoteFullCourseRequest, request: Request)
                                 "idx": result.idx,
                                 "source_file": result.source_file,
                                 "error": result.error or "unknown",
+                                "truncated": bool(result.truncated),
                             })
 
                 tasks = [asyncio.create_task(run_one(p)) for p in fresh_plans]
@@ -1711,14 +1811,22 @@ async def stream_full_course_notes(req: NoteFullCourseRequest, request: Request)
                     user_lang=user_lang,
                 )
 
-                async for delta in router.complete_stream(
+                review_truncated = False
+                async for item in router.complete_stream(
                     review_inputs["prompt"],
                     task_type=review_inputs["task_type"],
                     system=review_inputs["system"],
                     temperature=review_inputs["temperature"],
                     max_tokens=review_inputs["max_tokens"],
                 ):
-                    partial += delta
+                    if isinstance(item, TruncationSignal):
+                        review_truncated = True
+                        logger.warning(
+                            "review pass truncated for course %s (reason=%s)",
+                            course_id, item.reason,
+                        )
+                        continue
+                    partial += item
                     # Wire-cost note: ship `delta` only — DO NOT also ship
                     # `partial` here. Earlier versions included partial in
                     # every event, which made the cumulative wire bytes O(N²)
@@ -1726,7 +1834,7 @@ async def stream_full_course_notes(req: NoteFullCourseRequest, request: Request)
                     # on the wire). The frontend accumulates deltas itself.
                     yield json.dumps({
                         "type": "review_chunk",
-                        "delta": delta,
+                        "delta": item,
                     }, ensure_ascii=False) + "\n"
 
                 # Sanitize the reviewed body with the no-cap variant — a
@@ -1754,16 +1862,28 @@ async def stream_full_course_notes(req: NoteFullCourseRequest, request: Request)
                     }, ensure_ascii=False) + "\n"
                     return
 
+                files_truncated = [
+                    r.source_file for r in settled
+                    if getattr(r, "truncated", False)
+                ]
                 session_log.append(course_id, "generation", {
                     "kind": "notes-full-course",
                     "files_succeeded": len(succeeded),
                     "files_failed": len(failed),
+                    "files_truncated": len(files_truncated),
+                    "review_truncated": review_truncated,
                 })
                 yield json.dumps({
                     "type": "done",
                     "content": final_content,
                     "files_succeeded": len(succeeded),
                     "files_failed": len(failed),
+                    # Truncation surface: per-file list + the review pass
+                    # boolean. Frontend renders an inline banner so the
+                    # user knows the LaTeX they're looking at may have a
+                    # half-closed env at the tail.
+                    "files_truncated": files_truncated,
+                    "review_truncated": review_truncated,
                 }, ensure_ascii=False) + "\n"
 
             except asyncio.CancelledError:

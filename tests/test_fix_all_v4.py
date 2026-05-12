@@ -521,6 +521,46 @@ def test_nav_epoch_threaded_into_pdf_frame_and_text_body():
         "sourceFileUrl no longer appends `_nav=` cache-bust query — PDFium re-init guarantee gone"
 
 
+def test_stage_a_b_emit_runs_outside_semaphore():
+    """R5-2 review-swarm v2 follow-up F2: progress emission must run AFTER
+    the semaphore slot releases. Holding the slot during `_emit` lets a
+    slow / blocking progress_callback (e.g. upload pipeline's bounded
+    NDJSON queue) serialise the workers behind the lock — partially
+    defeats the flat-gather pipelining win.
+
+    Pin via source-grep on `extractor.py`: in both `_stage_a_for_file`
+    and `_stage_b_for_chunk` the `_emit(KG_STAGE_*, pct)` call must NOT
+    appear inside the same indented block as `async with ... sem:`. The
+    structural test is "find the function, find its `async with sem:`,
+    confirm `_emit` does NOT appear before the matching dedent."
+    """
+    src = Path("nano_notebooklm/kg/extractor.py").read_text(encoding="utf-8")
+    for fn_name, sem_pat, emit_pat in (
+        ("_stage_a_for_file", "async with sem:", "_emit(KG_STAGE_A,"),
+        ("_stage_b_for_chunk", "async with stage_b_sem:", "_emit(KG_STAGE_B,"),
+    ):
+        fn = re.search(
+            rf"async def {fn_name}\([\s\S]+?(?=\n    async def |\n    [a-zA-Z_]+ = |\nasync def |\ndef )",
+            src,
+        )
+        assert fn, f"{fn_name} not found"
+        body = fn.group(0)
+        sem_idx = body.find(sem_pat)
+        assert sem_idx >= 0, f"{sem_pat!r} not in {fn_name}"
+        # Find the end of the sem block: scan forward for a line whose
+        # indent is ≤ the indent of `async with`. Cheap heuristic: look
+        # for the next `finally:` at column 8 (function body indent).
+        # We just need to verify `_emit(...)` doesn't appear BEFORE the
+        # `finally:` keyword that closes the sem block.
+        finally_idx = body.find("\n        finally:", sem_idx)
+        assert finally_idx > sem_idx, f"finally: not found in {fn_name}"
+        inside_sem = body[sem_idx:finally_idx]
+        assert emit_pat not in inside_sem, (
+            f"{emit_pat!r} is still INSIDE the {sem_pat!r} block of "
+            f"{fn_name}; emit must run after sem release (F2)"
+        )
+
+
 def test_app_jsx_get_checked_files_returns_null_when_all_checked():
     """R5-2 fix-all v7 regression pin.
 

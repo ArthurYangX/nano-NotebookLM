@@ -482,27 +482,32 @@ async def extract_from_chunks(
 
     async def _stage_a_for_file(filename: str) -> tuple[str, list[Concept], list[tuple[str, str]]]:
         nonlocal stage_a_done
-        async with sem:
-            try:
-                # course_id encodes course slug + chapter-slug-with-hash so
-                # `_slug` collisions on similar filenames (e.g. "lec 1.pdf"
-                # / "lec_1.pdf") don't fuse into one root via the merger's
-                # (type, name, concept_id) key. R5-1 fix-all v1 #F3.
-                scoped_course_id = f"{course_name}__{_chapter_slug(filename)}"
-                return await extract_course_overview_and_topics(
+        # course_id encodes course slug + chapter-slug-with-hash so
+        # `_slug` collisions on similar filenames (e.g. "lec 1.pdf"
+        # / "lec_1.pdf") don't fuse into one root via the merger's
+        # (type, name, concept_id) key. R5-1 fix-all v1 #F3.
+        scoped_course_id = f"{course_name}__{_chapter_slug(filename)}"
+        try:
+            async with sem:
+                result = await extract_course_overview_and_topics(
                     course_id=scoped_course_id,
                     course_name=filename,
                     source_files=[filename],
                     sample_chunks=chunks_by_file[filename],
                     router=router,
                 )
-            finally:
-                async with stage_a_lock:
-                    stage_a_done += 1
-                    # Cap pre-completion emits at 99 so the terminal 100 is
-                    # always the explicit one emitted by the orchestrator.
-                    pct = max(1, min(99, int(100 * stage_a_done / stage_a_total)))
-                    _emit(KG_STAGE_A, pct)
+        finally:
+            # R5-2 review-swarm v2 follow-up F2: emit progress AFTER releasing
+            # the semaphore slot so a slow / blocking progress_callback (e.g.
+            # upload pipeline's NDJSON queue with backpressure) can't pin a
+            # worker slot — defeats the per-file concurrency win.
+            pct = None
+            async with stage_a_lock:
+                stage_a_done += 1
+                pct = max(1, min(99, int(100 * stage_a_done / stage_a_total)))
+            if pct is not None:
+                _emit(KG_STAGE_A, pct)
+        return result
 
     stage_a_results = await asyncio.gather(
         *[_stage_a_for_file(f) for f in files_ordered],
@@ -572,17 +577,25 @@ async def extract_from_chunks(
 
     async def _stage_b_for_chunk(c: Chunk):
         nonlocal stage_b_done
-        async with stage_b_sem:
-            try:
-                return await extract_concepts_from_chunk(
+        # R5-2 review-swarm v2 follow-up F2: emit progress AFTER releasing
+        # the semaphore. Holding the slot during `_emit` (which may push
+        # to the upload pipeline's bounded `asyncio.Queue(maxsize=64)`)
+        # lets backpressure serialise the workers behind the lock —
+        # partially defeats the flat-gather pipelining win.
+        try:
+            async with stage_b_sem:
+                result = await extract_concepts_from_chunk(
                     c, course_name, router,
                     topics=per_file_topics.get(_chunk_bucket_key(c.source_file), []),
                 )
-            finally:
-                async with stage_b_lock:
-                    stage_b_done += 1
-                    pct = max(1, min(99, int(100 * stage_b_done / stage_b_total)))
-                    _emit(KG_STAGE_B, pct)
+        finally:
+            pct = None
+            async with stage_b_lock:
+                stage_b_done += 1
+                pct = max(1, min(99, int(100 * stage_b_done / stage_b_total)))
+            if pct is not None:
+                _emit(KG_STAGE_B, pct)
+        return result
 
     tasks = [_stage_b_for_chunk(c) for c in sampled]
     results = await asyncio.gather(*tasks, return_exceptions=True)

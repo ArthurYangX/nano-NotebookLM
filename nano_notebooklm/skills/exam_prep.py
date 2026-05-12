@@ -70,35 +70,82 @@ EXAM_PREP_VARIANT_CONCURRENCY = int(os.getenv("EXAM_PREP_VARIANT_CONCURRENCY", "
 
 # Module-level lazy-init semaphore. Built on first use inside the running
 # event loop so test fixtures with their own loops don't race a global init.
-_VARIANT_SEMAPHORE: "asyncio.Semaphore | None" = None
+# R5-2 review-swarm v2 follow-up F3: pre-fix this was a module-global
+# `_VARIANT_SEMAPHORE` lazy-built once and reused across loops. Reusing
+# an asyncio.Semaphore across different event loops is at best fragile
+# (its internal fairness queue binds to a Future on first acquire) and
+# at worst crashes "Future attached to a different loop" — exactly the
+# pattern test fixtures hit when they wrap each test in `asyncio.run()`.
+#
+# Key by `id(loop)` but ALSO hold the loop itself in the dict value so
+# the loop can't be garbage-collected and have its memory address
+# (`id()` is just `addr` in CPython) reused under us. Without the
+# loop-reference hold, `asyncio.run()` → return → GC → next
+# `asyncio.run()` can land at the same address and `_get_variant_semaphore`
+# would return a stale semaphore bound to the dead loop's futures.
+_VARIANT_SEMAPHORES: dict[int, tuple["asyncio.AbstractEventLoop", asyncio.Semaphore]] = {}
 
 
 def _get_variant_semaphore() -> asyncio.Semaphore:
-    global _VARIANT_SEMAPHORE
-    if _VARIANT_SEMAPHORE is None:
-        _VARIANT_SEMAPHORE = asyncio.Semaphore(EXAM_PREP_VARIANT_CONCURRENCY)
-    return _VARIANT_SEMAPHORE
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        # No running loop (sync caller — shouldn't happen in production but
+        # keeps tests / scripts safe). Throwaway semaphore; the caller's
+        # `async with` will still gate correctly.
+        return asyncio.Semaphore(EXAM_PREP_VARIANT_CONCURRENCY)
+    key = id(loop)
+    cached = _VARIANT_SEMAPHORES.get(key)
+    if cached is not None and cached[0] is loop:
+        return cached[1]
+    sem = asyncio.Semaphore(EXAM_PREP_VARIANT_CONCURRENCY)
+    _VARIANT_SEMAPHORES[key] = (loop, sem)
+    return sem
 
 
 # fix-all v1 H2: per-course async lock keyed by (running_loop_id, course_id).
 # Without this, two concurrent submits both load_bank → both mutate → both
 # save_bank → last-writer-wins discards the other's grading history + any
-# successful variants. Mirrors the _COURSE_CACHE_LOCKS pattern in
-# notes_full_course (R4-6 fix-all v4) — loop_id keys handle test fixtures
-# that spin fresh loops via asyncio.run().
-_COURSE_LOCKS: dict[tuple[int, str], asyncio.Lock] = {}
+# successful variants.
+#
+# review-swarm v2 follow-up F3: same loop-anchor trick as
+# `_VARIANT_SEMAPHORES` — store the loop in the value so a GC'd loop
+# can't have its id reused under us. Soft cap (512) mirrors
+# `_UPLOAD_LOCKS_MAX` so a long-lived process doesn't accumulate one
+# entry per (loop_id, course_id) seen.
+_COURSE_LOCKS: dict[tuple[int, str], tuple["asyncio.AbstractEventLoop", asyncio.Lock]] = {}
+_COURSE_LOCKS_MAX = 512
 
 
 def _lock_for(course_id: str) -> asyncio.Lock:
     try:
-        loop_id = id(asyncio.get_running_loop())
+        loop = asyncio.get_running_loop()
     except RuntimeError:
-        loop_id = 0
+        # No running loop (sync caller). Hand back a fresh lock — caller
+        # almost certainly never reaches the `async with` so this is just
+        # a safety belt.
+        return asyncio.Lock()
+    loop_id = id(loop)
     key = (loop_id, course_id)
-    lock = _COURSE_LOCKS.get(key)
-    if lock is None:
-        lock = asyncio.Lock()
-        _COURSE_LOCKS[key] = lock
+    cached = _COURSE_LOCKS.get(key)
+    if cached is not None and cached[0] is loop:
+        return cached[1]
+    # Eviction (only when actually inserting):
+    if len(_COURSE_LOCKS) >= _COURSE_LOCKS_MAX:
+        # Prefer evicting entries whose loop is DIFFERENT from the current
+        # one (dead loops from earlier test invocations, etc.). Falls back
+        # to oldest insertion when only current-loop entries remain.
+        for k, (cached_loop, _cached_lock) in list(_COURSE_LOCKS.items()):
+            if cached_loop is not loop:
+                _COURSE_LOCKS.pop(k, None)
+                break
+        else:
+            try:
+                _COURSE_LOCKS.pop(next(iter(_COURSE_LOCKS)), None)
+            except (StopIteration, KeyError):
+                pass
+    lock = asyncio.Lock()
+    _COURSE_LOCKS[key] = (loop, lock)
     return lock
 
 
