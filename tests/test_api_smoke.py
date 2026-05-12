@@ -376,6 +376,11 @@ def test_status_qwen_url_host_strips_credentials_and_path(client, monkeypatch):
     # 正向：仅 hostname，剥光 scheme/userinfo/port/path/query
     assert body["qwen_raft_url_host"] == "host.example.com"
 
+    # review-swarm v2 LOW-2: 同时守住 qwen_raft_model_name 的 positive
+    # 分支 —— server.py 是 `config.QWEN_RAFT_MODEL_NAME if qwen_configured
+    # else None`，原先只测了 else 分支（test_status_qwen_fields_gated_on_url）。
+    assert body["qwen_raft_model_name"] == config.QWEN_RAFT_MODEL_NAME
+
     # 反向：凭据、端口、完整路径不得出现在响应中
     raw = r.text
     for sentinel in ["leakuser", "leakpass", "leaktoken", "48293", "/v1/chat", "https://leakuser"]:
