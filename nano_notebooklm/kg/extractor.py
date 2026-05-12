@@ -37,6 +37,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import os
 import random
 from typing import Any, Callable, Final, Literal
 
@@ -76,6 +77,15 @@ _STAGE_A_PARALLELISM = 3  # R5-1: per-file Stage A concurrency cap so a
                           # call per chapter and is small (one prompt,
                           # ≤30 chunk heads), so 3-way concurrency keeps
                           # latency reasonable without flooding upstream.
+# R5-2 fix-all v5: Stage B used to run `asyncio.gather(batch_size=5)` then
+# barrier on the whole batch before starting the next 5 — so a slow
+# straggler in batch i blocked the rest from kicking off. Flatten the
+# pipeline by using a single semaphore + flat gather across all sampled
+# chunks: every available worker grabs the next chunk the moment it's
+# free, no batch barriers. 10 is the safe default (codex proxy comfortably
+# handles ~10-15 rps); bump via env when running against a backend with
+# higher throughput, or lower it on rate-limited deployments.
+_STAGE_B_CONCURRENCY = int(os.getenv("KG_STAGE_B_CONCURRENCY", "10"))
 _TOPIC_NAME_MAX = 80     # F9: cap topic name to bound prompt-injection
 _TOPIC_DEF_MAX = 300     # F9: cap topic definition for the same reason
 _TOPIC_BAD_CHARS = ("\n", "\r", "\t", "`")  # F9: strip control / fence chars
@@ -534,43 +544,54 @@ async def extract_from_chunks(
             for t in topics:
                 t.learning_order = position.get(t.concept_id)
 
-    # ── Stage B flattened (R5-1 fix-all v1 #F2) ────────────────────────
-    # Pre-fix Stage B ran a sequential `for filename in files_ordered`
-    # outer loop with inner 5-chunk batches — small files under-filled
-    # the concurrency window and a 5-file × 6-chunk corpus took ~10
-    # sequential batches instead of 6 batches of 5. Flatten back to a
-    # single batched loop across all sampled chunks; the per-chunk
-    # topics arg is looked up from the same `_chunk_bucket_key` so each
-    # chunk still sees its OWN chapter's topics.
+    # ── Stage B fully pipelined (R5-2 fix-all v5 A) ────────────────────
+    # R5-1 fix-all v1 #F2 already flattened the outer per-file loop, but
+    # the inner `batch_size=5` loop still imposed a barrier: 5 chunks
+    # launch, await ALL 5, advance — a single straggler made the next 5
+    # chunks wait. For a 30-chunk upload with one slow chunk per batch
+    # that's ~6 stall windows.
+    #
+    # Now: one `asyncio.Semaphore(_STAGE_B_CONCURRENCY)` (default 10,
+    # env-tunable via `KG_STAGE_B_CONCURRENCY`) plus a flat
+    # `asyncio.gather` over every sampled chunk. Each worker grabs the
+    # next chunk as soon as it finishes its current one — no barriers.
+    # Progress is reported per-chunk-completion under a tiny lock so the
+    # emitted % stays monotonic even though tasks complete out of order.
     _emit(KG_STAGE_B, 0)
-    batch_size = 5
     all_concepts: list[Concept] = []
     all_relations: list[Relation] = []
+    stage_b_sem = asyncio.Semaphore(_STAGE_B_CONCURRENCY)
+    stage_b_total = max(1, len(sampled))
+    stage_b_done = 0
+    stage_b_lock = asyncio.Lock()
 
-    for i in range(0, len(sampled), batch_size):
-        batch = sampled[i:i + batch_size]
-        tasks = [
-            extract_concepts_from_chunk(
-                c, course_name, router,
-                topics=per_file_topics.get(_chunk_bucket_key(c.source_file), []),
-            )
-            for c in batch
-        ]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        for result in results:
-            if isinstance(result, Exception):
-                # Same PII-scrub discipline as Stage A.
-                logger.warning(
-                    "Batch extraction error: %s",
-                    getattr(result, "code", type(result).__name__),
+    async def _stage_b_for_chunk(c: Chunk):
+        nonlocal stage_b_done
+        async with stage_b_sem:
+            try:
+                return await extract_concepts_from_chunk(
+                    c, course_name, router,
+                    topics=per_file_topics.get(_chunk_bucket_key(c.source_file), []),
                 )
-                continue
-            concepts, relations = result
-            all_concepts.extend(concepts)
-            all_relations.extend(relations)
-        done = min(i + batch_size, len(sampled))
-        pct = max(1, min(99, int(100 * done / max(1, len(sampled)))))
-        _emit(KG_STAGE_B, pct)
+            finally:
+                async with stage_b_lock:
+                    stage_b_done += 1
+                    pct = max(1, min(99, int(100 * stage_b_done / stage_b_total)))
+                    _emit(KG_STAGE_B, pct)
+
+    tasks = [_stage_b_for_chunk(c) for c in sampled]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    for result in results:
+        if isinstance(result, Exception):
+            # Same PII-scrub discipline as Stage A.
+            logger.warning(
+                "Batch extraction error: %s",
+                getattr(result, "code", type(result).__name__),
+            )
+            continue
+        concepts, relations = result
+        all_concepts.extend(concepts)
+        all_relations.extend(relations)
     _emit(KG_STAGE_B, 100)
 
     # R4-4: cache concept_embedding on every non-root concept so graph_search

@@ -318,6 +318,93 @@ async def test_extract_from_chunks_stage_a_failure_falls_back_to_single_stage():
     assert all(c.concept_type != "topic" for c in concepts)
 
 
+async def test_stage_b_runs_without_batch_barrier(monkeypatch):
+    """R5-2 fix-all v5: pre-fix Stage B used `for i in range(0, N, 5)`
+    with `gather` per batch, so a single slow chunk in batch[0] blocked
+    batch[1] from kicking off. The fix flattens to one semaphore + flat
+    gather → every available worker grabs the next chunk immediately.
+
+    Pin the new behavior: with 8 chunks and concurrency=4, all 4 in-flight
+    slots must fill BEFORE the first chunk completes (proves no barrier).
+    Pre-fix this would only ever see 4 simultaneous calls anyway (batch
+    size 5, plus one for Stage A) BUT the in-flight peak would happen in
+    waves of 5; the fix lets it stay pegged at concurrency=4 for the
+    duration.
+    """
+    import asyncio as _asyncio
+    from nano_notebooklm.kg import extractor as ext_mod
+    from nano_notebooklm.kg.extractor import extract_from_chunks
+
+    # Lower the semaphore so the test can observe saturation without
+    # needing 10 chunks (keeps the regression cheap in CI).
+    monkeypatch.setattr(ext_mod, "_STAGE_B_CONCURRENCY", 4)
+
+    inflight = 0
+    peak_inflight = 0
+    inflight_lock = _asyncio.Lock()
+    release_gate = _asyncio.Event()
+    call_started = _asyncio.Event()
+
+    class _PeakRouter:
+        def __init__(self):
+            self.stage_a_returned = False
+            self.calls = 0
+
+        async def complete_structured(self, prompt, *, system="", task_type="", **kwargs):
+            nonlocal inflight, peak_inflight
+            self.calls += 1
+            # First call is Stage A — return immediately so we can
+            # measure Stage B saturation.
+            if not self.stage_a_returned:
+                self.stage_a_returned = True
+                return {
+                    "course_overview": "X.",
+                    "topics": [
+                        {"name": f"Topic{i}", "summary": "s", "weight": 5}
+                        for i in range(3)
+                    ],
+                }
+            # Stage B chunk call: increment inflight, wait for the gate.
+            async with inflight_lock:
+                inflight += 1
+                if inflight > peak_inflight:
+                    peak_inflight = inflight
+                call_started.set()
+            try:
+                await release_gate.wait()
+                return {
+                    "concepts": [{
+                        "name": "Leaf", "definition": "...", "type": "definition",
+                        "parent_topic": "Topic0",
+                    }],
+                    "relations": [],
+                }
+            finally:
+                async with inflight_lock:
+                    inflight -= 1
+
+    chunks = [_chunk(f"c{i}", f"Chunk {i} text") for i in range(8)]
+    router = _PeakRouter()
+    extract_task = _asyncio.create_task(
+        extract_from_chunks(chunks, "testcourse", router, max_chunks=8),
+    )
+
+    # Wait for the first Stage B call to start, then give the event loop
+    # time to schedule the rest up to the semaphore cap.
+    await _asyncio.wait_for(call_started.wait(), timeout=2.0)
+    for _ in range(20):
+        await _asyncio.sleep(0)  # let scheduler run pending Stage B starts
+    assert peak_inflight == 4, (
+        f"expected concurrency-cap saturation = 4, observed peak {peak_inflight}; "
+        "Stage B may have reintroduced a batch barrier"
+    )
+
+    # Release all stalled calls and let the task complete.
+    release_gate.set()
+    concepts, relations = await _asyncio.wait_for(extract_task, timeout=2.0)
+    assert any(c.depth >= 2 for c in concepts), "should have at least one leaf"
+
+
 async def test_extract_from_chunks_empty_corpus_no_llm_calls():
     """Corner: empty corpus → no LLM calls, no concepts, no relations."""
     from nano_notebooklm.kg.extractor import extract_from_chunks
