@@ -43,7 +43,7 @@ logger = logging.getLogger(__name__)
 # Cap chunks per query so a hub concept with 100 incident chunks can't blow
 # the LLM context window. GOAL.md R4-4 spec: hop_limit=2 must keep chunks
 # ≤ 30. Tunable via env for eval sweeps.
-DEFAULT_TOP_K_CONCEPTS = 5
+DEFAULT_TOP_K_CONCEPTS = 10  # 2026-05-13: 5 → 10 to widen cross-lingual seed
 DEFAULT_HOP_LIMIT = 2
 DEFAULT_MAX_CHUNKS = 30
 
@@ -60,7 +60,7 @@ _KG_LOAD_CACHE: dict[str, tuple[dict[str, Any], float, float]] = {}
 _KG_LOAD_CACHE_LOCK = threading.Lock()
 
 
-def _concept_embed_text(node: dict[str, Any]) -> str:
+def _concept_embed_text(node: dict[str, Any], chunk_text_lookup: dict[str, str] | None = None) -> str:
     """fix-all v1 #C8 + v3 #L5 (R4-4 review-swarm): adapter around the
     extractor's canonical helper so lazy-recompute embeddings can never
     drift from the cached batch-compute embeddings.
@@ -71,12 +71,26 @@ def _concept_embed_text(node: dict[str, Any]) -> str:
     surfaces at construction time (Pydantic ValidationError) rather than
     deep inside a graph_search broad-except clause that would drop every
     cache-miss node.
+
+    2026-05-13 cross-lingual fix: forward the chunk_text_lookup so lazy
+    recompute paths get the same anchoring excerpts that batch-extract
+    embeddings do. On legacy KGs the on-disk node has `chunk_ids` but no
+    `source_chunks`; synthesize a minimal source_chunks list from
+    chunk_ids so the enrichment path still kicks in.
     """
-    return _extractor_embed_text(Concept(
-        concept_id=str(node.get("id") or "shim"),
-        name=str(node.get("name") or ""),
-        definition=str(node.get("definition") or ""),
-    ))
+    source_chunks = node.get("source_chunks") or []
+    if not source_chunks:
+        chunk_ids = node.get("chunk_ids") or []
+        source_chunks = [{"chunk_id": cid} for cid in chunk_ids if cid]
+    return _extractor_embed_text(
+        Concept(
+            concept_id=str(node.get("id") or "shim"),
+            name=str(node.get("name") or ""),
+            definition=str(node.get("definition") or ""),
+            source_chunks=source_chunks,
+        ),
+        chunk_text_lookup,
+    )
 
 
 def _cache_key(course_id: str, artifacts_dir: Path) -> str:
@@ -218,6 +232,7 @@ def _resolve_node_embeddings(
     nodes: list[dict[str, Any]],
     embed_fn: Callable[[list[str]], Any],
     expected_dim: int,
+    chunk_text_lookup: dict[str, str] | None = None,
 ) -> dict[str, np.ndarray]:
     """fix-all v1 #B4 (R4-4 review-swarm): single-pass embedding resolver.
 
@@ -251,7 +266,7 @@ def _resolve_node_embeddings(
                 # Dimension mismatch → drop the stale cache, batch-recompute.
             except (TypeError, ValueError):
                 pass
-        text = _concept_embed_text(node)
+        text = _concept_embed_text(node, chunk_text_lookup)
         if text:
             to_compute.append((nid, text))
 
@@ -294,9 +309,21 @@ def _resolve_node_embeddings(
         _resolve_per_node(to_compute, embed_fn, expected_dim, cache)
         return cache
 
+    # 2026-05-13: write-back the freshly batched embeddings into the node
+    # dicts so the next graph_search call hits the (in-memory, _KG_LOAD_CACHE-
+    # backed) cache instead of paying ~1-2s of sentence-transformer time
+    # every chat. Crucial after the cross-lingual fix stripped on-disk
+    # `concept_embedding` to force re-embedding with the enriched text.
+    # We only mutate the in-memory dict; disk KG file is untouched.
+    node_by_id = {n.get("id"): n for n in nodes if n.get("id")}
     for (nid, _), emb in zip(to_compute, batch_arr):
         if emb.shape == (expected_dim,):
             cache[nid] = emb
+            target = node_by_id.get(nid)
+            if target is not None:
+                # Store as plain Python list so the cached dict stays
+                # JSON-serialisable if any caller later decides to flush.
+                target["concept_embedding"] = emb.tolist()
         else:
             logger.debug(
                 "graph_search: batch embed for %s shape %s != expected (%d,)",
@@ -366,9 +393,17 @@ def graph_search(
     top_k_concepts: int = DEFAULT_TOP_K_CONCEPTS,
     hop_limit: int = DEFAULT_HOP_LIMIT,
     max_chunks: int = DEFAULT_MAX_CHUNKS,
+    query_embedding: np.ndarray | None = None,
 ) -> list[SearchResult]:
     """Run GraphRAG retrieval against the named course's KG. See module
     docstring for the algorithm; see qa_skill.py for the fallback contract.
+
+    `query_embedding` (review-swarm graphrag-all-courses #MED-3, 2026-05-12):
+    when the caller fans `graph_search` out across multiple courses for
+    the same query (All Courses graphrag), precomputing the query
+    embedding once and threading it in here avoids N redundant
+    embed_fn([query]) calls (~80-640ms saved on a 8-course fan-out in
+    API mode). When None, falls back to the legacy in-function compute.
     """
     if not query or not query.strip():
         return []
@@ -386,38 +421,101 @@ def graph_search(
 
     # 1. Query embedding sets the expected dimension. Any KG node whose
     #    cached concept_embedding disagrees will be lazy-recomputed.
-    try:
-        q_out = embed_fn([query.strip()])
-        q_emb = np.asarray(q_out, dtype=np.float32)
+    if query_embedding is not None:
+        q_emb = np.asarray(query_embedding, dtype=np.float32)
         if q_emb.ndim == 2:
             q_emb = q_emb[0]
         if q_emb.ndim != 1:
-            logger.warning("graph_search: query embedding has rank %d, expected 1", q_emb.ndim)
+            logger.warning(
+                "graph_search: precomputed query embedding has rank %d, expected 1",
+                q_emb.ndim,
+            )
             return []
-    except Exception as exc:  # noqa: BLE001 — embed_fn failure cannot crash chat
-        # fix-all v2 #V5 (R4-4 review-swarm v2): drop exc_info=True on the
-        # query-embed path. In EMBEDDING_MODE=api, the openai-python SDK's
-        # exception object often carries the request body (`input=[query]`)
-        # in its repr/traceback, which would land the user's question in
-        # log shippers.
-        # fix-all v3 (R4-4 follow-up review-swarm): also drop `str(exc)`
-        # from the format args — `APIError.__str__` includes the request
-        # body, so even the message-only render (without exc_info) leaks
-        # the user's question text. Mirrors qa_skill.py:622-628.
-        code = getattr(exc, "code", type(exc).__name__)
-        logger.warning("graph_search: embed_fn failed on query (%s)", code)
-        return []
+        # v2 MED-3 (2026-05-13): trust boundary — caller-supplied ndarray
+        # could be empty, all-zero, or contain NaN/Inf (e.g. a buggy
+        # embed_fn that returned partially-resolved batch). Without this
+        # guard a NaN propagates into `np.dot` → cosine scores are
+        # non-deterministic under `sorted()` → ranking is garbage but no
+        # crash, so the bug would surface as silent retrieval miscompare.
+        if q_emb.size == 0:
+            logger.warning("graph_search: precomputed query embedding is empty")
+            return []
+        if not np.all(np.isfinite(q_emb)):
+            logger.warning(
+                "graph_search: precomputed query embedding contains NaN/Inf",
+            )
+            return []
+    else:
+        try:
+            q_out = embed_fn([query.strip()])
+            q_emb = np.asarray(q_out, dtype=np.float32)
+            if q_emb.ndim == 2:
+                q_emb = q_emb[0]
+            if q_emb.ndim != 1:
+                logger.warning("graph_search: query embedding has rank %d, expected 1", q_emb.ndim)
+                return []
+        except Exception as exc:  # noqa: BLE001 — embed_fn failure cannot crash chat
+            # fix-all v2 #V5 (R4-4 review-swarm v2): drop exc_info=True on the
+            # query-embed path. In EMBEDDING_MODE=api, the openai-python SDK's
+            # exception object often carries the request body (`input=[query]`)
+            # in its repr/traceback, which would land the user's question in
+            # log shippers.
+            # fix-all v3 (R4-4 follow-up review-swarm): also drop `str(exc)`
+            # from the format args — `APIError.__str__` includes the request
+            # body, so even the message-only render (without exc_info) leaks
+            # the user's question text. Mirrors qa_skill.py:622-628.
+            code = getattr(exc, "code", type(exc).__name__)
+            logger.warning("graph_search: embed_fn failed on query (%s)", code)
+            return []
 
     expected_dim = int(q_emb.shape[0])
+
+    # 2026-05-13 cross-lingual fix: when the query is mixed-language
+    # (Chinese chars + ASCII letters, e.g. "什么是attention机制"), the
+    # English-trained MiniLM embedding ranks Chinese-named concepts
+    # higher than English-named ones from other chapters — so an
+    # English Self-Attention concept in ch4(2).pdf gets silently
+    # ranked below Chinese BERT/WordPiece concepts in ch9.pdf. Build
+    # a SECOND query embedding from the ASCII-only stripped query
+    # ("attention" alone), embed both, and take MAX(cos_full, cos_ascii)
+    # per concept. The English-only signal lights up the English
+    # concepts even when the full Chinese-mixed query dilutes them.
+    aux_q_emb: np.ndarray | None = None
+    q = query.strip()
+    has_cjk = any("一" <= ch <= "鿿" for ch in q)
+    has_ascii_letter = any(ch.isascii() and ch.isalpha() for ch in q)
+    if has_cjk and has_ascii_letter:
+        ascii_only = "".join(ch if (ch.isascii() and (ch.isalpha() or ch.isspace())) else " " for ch in q)
+        ascii_only = " ".join(ascii_only.split())
+        if ascii_only and ascii_only.lower() not in {"is", "the", "a", "an", "what", "how"}:
+            try:
+                aux_out = embed_fn([ascii_only])
+                aux_q_emb = np.asarray(aux_out, dtype=np.float32)
+                if aux_q_emb.ndim == 2:
+                    aux_q_emb = aux_q_emb[0]
+                if aux_q_emb.shape != q_emb.shape or not np.all(np.isfinite(aux_q_emb)):
+                    aux_q_emb = None
+            except Exception:  # noqa: BLE001
+                aux_q_emb = None
 
     # 2. Resolve every non-root node's embedding in one pass (cached +
     #    batched lazy recompute). Score by cosine (dot = cosine on L2-
     #    normalised vectors).
+    # 2026-05-13 cross-lingual fix: pre-load chunks.json + build a
+    #    chunk_id → text lookup so lazy-recompute embeddings get the
+    #    same chunk-text anchoring as batch-extract ones (see
+    #    `extractor._concept_embed_text` for the rationale). Cheap —
+    #    we'd load chunks_idx later anyway for the materialisation step.
+    chunks_idx_early = _load_chunks_index(course_id, art)
+    chunk_text_lookup = {
+        cid: str(row.get("text") or "")
+        for cid, row in chunks_idx_early.items()
+    }
     non_root = [
         n for n in nodes
         if (n.get("concept_type") or "").lower() != "root"
     ]
-    embed_cache = _resolve_node_embeddings(non_root, embed_fn, expected_dim)
+    embed_cache = _resolve_node_embeddings(non_root, embed_fn, expected_dim, chunk_text_lookup)
     scored: list[tuple[float, dict[str, Any]]] = []
     for node in non_root:
         nid = node.get("id") or ""
@@ -425,6 +523,8 @@ def graph_search(
         if emb is None:
             continue
         score = float(np.dot(q_emb, emb))
+        if aux_q_emb is not None:
+            score = max(score, float(np.dot(aux_q_emb, emb)))
         scored.append((score, node))
 
     if not scored:
@@ -472,7 +572,8 @@ def graph_search(
     if not best_by_chunk:
         return []
 
-    chunks_idx = _load_chunks_index(course_id, art)
+    # chunks_idx already loaded at step 2 (cross-lingual fix).
+    chunks_idx = chunks_idx_early
 
     # 5. Materialise SearchResult list, sorted by sort_key desc, capped.
     ordered = sorted(best_by_chunk.items(), key=lambda kv: kv[1][0], reverse=True)

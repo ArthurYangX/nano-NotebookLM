@@ -91,10 +91,25 @@ QWEN_RAFT_URL = _validate_qwen_url(os.getenv("QWEN_RAFT_URL", ""))
 QWEN_RAFT_TOKEN = os.getenv("QWEN_RAFT_TOKEN", "")
 QWEN_RAFT_MODEL_NAME = os.getenv("QWEN_RAFT_MODEL_NAME", "qwen2.5-7b-raft")
 QWEN_RAFT_HTTP_TIMEOUT = float(os.getenv("QWEN_RAFT_HTTP_TIMEOUT", "60"))
+# 2026-05-13: parallel base Qwen2.5-7B-Instruct service for A/B compare
+# against RAFT. Same validation contract as the RAFT URL. Empty / unset
+# means base option is disabled in the Settings UI.
+QWEN_BASE_URL = _validate_qwen_url(os.getenv("QWEN_BASE_URL", ""))
+QWEN_BASE_MODEL_NAME = os.getenv("QWEN_BASE_MODEL_NAME", "qwen2.5-7b-instruct")
 
 # ── Embedding ────────────────────────────────────────────────────────
-EMBEDDING_MODE = os.getenv("EMBEDDING_MODE", "local")  # "local" or "api"
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
+# 2026-05-13: defaults switched to multilingual.
+# - "api" mode + "text-embedding-3-small": cos(zh, en) ≈ 0.82 (cross-lingual)
+# - "local" mode default now points at the multilingual MiniLM variant
+#   (paraphrase-multilingual-MiniLM-L12-v2, 471M, 384-dim, 50+ languages).
+#   The old "all-MiniLM-L6-v2" was English-only and ranked irrelevant Chinese
+#   chunks above on-topic English ones for any mixed-language query.
+EMBEDDING_MODE = os.getenv("EMBEDDING_MODE", "api")
+EMBEDDING_MODEL = os.getenv(
+    "EMBEDDING_MODEL",
+    "text-embedding-3-small" if os.getenv("EMBEDDING_MODE", "api") == "api"
+    else "paraphrase-multilingual-MiniLM-L12-v2",
+)
 
 # ── Chunking defaults ────────────────────────────────────────────────
 CHUNK_SIZE_TOKENS = 512

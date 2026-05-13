@@ -117,6 +117,14 @@ _COURSE_LOCKS: dict[tuple[int, str], tuple["asyncio.AbstractEventLoop", asyncio.
 _COURSE_LOCKS_MAX = 512
 
 
+# 2026-05-13: hold strong refs to fire-and-forget variant-gen tasks so they
+# don't get garbage-collected mid-await. asyncio.create_task only retains a
+# WEAK ref via its parent; without an external strong ref the task can be
+# silently cancelled. Tasks self-discard from the set on completion via
+# add_done_callback.
+_BACKGROUND_VARIANT_TASKS: set[asyncio.Task] = set()
+
+
 def _lock_for(course_id: str) -> asyncio.Lock:
     try:
         loop = asyncio.get_running_loop()
@@ -434,18 +442,44 @@ class ExamPrepSkill(Skill):
         for c in all_chunks:
             groups[c.source_file].append(c)
 
-        # Default max_topics = 4 per source_file (clamped to [4, 20]).
-        # Explicit `params.max_topics` always wins.
+        # 2026-05-13: enforce "at least 3 topics per source_file" floor
+        # in addition to the existing "4 per file" target ceiling. Without
+        # the floor, the LLM observed a 5-20 range on the NLP course
+        # (5 files → max 20) and chose 8 — one chapter (ch4 "传统机器
+        # 学习") collapsed Naive Bayes / 决策树 / SVM into a single
+        # topic, dropping legitimate exam coverage. Now:
+        #   min_topics = num_files * 3   (LLM MUST hit at least this)
+        #   max_topics = num_files * 4   (the "target" budget)
+        # Cap raised from 20 → 30 so 7+ file courses (min would be ≥21)
+        # don't get an inconsistent min > max constraint. Explicit
+        # `params.max_topics` still overrides the upper bound; the
+        # floor is then clamped to <= max so the prompt's
+        # "{min}-{max}" range stays valid.
+        target_per_file = 4
+        floor_per_file = 3
         if explicit_max_topics is not None:
             max_topics = int(explicit_max_topics)
         else:
-            max_topics = max(4, min(20, len(groups) * 4))
+            max_topics = max(target_per_file, min(30, len(groups) * target_per_file))
+        min_topics = max(floor_per_file, len(groups) * floor_per_file)
+        if min_topics > max_topics:
+            min_topics = max_topics
 
-        # Target ~20 sample chunks total, evenly spread. With 1 file
-        # this picks 20 chunks (head + middle + tail of the file); with
-        # 5 files this picks ~4 per file.
-        sample_budget = 20
-        per_file = max(2, sample_budget // max(1, len(groups)))
+        # 2026-05-13: scale `per_file` with the topic-count floor. The
+        # previous `sample_budget=20` → 4 chunks/file (on a 5-file course)
+        # routinely starved the LLM of mid-chapter content: ch4 of the
+        # NLP course (63 chunks covering Naive Bayes / 决策树 / SVM /
+        # Boosting) only contributed 4 evenly-spaced samples, so the LLM
+        # never saw the SVM-specific slides and naturally folded the
+        # whole chapter into one broad "传统机器学习" topic — no matter
+        # how loudly the prompt demanded 3 topics per file. New rule:
+        # show the LLM at least `2 × floor_per_file` chunks per file
+        # (== 6 for floor_per_file=3), and at least 10 for single-file
+        # courses where there are no sibling files to bulk-context the
+        # decision. Total budget grows ~linearly with file count, which
+        # is still cheap for gpt-5.5 (60 chunks × ~300 chars ≈ 18K tok).
+        per_file = max(10 if len(groups) == 1 else 6, floor_per_file * 2)
+        sample_budget = per_file * max(1, len(groups))
         sampled: list = []
         for source_file, chunks in groups.items():
             if not chunks:
@@ -486,6 +520,7 @@ class ExamPrepSkill(Skill):
 
         prompt = prompts.EXAM_PREP_TOPIC_PROMPT.format(
             course_name=course_id,
+            min_topics=min_topics,
             max_topics=max_topics,
             source_text=source_text,
         )
@@ -514,6 +549,18 @@ class ExamPrepSkill(Skill):
         topics_raw = data.get("topics") if isinstance(data, dict) else data
         if not isinstance(topics_raw, list):
             return SkillResult(success=False, error="topic_extraction_malformed")
+        # Diagnostic: always log the raw LLM count so we can see at a
+        # glance whether undersampling, prompt-disobedience, or
+        # downstream filtering is what limits final topic count.
+        logger.info(
+            "exam_prep plan: LLM returned %d raw topics (min_topics=%d max_topics=%d num_files=%d)",
+            len(topics_raw), min_topics, max_topics, len(groups),
+        )
+        if len(topics_raw) < min_topics:
+            logger.warning(
+                "exam_prep plan: LLM disobeyed floor (%d < %d)",
+                len(topics_raw), min_topics,
+            )
 
         # H4: when force=True, preserve old topic.questions for any new topic
         # whose normalized name matches an old topic. Pre-fix, a slight name
@@ -869,19 +916,44 @@ class ExamPrepSkill(Skill):
     async def submit_answers(
         self, course_id: str, params: dict, user_lang: str | None,
     ) -> SkillResult:
+        # 2026-05-13: split submit into a fast synchronous phase (grade +
+        # save) and an asynchronous variant-gen phase (LLM calls). Pre-fix,
+        # the user waited 8-15s on every submit because `asyncio.gather`
+        # over the wrong-topic variant tasks blocked the response. Now the
+        # response returns in ~50ms with grading + a `variants_pending`
+        # flag; the variant LLM calls run as a fire-and-forget background
+        # task that acquires the course lock on its own and merges into
+        # the bank when done. Next quiz / next view pulls them up.
         async with _lock_for(course_id):
-            return await self._submit_answers_locked(course_id, params, user_lang)
+            response, wrong_topic_ids = await self._grade_and_save_locked(
+                course_id, params,
+            )
+        # Lock released. If anything went wrong (no topics, bad input) or
+        # there were no wrong answers, return immediately. Otherwise kick
+        # off the background variant gen.
+        if wrong_topic_ids:
+            task = asyncio.create_task(
+                self._generate_variants_background(
+                    course_id, wrong_topic_ids, user_lang,
+                )
+            )
+            _BACKGROUND_VARIANT_TASKS.add(task)
+            task.add_done_callback(_BACKGROUND_VARIANT_TASKS.discard)
+        return response
 
-    async def _submit_answers_locked(
-        self, course_id: str, params: dict, user_lang: str | None,
-    ) -> SkillResult:
+    async def _grade_and_save_locked(
+        self, course_id: str, params: dict,
+    ) -> tuple[SkillResult, list[str]]:
+        """Grade phase only — no LLM calls. Returns (response, wrong_topic_ids).
+        Caller is responsible for spawning background variant gen using the
+        returned ids."""
         bank = load_bank(course_id)
         if not bank.get("topics"):
-            return SkillResult(success=False, error="no_topics — call action=plan first")
+            return SkillResult(success=False, error="no_topics — call action=plan first"), []
 
         answers = params.get("answers") or {}
         if not isinstance(answers, dict):
-            return SkillResult(success=False, error="answers_must_be_dict")
+            return SkillResult(success=False, error="answers_must_be_dict"), []
 
         topic_by_qid: dict[str, dict] = {}
         q_by_id: dict[str, dict] = {}
@@ -925,58 +997,94 @@ class ExamPrepSkill(Skill):
             })
 
         budget = variant_budget(len(wrong_topic_ids))
-        variants_added: dict[str, int] = {}
-        budget_capped = False  # L11: did per-topic cap (5) bite?
-        if budget > 0:
-            # L6: rotate kinds across topics (not per-topic) so a single submit
-            # spans both multi-choice + short-answer variants rather than
-            # bursting one shape. Pre-fix: kinds chosen by len(questions) % 2
-            # at task-creation time → all variants in one submit share one
-            # kind, then next submit flips.
-            tasks = []
-            target_ids = []
-            for idx, tid in enumerate(wrong_topic_ids):
-                topic = next((t for t in bank["topics"] if t["id"] == tid), None)
-                if topic is None:
-                    continue
-                kinds = (("multiple_choice",) if idx % 2 == 0 else ("short_answer",))
-                source_q = next(
-                    (q for q in reversed(topic.get("questions", []))
-                     if q.get("history") and not q["history"][-1].get("correct")),
-                    None,
-                )
-                tasks.append(self._generate_questions(
-                    course_id, topic, count=budget, kinds=kinds,
-                    variant_of=(source_q or {}).get("id"),
-                    user_lang=user_lang,
-                ))
-                target_ids.append(tid)
-            if tasks:
-                results = await asyncio.gather(*tasks, return_exceptions=True)
-                for tid, r in zip(target_ids, results):
-                    if isinstance(r, int) and r > 0:
-                        variants_added[tid] = r
-                    elif isinstance(r, Exception):
-                        # M1: type name only
-                        logger.warning(
-                            "variant gen failed for %s: %s",
-                            tid, type(r).__name__,
-                        )
-                # L11: did per-topic cap clip what was generated? (i.e. raw
-                # budget would have been higher if not capped at PER_TOPIC_CAP)
-                raw_per_topic = max(1, TOTAL_VARIANT_CAP // max(len(wrong_topic_ids), 1))
-                budget_capped = raw_per_topic > PER_TOPIC_VARIANT_CAP
+        # L11 (preserved): did per-topic cap clip what WOULD have been
+        # generated? Computed up front so we can surface in the immediate
+        # response even though variant gen is now async.
+        raw_per_topic = max(1, TOTAL_VARIANT_CAP // max(len(wrong_topic_ids), 1))
+        budget_capped = budget > 0 and raw_per_topic > PER_TOPIC_VARIANT_CAP
+        expected_variant_count = budget * len(wrong_topic_ids)
 
         save_bank(course_id, bank)
         return SkillResult(success=True, data={
             "graded": graded,
             "wrong_topic_count": len(wrong_topic_ids),
             "variant_budget_per_topic": budget,
-            "variants_added": variants_added,
+            # `variants_added` is now populated by the background task
+            # AFTER this response returns. Frontend uses `variants_pending`
+            # + `expected_variant_count` for the immediate "+N queued" chip
+            # and refreshes the bank later to see actual counts.
+            "variants_added": {},
+            "variants_pending": budget > 0 and bool(wrong_topic_ids),
+            "expected_variant_count": expected_variant_count,
             "budget_capped": budget_capped,
             "dropped_question_ids": dropped_question_ids,
             "view": self._compute_view(bank),
-        })
+        }), wrong_topic_ids
+
+    async def _generate_variants_background(
+        self,
+        course_id: str,
+        wrong_topic_ids: list[str],
+        user_lang: str | None,
+    ) -> None:
+        """Fire-and-forget variant generation. Acquires the course lock
+        freshly (the submit path already released it), reloads the bank,
+        runs N concurrent LLM calls (gated by _get_variant_semaphore), and
+        merges results back into the bank.
+
+        Errors are swallowed and logged — there's no caller to report to.
+        The next view / next_quiz will simply see the bank as-is.
+        """
+        budget = variant_budget(len(wrong_topic_ids))
+        if budget <= 0 or not wrong_topic_ids:
+            return
+        try:
+            async with _lock_for(course_id):
+                bank = load_bank(course_id)
+                if not bank.get("topics"):
+                    return
+                # Build tasks. L6 rotation preserved.
+                tasks = []
+                target_ids = []
+                for idx, tid in enumerate(wrong_topic_ids):
+                    topic = next((t for t in bank["topics"] if t["id"] == tid), None)
+                    if topic is None:
+                        continue
+                    kinds = (("multiple_choice",) if idx % 2 == 0 else ("short_answer",))
+                    source_q = next(
+                        (q for q in reversed(topic.get("questions", []))
+                         if q.get("history") and not q["history"][-1].get("correct")),
+                        None,
+                    )
+                    tasks.append(self._generate_questions(
+                        course_id, topic, count=budget, kinds=kinds,
+                        variant_of=(source_q or {}).get("id"),
+                        user_lang=user_lang,
+                    ))
+                    target_ids.append(tid)
+                if not tasks:
+                    return
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                added_total = 0
+                for tid, r in zip(target_ids, results):
+                    if isinstance(r, int) and r > 0:
+                        added_total += r
+                    elif isinstance(r, Exception):
+                        logger.warning(
+                            "background variant gen failed for %s: %s",
+                            tid, type(r).__name__,
+                        )
+                save_bank(course_id, bank)
+                logger.info(
+                    "exam_prep variants: course=%s wrong=%d budget=%d added=%d",
+                    course_id, len(wrong_topic_ids), budget, added_total,
+                )
+        except Exception as exc:
+            # M1: type-name only — this is a fire-and-forget task, swallow.
+            logger.warning(
+                "background variant gen crashed for %s: %s",
+                course_id, type(exc).__name__,
+            )
 
     # ── view / reset ───────────────────────────────────────────────
 

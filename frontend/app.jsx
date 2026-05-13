@@ -161,7 +161,10 @@ function App() {
   const [backend, setBackend] = useState(() => {
     try {
       const v = window.localStorage.getItem("nano-nlm:v1:backend");
-      return v === "qwen_raft" ? "qwen_raft" : "codex";
+      // 2026-05-13: qwen_base is the parallel base-Instruct option;
+      // accept it alongside qwen_raft. Anything else → default codex.
+      if (v === "qwen_raft" || v === "qwen_base") return v;
+      return "codex";
     } catch (e) { return "codex"; }
   });
   function commitBackend(value) {
@@ -420,9 +423,15 @@ function App() {
   // unset) or a silent fallback (URL set, host down). Auto-rollback
   // resets to codex once status confirms qwen is unavailable.
   useEffect(() => {
-    if (!backendStatus || backend !== "qwen_raft") return;
-    if (!backendStatus.qwen_raft_configured || !backendStatus.qwen_raft_available) {
-      commitBackend("codex");
+    if (!backendStatus) return;
+    if (backend === "qwen_raft") {
+      if (!backendStatus.qwen_raft_configured || !backendStatus.qwen_raft_available) {
+        commitBackend("codex");
+      }
+    } else if (backend === "qwen_base") {
+      if (!backendStatus.qwen_base_configured || !backendStatus.qwen_base_available) {
+        commitBackend("codex");
+      }
     }
   }, [backendStatus, backend]);
 
@@ -618,6 +627,15 @@ function App() {
   // Shape: null | { files: string[], review: bool }. Cleared when
   // streaming starts and on course switch (alongside noteCacheStats).
   const [notesTruncated, setNotesTruncated] = useState(null);
+  // Review-pass progress chip (2026-05-13): the second LLM pass polishes
+  // the merged per-file draft (unifies terminology, adds cross-refs,
+  // collapses duplicate definitions). Previously the frontend reset the
+  // visible notes to "" on `reviewing` and re-streamed the polished
+  // content from scratch → users perceived it as "regenerated twice".
+  // Now we keep the merged draft visible and only flip this flag so
+  // the topbar shows a chip explaining what's happening. Cleared when
+  // streaming starts and on course switch.
+  const [noteReviewing, setNoteReviewing] = useState(false);
 
   async function handleGenerateNotes({ force = false } = {}) {
     if (!activeCourse) { alert("Please select a specific course first (not 'All Courses')"); return; }
@@ -645,6 +663,7 @@ function App() {
     setStreamProgress(0);
     setNoteCacheStats(null);
     setNotesTruncated(null);
+    setNoteReviewing(false);
     setGenerationState(StudyState.createGenerationState());
     const fileSections = [];
     // fix-all v1 #19: mirror backend's _escape_latex_title (in
@@ -698,18 +717,19 @@ function App() {
     }
     let reviewPartial = "";
     let inReview = false;
-    // Throttle setRealNotes during review_chunk (review-swarm fix-all):
-    // backend ships ~10 deltas/sec; each setRealNotes invalidates the
-    // useMemo for latexToHtml(draft), which re-runs the 8-stage regex
-    // pipeline on an ever-growing string. Coalesce to ~250ms intervals.
-    let reviewSetTimer = null;
-    function scheduleReviewUpdate() {
-      if (reviewSetTimer) return;
-      reviewSetTimer = setTimeout(() => {
-        reviewSetTimer = null;
-        setRealNotes(reviewPartial);
-      }, 250);
-    }
+    // 2026-05-13: review pass no longer pushes deltas to `realNotes`
+    // mid-stream. Previously each `review_chunk` accumulated into
+    // `reviewPartial` then scheduleReviewUpdate() called
+    // `setRealNotes(reviewPartial)` every ~250ms — the visible document
+    // reset to empty on the first review_chunk (since reviewPartial
+    // started as "") and re-grew from scratch, which users perceived as
+    // "notes regenerated twice". We keep accumulating `reviewPartial`
+    // locally for two reasons: (a) terminal swap at end-of-stream uses
+    // `final.content || reviewPartial` as the canonical body, (b) the
+    // error catch block surfaces it as the retry-state partial. The
+    // `noteReviewing` chip (set on the `reviewing` event) gives users
+    // the progress feedback that mid-stream rendering used to provide.
+    // No reviewSetTimer needed — nothing to throttle.
     // Coalesce setRealNotes during cache-batch (review-swarm fix-all):
     // when N file_cached events arrive back-to-back, each previously
     // triggered an O(N) rebuildDraftFromFiles + latexToHtml render. Defer
@@ -835,14 +855,17 @@ function App() {
         } else if (event.type === "reviewing") {
           inReview = true;
           reviewPartial = "";
+          // Show the review-pass chip so the user knows the second LLM
+          // call is running (term unification / cross-refs). The merged
+          // draft from the per-file pass stays on screen until the final
+          // setRealNotes(content) below swaps in the polished body.
+          setNoteReviewing(true);
         } else if (event.type === "review_chunk") {
           // Backend ships `delta` only — review_chunk would otherwise be
-          // O(N²) on the wire. Accumulate locally.
+          // O(N²) on the wire. Accumulate locally for the terminal swap
+          // and retry-state surface, but DON'T setRealNotes here — see
+          // the comment on `reviewPartial`/`inReview` above.
           reviewPartial = reviewPartial + (event.delta || "");
-          // Throttle the React render to ~250ms (see scheduleReviewUpdate
-          // above); setGenerationState stays un-throttled because it only
-          // tracks partial text for retry state, no expensive re-render.
-          scheduleReviewUpdate();
           setGenerationState(s => StudyState.recordPartialGeneration(s, event.delta || ""));
         } else if (event.type === "error") {
           setGenerationState(s => StudyState.recordGenerationFailure(
@@ -852,13 +875,13 @@ function App() {
           ));
         }
       }, { userLang, force });
-      // Cancel any pending throttled review render — the next setRealNotes
-      // below installs the canonical final content.
-      if (reviewSetTimer) { clearTimeout(reviewSetTimer); reviewSetTimer = null; }
+      // Cancel any pending throttled file_delta render — the next
+      // setRealNotes below installs the canonical final content.
       if (fileDeltaTimer) { clearTimeout(fileDeltaTimer); fileDeltaTimer = null; }
       if (final && final.type === "error") throw new Error(final.error || "stream_failed");
       const content = (final && final.content) || reviewPartial || rebuildDraftFromFiles() || "Notes generation failed.";
       setRealNotes(content);
+      setNoteReviewing(false);
       saveCached(activeCourse, "notes", content);
       StudyState.saveNoteDraft(localStorage, activeCourse, content);
       // Truncation surface: backend's terminal `done` event carries
@@ -880,12 +903,11 @@ function App() {
       // Clear pending throttled renders BEFORE setting the error state —
       // otherwise a fire ~250ms later would overwrite the error banner
       // with a stale partial draft via setRealNotes(rebuildDraftFromFiles()).
-      // (Success path clears them at lines 889-890; mirror that here.)
-      if (reviewSetTimer) { clearTimeout(reviewSetTimer); reviewSetTimer = null; }
       if (fileDeltaTimer) { clearTimeout(fileDeltaTimer); fileDeltaTimer = null; }
       const msg = "Error: " + e.message;
       setRealNotes(prev => prev || rebuildDraftFromFiles() || msg);
       setGenerationState(s => StudyState.recordGenerationFailure(s, e, (s.failures || 0) + 1));
+      setNoteReviewing(false);
     }
     setStreaming(false);
   }
@@ -1290,29 +1312,48 @@ function App() {
               chip label and tooltips reflect whatever OPENAI_MODEL is
               actually in use (default gpt-5.5, was gpt-5.4 until tonight).
               Falls back to a generic "GPT" when /api/status hasn't loaded. */}
-          <button
-            className={"backend-chip mono backend-" + (backend === "qwen_raft" ? "qwen" : "codex")}
-            title={
-              !backendStatus
-                ? "Loading backend status..."
-                : !backendStatus.qwen_raft_configured
-                ? "Qwen-RAFT 未配置 (设置 QWEN_RAFT_URL 启用)"
-                : !backendStatus.qwen_raft_available
-                ? "Qwen-RAFT 不可用，自动使用 codex " + ((backendStatus && backendStatus.openai_model) || "GPT")
-                : "当前后端: " + (backend === "qwen_raft"
-                    ? ((backendStatus && backendStatus.qwen_raft_model_name) || "Qwen-RAFT")
-                    : "codex " + ((backendStatus && backendStatus.openai_model) || "GPT")) + " (点击切换)"
-            }
-            onClick={() => {
-              const next = backend === "qwen_raft" ? "codex" : "qwen_raft";
-              commitBackend(next);
-            }}
-            disabled={streaming || !backendStatus || !backendStatus.qwen_raft_configured || !backendStatus.qwen_raft_available}
-          >
-            {backend === "qwen_raft"
-              ? "🎓 Qwen"
-              : "🤖 " + (((backendStatus && backendStatus.openai_model) || "GPT").replace(/^gpt-/i, "GPT-"))}
-          </button>
+          {/* 2026-05-13: tri-state backend chip — Codex → Qwen-RAFT → Qwen-Base → Codex.
+              Each click cycles to the next AVAILABLE backend; disabled
+              entries auto-skip. Tooltip names the current one + says
+              "click to switch". Settings page has explicit radios for
+              the same three options. */}
+          {(() => {
+            const cycle = ["codex", "qwen_raft", "qwen_base"];
+            const avail = (b) => {
+              if (b === "codex") return true;
+              if (b === "qwen_raft") return !!(backendStatus?.qwen_raft_configured && backendStatus?.qwen_raft_available);
+              if (b === "qwen_base") return !!(backendStatus?.qwen_base_configured && backendStatus?.qwen_base_available);
+              return false;
+            };
+            const next = () => {
+              const i = cycle.indexOf(backend);
+              for (let k = 1; k <= cycle.length; k++) {
+                const cand = cycle[(i + k) % cycle.length];
+                if (avail(cand)) return cand;
+              }
+              return "codex";
+            };
+            const variant = backend === "qwen_raft" ? "qwen-raft" : backend === "qwen_base" ? "qwen-base" : "codex";
+            const label = backend === "qwen_raft"
+              ? "🎓 RAFT"
+              : backend === "qwen_base"
+                ? "🐧 Base"
+                : "🤖 " + (((backendStatus && backendStatus.openai_model) || "GPT").replace(/^gpt-/i, "GPT-"));
+            const tip = backend === "qwen_raft"
+              ? "Qwen-RAFT 微调 · 点击切换"
+              : backend === "qwen_base"
+                ? "Qwen-Instruct 基座 · 点击切换"
+                : "Codex · 点击切换";
+            const cantPickAnyQwen = !avail("qwen_raft") && !avail("qwen_base");
+            return (
+              <button
+                className={"backend-chip mono backend-" + variant}
+                title={tip}
+                onClick={() => commitBackend(next())}
+                disabled={streaming || cantPickAnyQwen && backend === "codex"}
+              >{label}</button>
+            );
+          })()}
           <button className="icon-btn" title="Generate Notes (uses cache when available)" onClick={() => handleGenerateNotes()} disabled={streaming}>📝</button>
           <button
             className="icon-btn"
@@ -1328,6 +1369,14 @@ function App() {
                 : `${noteCacheStats.cached} cached · ${noteCacheStats.fresh} fresh`}
             >
               {noteCacheStats.force ? "🔄" : "⚡"}{noteCacheStats.cached}/{noteCacheStats.total}
+            </span>
+          )}
+          {noteReviewing && (
+            <span
+              className="cache-chip mono cache-reviewing"
+              title="第二轮：统一术语 / 加交叉引用 / 折叠重复定义。完成后会一次性替换为润色版。"
+            >
+              ✨ 润色中
             </span>
           )}
           {notesTruncated && (notesTruncated.review || notesTruncated.files.length > 0) && (
@@ -1360,12 +1409,34 @@ function App() {
           {/* 2026-05-12: settings entry. Single source of truth — the
               Settings tab was retired from the main tab bar so this icon
               is the only way in. Persona / language / backend / cache
-              management all live in the Settings view. */}
+              management all live in the Settings view.
+
+              2026-05-13: do NOT mirror the neighbour icon-buttons'
+              `disabled={streaming}`. Those start generations (KG / exam
+              analysis / report / mastery) so blocking them mid-stream
+              prevents accidental double-fires. Settings is a navigation
+              switch to a read-only preferences view — it should stay
+              reachable during a notes/quiz/report stream so the user
+              can clear cache or change language while waiting.
+
+              Also dismiss any terminal-state processing modal (done or
+              error) on click. Without this, an upload that errored
+              leaves `processing` non-null with `errorStage` set, which
+              locks `effectiveMode = "processing"` (see line ~1195) and
+              hides Settings even after mode === "settings". The retry
+              button inside the Processing screen is the normal exit,
+              but a user who just wants to bail to Settings shouldn't
+              be trapped. Mid-flight uploads (no done, no errorStage)
+              are NOT dismissed — those still need to finish. */}
           <button
             className={"icon-btn" + (mode === "settings" ? " active" : "")}
             title="Settings (helper name, language, backend, cache)"
-            onClick={() => setMode("settings")}
-            disabled={streaming}
+            onClick={() => {
+              if (processing && (processing.done || processing.errorStage)) {
+                setProcessing(null);
+              }
+              setMode("settings");
+            }}
           >⚙</button>
         </div>
       </header>
@@ -1405,7 +1476,18 @@ function App() {
           <button className="tool mono" style={{ fontSize: 11 }}>{activeSources.length}/{sources.length} sources</button>
         </div>
         <div className="workspace">
-          {(!uploading && !processing && visibleCourses.length === 0) && (
+          {/* 2026-05-13: the empty-courses CTA is `height/width:100%` and
+              `.workspace` is `overflow:hidden`, so when visibleCourses is
+              empty (e.g. all courses hidden via 管理 modal) it covers
+              whatever mode-specific view rendered below it. Settings and
+              History are course-agnostic and are the exact escape hatches
+              the user needs in that state ("全部恢复显示" lives in
+              Settings) — gate the CTA off those two modes so the user
+              can actually reach them. */}
+          {(!uploading && !processing
+            && visibleCourses.length === 0
+            && effectiveMode !== "settings"
+            && effectiveMode !== "history") && (
             <div className="empty-courses-cta" data-testid="empty-courses">
               <div className="empty-courses-card">
                 <div className="empty-courses-glyph">📂</div>
@@ -1547,6 +1629,12 @@ function App() {
       </main>
 
       {/* ========= Assistant ========= */}
+      {/* 2026-05-13: derive the source_file the user is currently viewing
+          in Reader (activeId → matching source.sourceFile) and pass it
+          down to Assistant so chat sends `active_source_file` to /api/chat.
+          The backend uses it as a soft retrieval bias (graphrag boosts
+          hits from this file). null when the user has no focused file
+          (e.g. All Courses with nothing picked, or sources list empty). */}
       <Assistant
         mode={effectiveMode}
         persona={persona}
@@ -1562,6 +1650,7 @@ function App() {
         checkedFiles={getCheckedSourceFiles()}
         userLang={userLang}
         backend={backend}
+        activeSourceFile={(sources.find(s => s.id === activeId) || {}).sourceFile || null}
       />
 
       {/* ========= Status bar ========= */}
@@ -2804,17 +2893,23 @@ function RealNotesView({ content, streaming, activeCourse, sources, onContentCha
         >{effectiveCollapsed ? "▸ Tools" : "▾ Tools"}</button>
         {!effectiveCollapsed && (
           <>
-            <button className="btn ghost" onClick={() => { setEditing(!editing); setSelMenu(null); setPopover(null); }}>{editing ? "Preview" : "Edit"}</button>
+            {/* 2026-05-13: Edit button hidden by user request. The
+                CodeMirror editor + setEditing state machinery stays in
+                place — if you want it back, restore this button. The
+                Preview rendering, highlights, TOC, and export paths
+                are all independent of editing mode. */}
             <button className="btn ghost" onClick={downloadLatex} title="下载 .tex 源文件">.tex</button>
             <button className="btn ghost" onClick={printPdfFromBrowser} title="浏览器打印（快速预览）">PDF (print)</button>
-            <button
-              className="btn ghost"
-              onClick={compilePdfWithTectonic}
-              disabled={tectonicAvailable === false}
-              title={tectonicAvailable === false
-                ? "Tectonic 不可用：服务器未安装 LaTeX 编译器"
-                : "服务端 LaTeX 编译（学术排版）"}
-            >PDF (compile)</button>
+            {tectonicAvailable !== false && (
+              <button
+                className="btn ghost"
+                onClick={compilePdfWithTectonic}
+                disabled={tectonicAvailable === null}
+                title={tectonicAvailable === null
+                  ? "检查 tectonic 状态中…"
+                  : "服务端 LaTeX 编译（学术排版）"}
+              >PDF (compile)</button>
+            )}
             <button className="btn ghost" onClick={() => setShowToc(v => !v)} disabled={editing}>{showToc ? "Hide TOC" : "Show TOC"}</button>
             <button className="btn ghost" onClick={() => setShowDrawer(v => !v)} disabled={editing}>{showDrawer ? "Hide Highlights" : `Highlights · ${highlights.length}`}</button>
           </>

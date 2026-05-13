@@ -55,17 +55,23 @@ const API = {
     return res.json();
   },
 
-  async chat(question, courseId = null, topK = 5, checkedFiles = null, { signal } = {}, { userLang = null, backend = null, persona = null } = {}) {
+  async chat(question, courseId = null, topK = 5, checkedFiles = null, { signal } = {}, { userLang = null, backend = null, persona = null, activeSourceFile = null } = {}) {
     const body = {
       question, course_id: courseId, top_k: topK, checked_files: checkedFiles,
     };
     if (userLang) body.user_lang = userLang;
     // R4-5 part 2: thread the backend chip selection through to ChatRequest.
     // Server-side Pydantic Literal rejects anything other than "codex"/"qwen_raft".
-    if (backend === "codex" || backend === "qwen_raft") body.backend = backend;
+    if (backend === "codex" || backend === "qwen_raft" || backend === "qwen_base") body.backend = backend;
     // 2026-05-12: persona chip — empty / null means use server default.
     if (persona && typeof persona === "string" && persona.trim()) {
       body.persona = persona.trim();
+    }
+    // 2026-05-13: source_file the user is currently viewing in Reader,
+    // surfaced as a soft retrieval bias on the backend (graphrag boosts
+    // hits from this file). null when on All Courses / no focused file.
+    if (activeSourceFile && typeof activeSourceFile === "string") {
+      body.active_source_file = activeSourceFile;
     }
     return _post("/chat", body, { signal });
   },
@@ -166,8 +172,12 @@ const API = {
   // `userLang` ∈ {"zh","en",null} threads the user's language preference
   // down to topic + question generation so the LLM doesn't echo the
   // source-material language when the student picked the other one.
-  async examPrepPlan(courseId, { maxTopics = 8, force = false, userLang = null } = {}) {
-    const body = { course_id: courseId, max_topics: maxTopics, force };
+  async examPrepPlan(courseId, { maxTopics = null, force = false, userLang = null } = {}) {
+    // 2026-05-13: maxTopics now defaults to null so the backend's
+    // auto-scaling kicks in (≥3 topics per file). Passing an explicit
+    // number still pins the count via the API's `max_topics` field.
+    const body = { course_id: courseId, force };
+    if (maxTopics != null) body.max_topics = maxTopics;
     if (userLang) body.user_lang = userLang;
     return _post("/exam-prep/plan", body);
   },

@@ -257,7 +257,11 @@ async def test_complete_posts_to_v1_chat_completions(monkeypatch):
     assert isinstance(body, dict)
     assert "fn_index" not in body
     assert "data" not in body
-    assert body["model"] == "qwen2.5-7b-raft"   # config default
+    # Operator's local .env can override QWEN_RAFT_MODEL_NAME (CLAUDE.md
+    # documents dotenv override=True), so compare against the live
+    # config value rather than the hardcoded default string.
+    from nano_notebooklm import config as _cfg
+    assert body["model"] == _cfg.QWEN_RAFT_MODEL_NAME
     assert body["stream"] is False
 
     msgs = body["messages"]
@@ -422,7 +426,9 @@ async def test_health_check_returns_ok_when_model_loaded(monkeypatch):
     assert h["ok"] is True
     assert h["status"] == 200
     # Operator-configured value wins; upstream malicious string never surfaced.
-    assert h["model"] == "qwen2.5-7b-raft"
+    # .env override means we compare against live config, not the default string.
+    from nano_notebooklm import config as _cfg
+    assert h["model"] == _cfg.QWEN_RAFT_MODEL_NAME
     assert "/etc/passwd" not in str(h)
     # Probed /health, not /.
     assert stub.calls[0]["url"] == "http://example.com:8001/health"

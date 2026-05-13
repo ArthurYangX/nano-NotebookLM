@@ -210,7 +210,11 @@ QA_PROMPT = """Reference documents:
 
 Question: {question}
 
-Answer concisely based on the documents above. Cite key claims with [Source: filename, location]."""
+Answer concisely based on the documents above. Cite key claims with [Source: filename, location].
+
+If the documents contain partial information about the topic — even a one-line equivalence, a brief mention, a related concept, or a fragment under a topic header — synthesize a concise answer from those fragments rather than refusing. Course slides often state core ideas as terse bullets (e.g. "X = Y", "X is a special case of Y") that are themselves the answer in lecture context.
+
+Only say "not directly covered in the provided materials" when no document fragment mentions the topic at all."""
 
 # ── Concept extraction ───────────────────────────────────────────────
 CONCEPT_EXTRACTION_SYSTEM = (
@@ -494,7 +498,7 @@ EXAM_PREP_SYSTEM = (
 EXAM_PREP_TOPIC_PROMPT = """Extract the most exam-relevant topics from this course material.
 
 Course: {course_name}
-Max topics: {max_topics}
+Required topic count: {min_topics}–{max_topics} (you MUST output at least {min_topics})
 
 Source material:
 {source_text}
@@ -513,7 +517,13 @@ Output a JSON object:
 
 Rules:
 - `weight` ∈ [0,1] reflects exam importance (frequency × difficulty × foundational).
-- Pick 5–{max_topics} topics that cover the breadth of the syllabus.
+- Output AT LEAST {min_topics} topics and AT MOST {max_topics}. The lower bound
+  exists because each source file is required to contribute at least 3 topics
+  on average — do NOT collapse multiple distinct concepts from one file into a
+  single broad topic (e.g. for a "传统机器学习" chapter covering Naive Bayes,
+  decision trees, and SVM, emit three topics, not one).
+- Spread topics across the breadth of the syllabus; avoid concentrating all
+  picks in one or two files.
 - `source_chunks` must reference chunk_ids that appear in the supplied source material; pick 1–4 per topic.
 - If the system prompt contains a user-language binding, follow it strictly; otherwise default to the dominant language of the source material."""
 
@@ -607,12 +617,25 @@ def USER_LANG_BINDING(lang: str | None) -> str:
     if lang not in _USER_LANG_LABELS:
         return ""
     label = _USER_LANG_LABELS[lang]
+    other = "English" if lang == "zh" else "Chinese (中文)"
+    # 2026-05-13: rewrote to be far more emphatic. Qwen-RAFT in particular
+    # was observed echoing the source-material language (English ch4(2).pdf
+    # slides → English reply, even with `user_lang=zh` set). Codex GPT-5.5
+    # follows the original soft binding fine, but Qwen needs the explicit
+    # "even if the references are in {other}, you MUST reply in {label}"
+    # admonition plus a concrete example so it doesn't slip back into
+    # source language. Hard-coded for both zh→en and en→zh directions.
     return (
-        f"User language preference: Reply ONLY in {lang} ({label}). "
-        f"This overrides rule #4 above and any language hint inferred from "
-        f"the question or reference documents. If the references are in a "
-        f"different language, translate the relevant ideas into {label} "
-        f"before answering — do not echo source-language sentences verbatim."
+        f"CRITICAL OUTPUT LANGUAGE REQUIREMENT — Reply ONLY in {lang} ({label}).\n"
+        f"This overrides rule #4 above and any language hint inferred from the "
+        f"question or reference documents.\n"
+        f"Even when the reference documents are written in {other}, you MUST "
+        f"produce the entire response — definitions, explanations, paraphrased "
+        f"quotes, citation lead-ins — in {label}. The ONLY tokens that may "
+        f"remain in their original form are: proper nouns (e.g. \"Transformer\", "
+        f"\"BERT\"), formula symbols, and the exact file/page citation tags. "
+        f"Do not copy source-language sentences verbatim; translate the "
+        f"meaning into {label} first."
     )
 
 

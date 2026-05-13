@@ -436,6 +436,12 @@ def _annotate_quote_sources(answer: str, results: list[SearchResult]) -> str:
                 sf, loc, _txt, _txt_norm = candidates[best[0]]
                 source_tag = f"[Source: {sf}, {loc}]"
 
+        # 2026-05-13: top-rank fallback REVERTED. Real-user test showed
+        # graphrag often retrieved a wrong-chapter top chunk (e.g. ch1
+        # for an HMM question), and the `?` tag still pointed users to
+        # the wrong PDF page. Better to ship a bare blockquote than a
+        # confidently-wrong link.
+
         trailing_newline = "\n" if m.group(0).endswith("\n") else ""
         # When source_tag is None (neither substring nor fuzzy match
         # cleared the floor) we ship the blockquote / math block bare —
@@ -494,6 +500,12 @@ class QASkill(Skill):
         # name is consistent across rag / general / translated /
         # cross-course / graphrag paths.
         persona = params.get("persona")
+        # 2026-05-13: optional source_file the user is currently viewing
+        # in Reader. Used as a soft retrieval bias — graphrag bumps the
+        # ranking of hits from this file, and the score-gated RAG path
+        # gets a small boost for matching `source_file`. NOT a hard
+        # filter (use `checked_files` for that).
+        active_source_file = params.get("active_source_file") or None
 
         if not question:
             return SkillResult(success=False, error="No question provided")
@@ -548,6 +560,60 @@ class QASkill(Skill):
             else:
                 graphrag_results = await self._maybe_graphrag_all_courses(question)
                 graphrag_scope = "all-courses"
+            # 2026-05-13: active-file soft boost + injection.
+            # Phase 1 — boost already-retrieved chunks from the active file.
+            # Phase 2 — if active file produced ZERO hits (e.g. graphrag
+            # seeds were dominated by a sibling chapter due to embedding
+            # mono-lingual bias), inject up to 5 fresh hits from kb.search
+            # restricted to that file. This rescues the "user reading
+            # ch4(2) asks about RNN → graphrag pulls ch1 only" failure
+            # mode the dual-q embed alone can't fix.
+            if active_source_file:
+                from nano_notebooklm.types import SearchResult as _SR
+                active_hits = [r for r in (graphrag_results or []) if r.source_file == active_source_file]
+                if active_hits:
+                    # Phase 1: boost existing active-file chunks.
+                    boosted: list = []
+                    for r in (graphrag_results or []):
+                        if r.source_file == active_source_file:
+                            boosted.append(_SR(
+                                chunk_id=r.chunk_id, text=r.text,
+                                source_file=r.source_file, location=r.location,
+                                score=r.score + 0.15, course_id=r.course_id,
+                            ))
+                        else:
+                            boosted.append(r)
+                    boosted.sort(key=lambda r: r.score, reverse=True)
+                    graphrag_results = boosted
+                else:
+                    # Phase 2: no active-file hits in graphrag — inject
+                    # via hybrid search restricted to that file. We can't
+                    # just rely on the existing checked_files filter
+                    # because checked_files isn't set here. Build a small
+                    # ad-hoc result list and merge.
+                    try:
+                        fallback = self.kb.search(
+                            question, top_k=10, course_id=course_filter,
+                        )
+                        # filter to the active file
+                        from_file = [r for r in fallback if r.source_file == active_source_file]
+                        if from_file:
+                            # Score these slightly higher than typical
+                            # graphrag noise so they take precedence.
+                            graphrag_results = (graphrag_results or []) + [
+                                _SR(
+                                    chunk_id=r.chunk_id, text=r.text,
+                                    source_file=r.source_file, location=r.location,
+                                    score=max(r.score, 0.3) + 0.2,
+                                    course_id=r.course_id,
+                                )
+                                for r in from_file[:5]
+                            ]
+                            graphrag_results.sort(key=lambda r: r.score, reverse=True)
+                    except Exception:  # noqa: BLE001
+                        # search failure is best-effort; fall through to
+                        # the original graphrag result list.
+                        pass
             # fix-all v1 #A3 + v2 #V3: admission gate uses passes_score_gate
             # with a graphrag-specific cosine floor (default 0.15) instead of
             # the original `len >= 2` check.
@@ -1122,11 +1188,20 @@ class QASkill(Skill):
                     "qwen_raft backend failed (%s); falling back to default routing",
                     code,
                 )
-            # #V1: fall back to **default task routing** (no explicit
-            # backend pin). Avoids the codex→openai hard assumption.
+            # 2026-05-13 hotfix: when qwen_raft fails, fall back to
+            # qwen_base (also Qwen, same RAG output style) instead of
+            # running default routing. Default routing on a codex-
+            # daily-exhausted day hits openai → 403 ×2 → router internal
+            # fallback to qwen_raft → another wrapper timeout → 7-min
+            # double-loop. Pinning qwen_base here makes the fallback
+            # deterministic and fast (~30s). #V1 originally pointed at
+            # default routing to support claude-only deployments; that
+            # path still works because qwen_base is configured iff the
+            # operator opted into the dual-Qwen setup.
             resp = await self.router.complete(
                 prompt, task_type=task_type, system=system,
                 temperature=temperature, max_tokens=max_tokens,
+                backend="qwen_base",
             )
             return resp, True
 
@@ -1182,7 +1257,33 @@ class QASkill(Skill):
                 "what I found' is the correct answer in that case."
             )
 
-        prompt = prompts.QA_PROMPT.format(context=context, question=question)
+        # 2026-05-13: Qwen-RAFT empirically weights user-message instructions
+        # more than system, AND tends to echo the prompt's own language.
+        # When user_lang=zh + backend=qwen_raft, swap the QA scaffolding
+        # to a Chinese version so the model sees Chinese instructions and
+        # naturally answers in Chinese. Codex follows the soft system-
+        # prompt binding fine, so we only flip the scaffolding for qwen.
+        if user_lang == "zh" and backend == "qwen_raft":
+            prompt = (
+                "参考资料：\n\n"
+                f"{context}\n\n"
+                "---\n\n"
+                f"问题：{question}\n\n"
+                "请根据上述参考资料用**中文**简洁作答；关键论断要标注引用 [Source: 文件名, 页码]。"
+                "即使参考资料是英文写的，你也必须输出中文翻译后的解释，不要直接照搬英文句子。"
+                "**重要**：如果参考资料中出现 PPT/OCR 抽取出的碎片化数学符号"
+                "（例如 `q1 k1 ρ1 α3,1 α3,2 ρ1, ρ2, ρ3` 这种零散字符），"
+                "请用标准 LaTeX 公式重新表达（例如 `$\\mathrm{Attention}(Q,K,V) = "
+                "\\mathrm{softmax}(QK^\\top/\\sqrt{d_k}) V$`），"
+                "**绝对不要**逐字复述这些碎片符号 — 复述会陷入 token 循环。"
+                "如果参考资料里没有完整公式，明确说"
+                "「资料中没有给出完整公式」即可，不要编造。"
+            )
+        elif user_lang == "en" and backend == "qwen_raft":
+            prompt = prompts.QA_PROMPT.format(context=context, question=question)
+            prompt += "\n\n[OUTPUT LANGUAGE — MANDATORY] Reply ONLY in English; do not echo Chinese verbatim."
+        else:
+            prompt = prompts.QA_PROMPT.format(context=context, question=question)
         resp, fell_back = await self._complete_with_backend_fallback(
             prompt, task_type="qa_answer", system=system, temperature=0.3,
             backend=backend,

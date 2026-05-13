@@ -402,17 +402,44 @@ async def extract_concepts_from_chunk(
 # ── Orchestration ───────────────────────────────────────────────────
 
 
-def _concept_embed_text(c: Concept) -> str:
-    """Text fed to the embedding model for a concept node. Name + definition
-    captures more semantic surface than name alone — a node called "Encoder"
-    is ambiguous, "Encoder。The half of a transformer that maps tokens to
-    contextual representations." is not. Truncate at 600 chars to keep batch
-    sizes predictable on long definitions.
+def _concept_embed_text(c: Concept, chunk_text_lookup: dict[str, str] | None = None) -> str:
+    """Text fed to the embedding model for a concept node.
+
+    2026-05-13 cross-lingual fix: pre-fix the text was just `name。definition`,
+    both of which inherit the SOURCE document's language. A KG built from an
+    English slide deck ends up with concept names like "Self-Attention" and
+    English definitions — when a Chinese-speaking user queries "什么是
+    attention机制", the all-MiniLM-L6-v2 embedding (English-leaning) ranks
+    Chinese-named concepts from sibling chapters higher than the actual
+    English match, so GraphRAG silently routes to the wrong file.
+
+    The fix: when chunk text lookup is available (provided by extractor +
+    graph_search lazy-recompute), append up to ~300 chars of the FIRST
+    source chunk's text. This grounds the concept embedding in the real
+    domain vocabulary that appears in the source — "Self-Attention" gets
+    the surrounding "Transformer Positional Encoding Multi-Head Q K V
+    softmax attention weights..." context, which materially raises the
+    cosine for any query touching the same vocab, regardless of language.
+
+    Truncate the whole package at 800 chars (was 600) — slight bump for
+    the added context. Still cheap on batch-embed runtime.
     """
     name = (c.name or "").strip()
     definition = (c.definition or "").strip()
     text = f"{name}。{definition}" if definition else name
-    return text[:600]
+    if chunk_text_lookup:
+        for sc in (c.source_chunks or [])[:2]:
+            cid = sc.get("chunk_id") if isinstance(sc, dict) else None
+            if not cid:
+                continue
+            chunk_text = chunk_text_lookup.get(cid)
+            if not chunk_text:
+                continue
+            excerpt = " ".join(chunk_text.split())[:300]
+            if excerpt:
+                text = f"{text} | {excerpt}"
+                break  # one excerpt is enough; more dilutes the concept signal
+    return text[:800]
 
 
 async def extract_from_chunks(
@@ -634,8 +661,13 @@ async def extract_from_chunks(
     all_topics_flat: list[Concept] = [t for f in files_ordered for t in per_file_topics[f]]
     targets: list[Concept] = [*all_topics_flat, *all_concepts]
     if embed_fn is not None and targets:
+        # 2026-05-13 cross-lingual fix: thread a chunk_id → text lookup so
+        # `_concept_embed_text` can append a short excerpt of the source
+        # chunk to the embedding text. Anchors concept embeddings in
+        # real domain vocabulary so cross-language queries still hit.
+        chunk_text_lookup = {c.chunk_id: c.text for c in chunks}
         try:
-            texts = [_concept_embed_text(c) for c in targets]
+            texts = [_concept_embed_text(c, chunk_text_lookup) for c in targets]
             embs = await asyncio.to_thread(embed_fn, texts)
             # embed_fn returns either np.ndarray (shape [n, d]) or list[list[float]].
             for c, emb in zip(targets, embs):

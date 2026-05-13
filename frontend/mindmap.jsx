@@ -465,6 +465,18 @@ function MindMap({ data, layout, courseId, highlightedId, onNodeClick, onSourceC
       } else if (e.key === "F2" || e.key === "Enter") {
         e.preventDefault();
         startEditingNode(selectedId);
+      } else if (e.key === "Escape") {
+        // 2026-05-13: ESC deselects. Matches the click-on-background
+        // path; gives a keyboard escape hatch for users navigating
+        // without a mouse / trackpad. Guarded by the `editingId`
+        // check above so ESC during inline rename keeps cancelling
+        // the rename instead. Also clear the parent's
+        // `highlightedNode` via onNodeClick(null) so the dashed
+        // "hot" outline (isHot reads `highlightedId === n.id`)
+        // disappears alongside the solid "selected" outline.
+        e.preventDefault();
+        setSelectedId(null);
+        onNodeClick && onNodeClick(null);
       }
     }
     window.addEventListener("keydown", onKey);
@@ -600,11 +612,16 @@ function MindMap({ data, layout, courseId, highlightedId, onNodeClick, onSourceC
           // top of the sim's authoritative x,y on every tick → node
           // visually jumps after mouseup. Only write to fx/fy (sim's
           // pin mechanism) during drag, and skip the offsets state.
-          // fix-all v1 #A4: skip the alphaTarget(0.2).restart() per
-          // mousemove — it re-enters the d3 timer every frame and
-          // amplifies the tick storm. alphaTarget(0.2) once at
-          // mousedown is enough; sim keeps ticking until alphaTarget
-          // is reset on mouseup.
+          // fix-all v1 #A4 / 2026-05-13: warm the sim on the FIRST real
+          // drag movement, not on mousedown — a pure click (mousedown
+          // → mouseup, no move) leaves `simWarmed=false` and the sim
+          // stays at rest, so tap-to-select doesn't shake the graph.
+          // The `simWarmed` flag keeps the original single-warm
+          // invariant (one alphaTarget bump per drag, not per frame).
+          if (!d.simWarmed) {
+            simRef.current.alphaTarget(0.2).restart();
+            d.simWarmed = true;
+          }
           const simNode = simRef.current.nodes().find(n => n.id === d.id);
           if (simNode) {
             simNode.fx = d.baseX + dx;
@@ -648,6 +665,17 @@ function MindMap({ data, layout, courseId, highlightedId, onNodeClick, onSourceC
           setPendingEdge({ source: d.id, target: targetId });
         }
         setConnectDrag(null);
+      } else if (d.kind === "pan" && !d.moved) {
+        // 2026-05-13: pure click on canvas background (mousedown +
+        // mouseup, no pan movement) → deselect any selected node. Gives
+        // the user a way out of the selected state without having to
+        // click another node. Drag-to-pan stays unchanged (d.moved
+        // becomes true on first mousemove → this branch doesn't fire).
+        // Also notify the parent so the App-level `highlightedNode`
+        // clears — otherwise the node keeps its dashed "hot" outline
+        // (isHot reads `highlightedId === n.id`, driven by the parent).
+        setSelectedId(null);
+        onNodeClick && onNodeClick(null);
       }
       dragRef.current = null;
       forceRerender(n => n + 1);
@@ -760,12 +788,17 @@ function MindMap({ data, layout, courseId, highlightedId, onNodeClick, onSourceC
       baseX: Number(nodes.find(n => n.id === id)?.x || 0),
       baseY: Number(nodes.find(n => n.id === id)?.y || 0),
       moved: false,
+      simWarmed: false,
     };
-    // fix-all v1 #A4: bump alphaTarget once at mousedown so the sim
-    // stays warm during the drag without re-restarting per mousemove.
-    if (simRef.current) {
-      simRef.current.alphaTarget(0.2).restart();
-    }
+    // 2026-05-13: pure clicks (mousedown → mouseup, no movement) used
+    // to call `alphaTarget(0.2).restart()` here unconditionally, which
+    // re-heated the d3 force sim → every node twitched / drifted for a
+    // few seconds even though the user only wanted to select. Defer the
+    // warm-up to the FIRST mousemove (see onMove branch below), so a
+    // tap-to-select doesn't disturb layout. `dragRef.current.simWarmed`
+    // tracks whether the bump already fired so subsequent mousemoves
+    // don't restart the sim per frame (the original fix-all v1 #A4
+    // single-warm invariant is preserved).
   }
 
   function childCount(id) {

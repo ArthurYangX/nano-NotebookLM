@@ -103,7 +103,7 @@ def test_chat_with_user_lang_zh_injects_zh_only_addendum(chat_capture):
     })
     assert r.status_code == 200, r.text
     qa_systems = [s for s in captured["systems"]
-                  if "Dr. Marginalia" in s or "Reference documents" in s]
+                  if "Study Assistant" in s or "Reference documents" in s]
     assert qa_systems, "no qa system prompt captured"
     assert any("Reply ONLY in zh" in s for s in qa_systems), \
         f"expected strict zh binding in qa system; got:\n{qa_systems}"
@@ -121,7 +121,7 @@ def test_chat_with_user_lang_en_injects_en_only_addendum(chat_capture):
     })
     assert r.status_code == 200, r.text
     qa_systems = [s for s in captured["systems"]
-                  if "Dr. Marginalia" in s or "Reference documents" in s]
+                  if "Study Assistant" in s or "Reference documents" in s]
     assert qa_systems, "no qa system prompt captured"
     assert any("Reply ONLY in en" in s for s in qa_systems), \
         f"expected strict en binding in qa system; got:\n{qa_systems}"

@@ -40,6 +40,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import time
 import urllib.parse
@@ -80,7 +81,8 @@ _RAFT_FINAL_RE = re.compile(
     # list-marker prefix so neither "- Final conclusion:" nor "  Final
     # conclusion:" slip through.
     r"(?:^|\n)" + _LINE_LEAD +
-    r"(?:Final\s+conclusion|Conclusion|Final\s+answer|Answer|结论|最终结论)"
+    r"(?:Final\s+conclusion|Conclusion|Final\s+answer|Answer|"
+    r"(?:给出)?最终结论|给出结论|结论)"
     r"\s*[:：]\s*",
     flags=re.IGNORECASE,
 )
@@ -107,10 +109,84 @@ _RAFT_ANALYZE_RE = re.compile(
     r"Evidence\s+from\s+(?:the\s+)?(?:text|document(?:s)?|passage)|"
     r"Step-?by-?step\s+reasoning|"
     r"关键点分析|"
-    r"关键点\s+分析"
+    r"关键点\s+分析|"
+    # 2026-05-13 hotfix: RAFT 实际输出的中文 trio 之前漏匹配。
+    r"先?分析问题要点|"
+    r"引用原文关键内容|"
+    r"引用原文"
     r")\s*[:：]\s*",
     flags=re.IGNORECASE,
 )
+
+
+def _truncate_degenerate_loop(text: str) -> tuple[str, bool]:
+    """Detect token-level repetition loops and truncate at the first repeat.
+
+    2026-05-13: Qwen2.5-7B-RAFT under fragmented OCR math context (e.g.
+    ch4(2).pdf Self-Attention slides with bare subscripts α₃,₁ q₁ ρ_j …)
+    can degenerate into a "h i j t t t" token loop hundreds of times. The
+    frequency_penalty / presence_penalty fields in the request payload
+    reduce the rate but don't eliminate it entirely. As a safety net,
+    scan the response for any 3-character (post-normalization) substring
+    that recurs ≥ 5 times in a row, and truncate at the first repeat.
+
+    Returns ``(cleaned_text, was_truncated)``. Caller can use the flag to
+    trigger codex fallback when the response is salvageable but not
+    confidently the model's best output.
+    """
+    if not text or len(text) < 50:
+        return text, False
+    # Collapse whitespace + lowercase for matching but PRESERVE original
+    # text positions for slicing.
+    # Strategy: walk the text in 3-char windows; track consecutive equal
+    # windows. If we hit a run of ≥ 5 same windows, cut at the start of
+    # the 2nd repeat.
+    norm = " ".join(text.split())
+    if len(norm) < 50:
+        return text, False
+    window = 3
+    threshold = 5
+    i = 0
+    while i + window * threshold < len(norm):
+        candidate = norm[i:i + window]
+        # Skip empty / pure-space windows.
+        if not candidate.strip():
+            i += 1
+            continue
+        # Count consecutive occurrences starting at i.
+        runs = 1
+        j = i + window
+        while j + window <= len(norm) and norm[j:j + window] == candidate:
+            runs += 1
+            j += window
+        if runs >= threshold:
+            # Truncate at i + window (after the FIRST occurrence so the
+            # original output keeps the "real" tail before the loop).
+            return text[: max(0, _find_original_offset(text, i + window))], True
+        i += 1
+    return text, False
+
+
+def _find_original_offset(original: str, norm_offset: int) -> int:
+    """Map a normalised-whitespace offset back to the original text offset.
+    Walks `original` advancing one normalised char per non-collapsed char,
+    treating any whitespace run as a single space. Returns the original
+    index that corresponds to `norm_offset`.
+    """
+    norm_seen = 0
+    i = 0
+    in_space = False
+    while i < len(original) and norm_seen < norm_offset:
+        ch = original[i]
+        if ch.isspace():
+            if not in_space:
+                norm_seen += 1
+                in_space = True
+        else:
+            norm_seen += 1
+            in_space = False
+        i += 1
+    return i
 
 
 def _strip_raft_preamble(text: str) -> str:
@@ -368,12 +444,26 @@ class QwenRaftBackend(LLMBackend):
         if not self.configured:
             raise QwenBackendError("not_configured")
 
+        # 2026-05-13: Qwen2.5-7B-RAFT empirically degenerates into token
+        # loops when the source context contains fragmented OCR'd math
+        # symbols (the ch4(2).pdf Self-Attention slides emit hundreds of
+        # bare subscripts: α₃,₁, q₁, k₁, ρ_j, etc). Pre-fix output was
+        # "Attention(Q,K,V) = QKT" followed by 200+ repeats of "h i j t
+        # t t". Adding frequency_penalty kills the immediate-repeat
+        # attractor in the sampler; presence_penalty broadens vocabulary
+        # so it can't get stuck on the same token cluster. Values are
+        # mild — too high makes the model refuse to use math symbols at
+        # all. Threaded via env so we can tune in prod without redeploy.
+        freq_pen = float(os.getenv("QWEN_FREQUENCY_PENALTY", "0.5"))
+        pres_pen = float(os.getenv("QWEN_PRESENCE_PENALTY", "0.3"))
         payload = {
             "model": self.model_name,
             "messages": self._build_messages(prompt, system),
             "temperature": temperature,
             "max_tokens": max_tokens,
             "stream": False,
+            "frequency_penalty": freq_pen,
+            "presence_penalty": pres_pen,
         }
 
         start = time.monotonic()
@@ -404,6 +494,13 @@ class QwenRaftBackend(LLMBackend):
         # docstring above. Idempotent on plain-prose output (the codex-
         # path style), so safe to apply unconditionally.
         content = _strip_raft_preamble(content)
+        # 2026-05-13: degenerate-loop safety net (see
+        # _truncate_degenerate_loop). When triggered we keep the prefix
+        # before the loop — usually a salvageable partial answer —
+        # rather than dropping the entire response.
+        content, was_degenerate = _truncate_degenerate_loop(content)
+        if was_degenerate:
+            logger.warning("qwen response truncated at degenerate loop")
         latency_ms = (time.monotonic() - start) * 1000
         return LLMResponse(
             content=content,

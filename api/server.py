@@ -483,12 +483,14 @@ class ChatRequest(BaseModel):
     # The chat endpoint 422s when backend="qwen_raft" but
     # QWEN_RAFT_URL is unset, so a stale localStorage chip selection
     # doesn't silently fall through.
-    backend: Literal["codex", "qwen_raft"] | None = Field(
+    backend: Literal["codex", "qwen_raft", "qwen_base"] | None = Field(
         default=None,
         description=(
-            'Optional backend override surfaced via the topbar chip. '
-            '"codex" = default task routing; "qwen_raft" = AutoDL '
-            'Qwen2.5-7B-RAFT (requires QWEN_RAFT_URL configured).'
+            'Optional backend override surfaced via the topbar chip + Settings.'
+            '"codex" = default task routing; "qwen_raft" = AutoDL Qwen2.5-7B-RAFT '
+            '(requires QWEN_RAFT_URL); "qwen_base" = parallel base Qwen2.5-7B-Instruct '
+            '(requires QWEN_BASE_URL). Users typically pick codex vs qwen via the '
+            'topbar chip, and pick raft vs base via a Settings sub-radio.'
         ),
     )
     # 2026-05-12: user-customisable assistant name surfaced via the
@@ -508,6 +510,19 @@ class ChatRequest(BaseModel):
             "name for the tutor). Empty / None falls back to the "
             "configured DEFAULT_PERSONA. Trimmed and length-capped."
         ),
+    )
+    # 2026-05-13: the file the user is currently looking at in Reader.
+    # When present, qa_skill graphrag boosts chunks from this file and
+    # RAG paths score-boost matching `source_file`. Acts as a soft
+    # contextual signal ("you're reading X; if the question fits X,
+    # prefer X") without forcing a hard filter — the user can still ask
+    # cross-file questions and get cross-file answers. None when the
+    # user is on All Courses, in a tab without a focused file, or the
+    # frontend cache hasn't loaded sources yet.
+    active_source_file: str | None = Field(
+        default=None,
+        max_length=512,
+        description="source_file the user is currently viewing in Reader; used as a soft retrieval bias.",
     )
 
     @field_validator("question")
@@ -714,7 +729,15 @@ class ExamAnalysisRequest(BaseModel):
 class ExamPrepPlanRequest(BaseModel):
     model_config = {"extra": "forbid"}
     course_id: ReqCourseId
-    max_topics: int = Field(8, ge=3, le=15, description="Target number of exam topics to extract (3-15)")
+    # 2026-05-13: was `Field(8, ge=3, le=15)`. With 5+ source files the
+    # hard ceiling of 15 + default of 8 collapsed multi-chapter courses
+    # into a single broad topic per chapter (e.g. NLP ch4 "传统机器学习"
+    # absorbed Naive Bayes / 决策树 / SVM / Boosting into one slot).
+    # Default is now `None` → the skill auto-computes from num_source_files
+    # (≥ 3 topics per file floor, 4 per file ceiling, capped at 30).
+    # Range raised to [3, 30] so power users can still pin a specific
+    # count if the auto value isn't to their taste.
+    max_topics: int | None = Field(None, ge=3, le=30, description="Optional explicit topic count; None = auto-scale by source-file count (3 per file floor, 4 per file ceiling).")
     force: bool = Field(False, description="If true, re-run LLM and merge with existing bank by normalized topic name (preserves question history for matching names; orphans go to an archive bucket).")
     user_lang: Literal["zh", "en"] | None = Field(None, description="Reply language for generated topics + questions; None = follow source material.")
 
@@ -1278,6 +1301,8 @@ async def chat(req: ChatRequest):
     # RuntimeError. 422 mirrors the rest of the input-validation surface.
     if req.backend == "qwen_raft" and not config.QWEN_RAFT_URL:
         raise HTTPException(422, detail="qwen_raft backend not configured")
+    if req.backend == "qwen_base" and not config.QWEN_BASE_URL:
+        raise HTTPException(422, detail="qwen_base backend not configured")
     result = await orchestrator.skills["qa"].execute({
         "question": req.question,
         "course_filter": req.course_id,
@@ -1286,6 +1311,7 @@ async def chat(req: ChatRequest):
         "user_lang": req.user_lang,
         "backend": req.backend,
         "persona": req.persona,
+        "active_source_file": req.active_source_file,
     })
     if not result.success:
         raise HTTPException(status_code=502, detail=result.error or "qa skill failed")
@@ -3327,6 +3353,23 @@ async def status_endpoint():
             except Exception:  # noqa: BLE001 — status must never 500
                 qwen_available = False
             app.state.qwen_health_cache = (now, qwen_available)
+    # 2026-05-13: parallel health probe for base Qwen Instruct
+    qwen_base_configured = bool(config.QWEN_BASE_URL)
+    qwen_base_available = False
+    if qwen_base_configured and "qwen_base" in router.backends:
+        cached = getattr(app.state, "qwen_base_health_cache", None)
+        now = time.monotonic()
+        if cached is not None and (now - cached[0]) < QWEN_HEALTH_TTL_SECONDS:
+            qwen_base_available = bool(cached[1])
+        else:
+            try:
+                qwen_base_health = await asyncio.wait_for(
+                    router.backends["qwen_base"].health_check(), timeout=2.0,
+                )
+                qwen_base_available = bool(qwen_base_health.get("ok"))
+            except Exception:  # noqa: BLE001
+                qwen_base_available = False
+            app.state.qwen_base_health_cache = (now, qwen_base_available)
 
     # Settings page (A 档, 2026-05-12): expose model + base-URL + API-key
     # *configuration state* so the frontend Settings tab can render
@@ -3366,6 +3409,8 @@ async def status_endpoint():
         # disabled state + tooltip wording.
         "qwen_raft_configured": qwen_configured,
         "qwen_raft_available": qwen_available,
+        "qwen_base_configured": qwen_base_configured,
+        "qwen_base_available": qwen_base_available,
         # Settings page read-only model/key/base-URL surface.
         "default_backend": config.DEFAULT_BACKEND,
         "openai_model": config.OPENAI_MODEL,
@@ -3375,6 +3420,7 @@ async def status_endpoint():
         "anthropic_api_key_configured": bool(config.ANTHROPIC_API_KEY),
         "qwen_raft_model_name": config.QWEN_RAFT_MODEL_NAME if qwen_configured else None,
         "qwen_raft_url_host": qwen_url_host,
+        "qwen_base_model_name": config.QWEN_BASE_MODEL_NAME if qwen_base_configured else None,
         "version": app.version,
     }
 

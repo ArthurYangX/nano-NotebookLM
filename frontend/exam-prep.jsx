@@ -430,6 +430,13 @@ function ExamPrepResult({ graded, questions, answers, onContinue, onAgain }) {
   const wrong = total - right;
   const variants = graded.variants_added || {};
   const variantCount = Object.values(variants).reduce((s, n) => s + n, 0);
+  // 2026-05-13: variant generation moved to a fire-and-forget background
+  // task so submit returns in ~50ms instead of waiting 8-15s for the LLM
+  // calls. `variants_added` is now always empty in the immediate response
+  // — use `variants_pending` + `expected_variant_count` to surface that
+  // new questions are being generated and will appear on the next quiz.
+  const variantsPending = !!graded.variants_pending;
+  const expectedVariants = Number(graded.expected_variant_count || 0);
   const qById = {};
   questions.forEach(q => { qById[q.id] = q; });
 
@@ -452,6 +459,15 @@ function ExamPrepResult({ graded, questions, answers, onContinue, onAgain }) {
           <div className="exam-result-stat variants" title={`Self-evolution: ${graded.variant_budget_per_topic} variants per wrong topic`}>
             <b>+{variantCount}</b>
             <span>fresh variants generated</span>
+          </div>
+        )}
+        {variantCount === 0 && variantsPending && expectedVariants > 0 && (
+          <div
+            className="exam-result-stat variants"
+            title="新题目在后台生成（不阻塞当前页面）。下次开 quiz 时会出现。"
+          >
+            <b>~{expectedVariants}</b>
+            <span>变体生成中…</span>
           </div>
         )}
       </div>

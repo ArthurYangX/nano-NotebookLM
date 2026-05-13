@@ -687,33 +687,6 @@ def test_retry_generation_timeout():
     assert run_node(script).strip() == "ok"
 
 
-def test_observability_status_happy():
-    script = textwrap.dedent(
-        """
-        const h = require('./frontend/study-state.js');
-        const status = h.formatStatusBar({backends:['codex'], latency_ms:{search_p50:120, chat_p50:4100}, usage:{total_cost:0.12}});
-        if (!status.text.includes('codex')) throw new Error('backend missing');
-        if (!status.text.includes('120ms')) throw new Error('latency missing');
-        if (!status.ok) throw new Error('healthy status should be ok');
-        console.log('ok');
-        """
-    )
-    assert run_node(script).strip() == "ok"
-
-
-def test_observability_status_timeout():
-    script = textwrap.dedent(
-        """
-        const h = require('./frontend/study-state.js');
-        const status = h.formatStatusBar(null);
-        if (!status.degraded) throw new Error('missing degraded flag');
-        if (!status.text.includes('degraded')) throw new Error('missing degraded text');
-        console.log('ok');
-        """
-    )
-    assert run_node(script).strip() == "ok"
-
-
 def test_checked_source_files_strips_prefix_happy():
     """All Courses mode prepends '[course] ' to title for display, but the
     backend qa_skill compares against raw source_file. The helper must return

@@ -3189,10 +3189,18 @@ mark.hl-flash, .hl-jump.hl-flash { animation: hl-flash 0.9s ease-out; }
   border-color: oklch(0.80 0.04 235);
   color: oklch(0.40 0.12 235);
 }
-.backend-chip.backend-qwen {
+.backend-chip.backend-qwen,
+.backend-chip.backend-qwen-raft {
   border-color: oklch(0.78 0.10 305);
   color: oklch(0.38 0.18 305);
   background: oklch(0.97 0.04 305);
+}
+/* 2026-05-13: base Qwen Instruct chip — warmer cyan so the two qwen
+   variants are visually distinct in the cycle. */
+.backend-chip.backend-qwen-base {
+  border-color: oklch(0.78 0.10 195);
+  color: oklch(0.38 0.18 195);
+  background: oklch(0.97 0.04 195);
 }
 
 /* Persona chip CSS removed 2026-05-12: persona editing now lives in the
@@ -3234,6 +3242,22 @@ mark.hl-flash, .hl-jump.hl-flash { animation: hl-flash 0.9s ease-out; }
   color: oklch(0.42 0.22 30);
   background: oklch(0.97 0.05 30);
   cursor: help;
+}
+/* Review-pass chip (2026-05-13). Purple-leaning violet so it visually
+   reads as "polishing / second pass" — distinct from the green cache-hit
+   (success), yellow cache-miss (fresh work), and red cache-truncated
+   (error). A subtle pulse signals the LLM call is in flight; the chip
+   disappears when noteReviewing flips back to false at end-of-stream. */
+.cache-chip.cache-reviewing {
+  border-color: oklch(0.72 0.16 295);
+  color: oklch(0.42 0.22 295);
+  background: oklch(0.97 0.04 295);
+  animation: review-chip-pulse 1.6s ease-in-out infinite;
+  cursor: help;
+}
+@keyframes review-chip-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.62; }
 }
 
 /* ── Exam Prep ─────────────────────────────────────────────────────── */

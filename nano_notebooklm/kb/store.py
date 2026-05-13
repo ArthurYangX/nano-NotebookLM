@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Callable
 
@@ -28,10 +29,36 @@ def _get_default_embed_fn() -> Callable[[list[str]], np.ndarray]:
     mode = (config.EMBEDDING_MODE or "local").lower()
     if mode == "local":
         from sentence_transformers import SentenceTransformer
-        model = SentenceTransformer(config.EMBEDDING_MODEL)
+        # 2026-05-13: prefer MPS on Apple Silicon — bge-base-zh-v1.5
+        # (110M params) runs ~20-40× faster on M-series MPS than CPU.
+        # Falls back to CPU automatically on Intel Macs / Linux without
+        # CUDA. Override via NANO_NLM_EMBED_DEVICE if you want to pin.
+        device = os.getenv("NANO_NLM_EMBED_DEVICE")
+        if not device:
+            try:
+                import torch
+                if torch.backends.mps.is_available():
+                    device = "mps"
+                elif torch.cuda.is_available():
+                    device = "cuda"
+                else:
+                    device = "cpu"
+            except Exception:
+                device = "cpu"
+        logger.info("EMBEDDING_MODE=local: loading %s on device=%s", config.EMBEDDING_MODEL, device)
+        model = SentenceTransformer(config.EMBEDDING_MODEL, device=device)
+        # MPS pays per-batch sync; default batch_size=32 throttles to ~30
+        # chunks/s on M-series for 512-token chunks. Bump to 128 — empirical
+        # sweet spot before unified memory pressure makes things worse.
+        _embed_batch_size = 128 if device == "mps" else 64
 
         def embed(texts: list[str]) -> np.ndarray:
-            return model.encode(texts, normalize_embeddings=True, show_progress_bar=False)
+            return model.encode(
+                texts,
+                normalize_embeddings=True,
+                show_progress_bar=False,
+                batch_size=_embed_batch_size,
+            )
 
         return embed
 
@@ -56,8 +83,11 @@ def _build_api_embed_fn() -> Callable[[list[str]], np.ndarray]:
 
     client = openai.OpenAI(api_key=config.OPENAI_API_KEY, base_url=config.OPENAI_BASE_URL)
     model_name = config.EMBEDDING_MODEL
-    # Common API embedding models default; codex proxy may not support local sentence-transformers names
-    if model_name in ("all-MiniLM-L6-v2", ""):  # heuristic: default for local mode → fall back to OpenAI default
+    # 2026-05-13: extend fallback to also catch the multilingual MiniLM
+    # name — config.py defaults to that under EMBEDDING_MODE=local but a
+    # stale EMBEDDING_MODEL env var pointing at a local model name in
+    # API mode should still resolve to a real OpenAI-compatible model.
+    if model_name in ("all-MiniLM-L6-v2", "paraphrase-multilingual-MiniLM-L12-v2", ""):
         model_name = "text-embedding-3-small"
         logger.info("EMBEDDING_MODE=api: defaulting model to %s", model_name)
 

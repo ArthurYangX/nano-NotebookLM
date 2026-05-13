@@ -455,11 +455,392 @@ def test_user_lang_zh_addendum_lands_in_graphrag_system_prompt(monkeypatch, tmp_
         })
     assert r.status_code == 200, r.text
     assert r.json().get("path") == "graphrag", r.json()
-    qa_systems = [s for s in captured["systems"]
-                  if "Dr. Marginalia" in s or "Reference documents" in s]
+    # review-swarm fix-all #4: dropped the legacy "or 'Reference documents'"
+    # branch — qa_system() doesn't contain that literal (it's a user-prompt
+    # marker in QA_PROMPT, not the system). The old OR made this a weak
+    # persona pin on the graphrag path. Filter on the actual system-prompt
+    # marker so an empty list now indicates a real coverage gap.
+    qa_systems = [s for s in captured["systems"] if s.startswith("You are ")]
     assert qa_systems, "no qa system prompt captured"
     assert any("Reply ONLY in zh" in s for s in qa_systems), \
         f"zh-only binding addendum must reach graphrag system prompt; got:\n{qa_systems}"
+
+
+# ── review-swarm fix-all #4 (2026-05-12): graphrag × persona pin ─────
+
+
+def test_persona_reaches_graphrag_system_prompt(monkeypatch, tmp_path):
+    """rag / general / identity / translated / cross-course paths all
+    have explicit persona-injection tests (tests/test_persona.py); the
+    graphrag path was the gap. This pins that ChatRequest.persona reaches
+    the graphrag-path system prompt (qa_skill threads `persona` into
+    `_answer_rag` for graphrag too)."""
+    art = tmp_path / "artifacts"
+    (art / "courses").mkdir(parents=True)
+
+    nodes = [
+        _make_node("n_a", "Alpha", "zebra zebra zebra", chunk_id="ca",
+                   concept_type="topic", depth=1, weight=5.0),
+        _make_node("n_b", "Beta", "zebra context", chunk_id="cb"),
+    ]
+    chunks = [_make_chunk("ca", "alpha"), _make_chunk("cb", "beta")]
+    _seed(art, "cP", nodes, [], chunks)
+
+    monkeypatch.setenv("ARTIFACTS_DIR", str(art))
+    monkeypatch.setenv("NANO_NLM_DISABLE_EMBED_WARMUP", "1")
+    monkeypatch.setenv("RAG_SCORE_GATE_TOP1", "0.0")
+    from nano_notebooklm import config as cfg
+    monkeypatch.setattr(cfg, "ARTIFACTS_DIR", art)
+    from nano_notebooklm.kb import store as kb_store
+    monkeypatch.setattr(kb_store, "_get_default_embed_fn", lambda: _keyword_embed)
+    from nano_notebooklm.orchestrator import router_intent as ri
+    ri._LANG_CACHE.clear()
+
+    import api.server as server_mod
+    importlib.reload(server_mod)
+    server_mod.kb.build_index(None)
+
+    captured = {"systems": []}
+    from nano_notebooklm.types import LLMResponse
+
+    async def stub(prompt, task_type="", system="", temperature=0.7,
+                   max_tokens=4096, max_retries=3):
+        captured["systems"].append(system or "")
+        return LLMResponse(content="ans", model="fake",
+                           input_tokens=1, output_tokens=1, latency_ms=1.0)
+
+    monkeypatch.setattr(server_mod.router, "complete", stub)
+
+    with TestClient(server_mod.app) as client:
+        r = client.post("/api/chat", json={
+            "question": "zebra question",
+            "course_id": "cP",
+            "persona": "Aria",
+        })
+    assert r.status_code == 200, r.text
+    assert r.json().get("path") == "graphrag", r.json()
+    qa_systems = [s for s in captured["systems"] if s.startswith("You are ")]
+    assert qa_systems, "no graphrag qa system prompt captured"
+    assert any("You are Aria" in s for s in qa_systems), \
+        f"custom persona must inherit into graphrag system; got:\n{qa_systems}"
+    # And the legacy hardcoded name must not leak through.
+    assert not any("Dr. Marginalia" in s for s in qa_systems)
+
+
+# ── review-swarm graphrag-all-courses MED-6: partial failure + kill-switch ──
+
+
+def test_all_courses_graphrag_survives_partial_failure(monkeypatch, tmp_path):
+    """One course's KG is corrupt JSON, another's is valid. The merge
+    should silently drop the bad course (logged) and still surface
+    chunks from the good one. Pins the `asyncio.gather(return_exceptions
+    =True)` + per-course exception swallow contract."""
+    art = tmp_path / "artifacts"
+    (art / "courses").mkdir(parents=True)
+
+    # cBad: malformed KG JSON
+    cbad = art / "courses" / "cBad"
+    cbad.mkdir(parents=True)
+    (cbad / "knowledge_graph.json").write_text("{ not valid json")
+    (cbad / "chunks.json").write_text(json.dumps([]))
+
+    # cGood: valid KG with one matching node
+    good_nodes = [
+        _make_node("n_g", "GoodConcept", "zebra zebra", chunk_id="cg",
+                   concept_type="topic", depth=1, weight=5.0),
+    ]
+    good_chunks = [_make_chunk("cg", "good content from cGood", course_id="cGood")]
+    _seed(art, "cGood", good_nodes, [], good_chunks)
+
+    monkeypatch.setenv("ARTIFACTS_DIR", str(art))
+    monkeypatch.setenv("NANO_NLM_DISABLE_EMBED_WARMUP", "1")
+    monkeypatch.setenv("RAG_SCORE_GATE_TOP1", "0.0")
+    # Bust the courses-with-KG cache so this test sees the fixture's
+    # newly-seeded layout. Tests share process state; without the bust,
+    # a previous test's empty-courses scan could shadow ours.
+    from nano_notebooklm.skills import qa_skill as _qa
+    _qa._COURSES_KG_CACHE.clear()
+
+    from nano_notebooklm import config as cfg
+    monkeypatch.setattr(cfg, "ARTIFACTS_DIR", art)
+    from nano_notebooklm.kb import store as kb_store
+    monkeypatch.setattr(kb_store, "_get_default_embed_fn", lambda: _keyword_embed)
+    from nano_notebooklm.orchestrator import router_intent as ri
+    ri._LANG_CACHE.clear()
+
+    import api.server as server_mod
+    importlib.reload(server_mod)
+    server_mod.kb.build_index(None)
+
+    from nano_notebooklm.types import LLMResponse
+
+    async def stub(prompt, task_type="", system="", temperature=0.7,
+                   max_tokens=4096, max_retries=3):
+        return LLMResponse(content="ok", model="fake",
+                           input_tokens=1, output_tokens=1, latency_ms=1.0)
+    monkeypatch.setattr(server_mod.router, "complete", stub)
+
+    with TestClient(server_mod.app) as client:
+        r = client.post("/api/chat", json={
+            "question": "zebra unique",
+        })  # course_id omitted → All Courses mode
+    assert r.status_code == 200, r.text
+    body = r.json()
+    # cBad would crash if not swallowed; getting any answer (path
+    # graphrag OR general) proves the partial-failure didn't propagate.
+    # We assert path=graphrag because cGood's KG should have surfaced.
+    assert body.get("path") == "graphrag", body
+    # v2 LOW (R4-6): pin the session-log contract for All-Courses chat.
+    # session_log.append(req.course_id, "question", ...) sees None
+    # (req.course_id) so the JSONL line carries `"course_id": null`.
+    # qa_skill's add_interaction uses "general" for the in-memory
+    # bucket, but the on-disk session log keeps the original request's
+    # course_id verbatim. Pinning here so a future refactor that flips
+    # the on-disk format to "general" (which would break historical
+    # grouping in the UI) red-tests instead of silently shipping.
+    sessions_dir = art / "sessions"
+    assert sessions_dir.exists(), "expected sessions dir to be written"
+    found_null = False
+    for jl in sessions_dir.glob("session-*.jsonl"):
+        for line in jl.read_text().splitlines():
+            if '"course_id": null' in line and '"path": "graphrag"' in line:
+                found_null = True
+                break
+        if found_null:
+            break
+    assert found_null, \
+        "All-Courses graphrag must log with course_id=null + path=graphrag"
+
+
+def test_all_courses_graphrag_skipped_when_kill_switch_off(monkeypatch, tmp_path):
+    """`GRAPHRAG_ENABLED=off` + All Courses mode must skip
+    `_maybe_graphrag_all_courses` entirely and fall straight to plain
+    BM25/vector RRF (path != "graphrag"). Pins the kill-switch
+    interaction for the All-Courses branch."""
+    art = tmp_path / "artifacts"
+    (art / "courses").mkdir(parents=True)
+
+    nodes = [
+        _make_node("n_a", "Alpha", "zebra zebra zebra", chunk_id="ca",
+                   concept_type="topic", depth=1, weight=5.0),
+    ]
+    chunks = [_make_chunk("ca", "alpha content", course_id="cK")]
+    _seed(art, "cK", nodes, [], chunks)
+
+    monkeypatch.setenv("ARTIFACTS_DIR", str(art))
+    monkeypatch.setenv("NANO_NLM_DISABLE_EMBED_WARMUP", "1")
+    monkeypatch.setenv("RAG_SCORE_GATE_TOP1", "0.0")
+    # Kill switch flipped off — explicit non-enable value (fail-safe).
+    monkeypatch.setenv("GRAPHRAG_ENABLED", "off")
+    from nano_notebooklm.skills import qa_skill as _qa
+    _qa._COURSES_KG_CACHE.clear()
+
+    from nano_notebooklm import config as cfg
+    monkeypatch.setattr(cfg, "ARTIFACTS_DIR", art)
+    from nano_notebooklm.kb import store as kb_store
+    monkeypatch.setattr(kb_store, "_get_default_embed_fn", lambda: _keyword_embed)
+    from nano_notebooklm.orchestrator import router_intent as ri
+    ri._LANG_CACHE.clear()
+
+    import api.server as server_mod
+    importlib.reload(server_mod)
+    server_mod.kb.build_index(None)
+
+    from nano_notebooklm.types import LLMResponse
+
+    async def stub(prompt, task_type="", system="", temperature=0.7,
+                   max_tokens=4096, max_retries=3):
+        return LLMResponse(content="ok", model="fake",
+                           input_tokens=1, output_tokens=1, latency_ms=1.0)
+    monkeypatch.setattr(server_mod.router, "complete", stub)
+
+    with TestClient(server_mod.app) as client:
+        r = client.post("/api/chat", json={
+            "question": "zebra",
+        })
+    assert r.status_code == 200, r.text
+    # path must not be graphrag — kill switch is on, fan-out skipped.
+    # Could be "rag" (if BM25 hits) or "general" (if not). Either is
+    # acceptable; what matters is that "graphrag" is impossible.
+    assert r.json().get("path") != "graphrag", r.json()
+
+
+def test_all_courses_graphrag_chat_source_carries_course_id(monkeypatch, tmp_path):
+    """review-swarm MED-1 contract: when All Courses graphrag fires,
+    each ChatSource entry in the response must include `course_id` so
+    the frontend can render `source_file · course_id`. Single-course
+    paths leave it None (back-compat)."""
+    art = tmp_path / "artifacts"
+    (art / "courses").mkdir(parents=True)
+
+    nodes_x = [
+        _make_node("n_x", "Xtopic", "zebra zebra zebra", chunk_id="cx",
+                   concept_type="topic", depth=1, weight=5.0),
+    ]
+    chunks_x = [_make_chunk("cx", "zebra in course X", course_id="cX")]
+    _seed(art, "cX", nodes_x, [], chunks_x)
+
+    nodes_y = [
+        _make_node("n_y", "Ytopic", "zebra alpha", chunk_id="cy",
+                   concept_type="topic", depth=1, weight=5.0),
+    ]
+    chunks_y = [_make_chunk("cy", "zebra in course Y", course_id="cY")]
+    _seed(art, "cY", nodes_y, [], chunks_y)
+
+    monkeypatch.setenv("ARTIFACTS_DIR", str(art))
+    monkeypatch.setenv("NANO_NLM_DISABLE_EMBED_WARMUP", "1")
+    monkeypatch.setenv("RAG_SCORE_GATE_TOP1", "0.0")
+    monkeypatch.delenv("GRAPHRAG_ENABLED", raising=False)
+    from nano_notebooklm.skills import qa_skill as _qa
+    _qa._COURSES_KG_CACHE.clear()
+
+    from nano_notebooklm import config as cfg
+    monkeypatch.setattr(cfg, "ARTIFACTS_DIR", art)
+    from nano_notebooklm.kb import store as kb_store
+    monkeypatch.setattr(kb_store, "_get_default_embed_fn", lambda: _keyword_embed)
+    from nano_notebooklm.orchestrator import router_intent as ri
+    ri._LANG_CACHE.clear()
+
+    import api.server as server_mod
+    importlib.reload(server_mod)
+    server_mod.kb.build_index(None)
+
+    from nano_notebooklm.types import LLMResponse
+
+    async def stub(prompt, task_type="", system="", temperature=0.7,
+                   max_tokens=4096, max_retries=3):
+        return LLMResponse(content="ok", model="fake",
+                           input_tokens=1, output_tokens=1, latency_ms=1.0)
+    monkeypatch.setattr(server_mod.router, "complete", stub)
+
+    with TestClient(server_mod.app) as client:
+        r = client.post("/api/chat", json={"question": "zebra"})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body.get("path") == "graphrag", body
+    # At least one source must carry a non-null course_id matching cX or cY.
+    sources = body.get("sources", [])
+    assert sources, "graphrag must surface at least one source"
+    origin_courses = {s.get("course_id") for s in sources}
+    assert origin_courses & {"cX", "cY"}, \
+        f"expected at least one source from cX or cY; got course_ids={origin_courses}"
+
+
+# ── review-swarm v2 MED-4 (2026-05-13): fast-path + env-parse + TTL ──
+
+
+def test_graph_search_skips_embed_when_query_embedding_provided():
+    """v2 MED-3 / Reviewer 4 #5: when caller passes a precomputed
+    `query_embedding`, `graph_search` MUST NOT call `embed_fn([query])`.
+    Spy on embed_fn calls; assert zero invocations for the query
+    payload when precomputed is provided."""
+    import json as _json
+    import numpy as np
+    from nano_notebooklm.kb.graph_search import graph_search
+    from pathlib import Path
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as td:
+        td_path = Path(td)
+        cd = td_path / "courses" / "cFast"
+        cd.mkdir(parents=True)
+        nodes = [
+            _make_node("n_z", "Zeta", "zebra zebra", chunk_id="cz",
+                       concept_type="topic", depth=1, weight=5.0),
+        ]
+        chunks = [_make_chunk("cz", "zebra body text", course_id="cFast")]
+        (cd / "knowledge_graph.json").write_text(
+            _json.dumps({"nodes": nodes, "edges": [], "course_name": "cFast"})
+        )
+        (cd / "chunks.json").write_text(_json.dumps(chunks, default=str))
+
+        calls: list[list[str]] = []
+
+        def spy_embed(texts):
+            calls.append(list(texts))
+            return _keyword_embed(texts)
+
+        precomp = _keyword_embed(["zebra"])  # shape (1, d)
+
+        graph_search(
+            "zebra", "cFast", spy_embed,
+            artifacts_dir=td_path,
+            query_embedding=precomp,
+        )
+
+    # When precomputed is provided, embed_fn must NOT be called for the
+    # query itself. (It MAY still be called for cache-miss node embeds —
+    # but for this minimal fixture every node has its own keyword-derived
+    # embedding inline.)
+    flat = [t for batch in calls for t in batch]
+    assert "zebra" not in flat, \
+        f"precomputed query_embedding should skip embed_fn([query]); got calls={calls}"
+
+
+def test_graphrag_fanout_concurrency_env_garbage_falls_back(monkeypatch):
+    """v2 MED-1: a non-numeric GRAPHRAG_FANOUT_CONCURRENCY must NOT
+    crash module import (or `_parse_fanout_concurrency()` here). It
+    should warn + default to 4."""
+    from nano_notebooklm.skills import qa_skill as _qa
+
+    monkeypatch.setenv("GRAPHRAG_FANOUT_CONCURRENCY", "abc")
+    assert _qa._parse_fanout_concurrency() == 4
+
+    monkeypatch.setenv("GRAPHRAG_FANOUT_CONCURRENCY", "")
+    assert _qa._parse_fanout_concurrency() == 4
+
+    monkeypatch.setenv("GRAPHRAG_FANOUT_CONCURRENCY", "0")
+    assert _qa._parse_fanout_concurrency() == 1  # max(1, 0)
+
+    monkeypatch.setenv("GRAPHRAG_FANOUT_CONCURRENCY", "8")
+    assert _qa._parse_fanout_concurrency() == 8
+
+    monkeypatch.setenv("GRAPHRAG_FANOUT_CONCURRENCY", "-3")
+    assert _qa._parse_fanout_concurrency() == 1  # max(1, -3)
+
+
+def test_graphrag_courses_cache_ttl_env_garbage_falls_back(monkeypatch):
+    """v2 MED-1: same defensive parse for the TTL env."""
+    from nano_notebooklm.skills import qa_skill as _qa
+
+    monkeypatch.setenv("GRAPHRAG_COURSES_CACHE_TTL", "not-a-number")
+    assert _qa._parse_cache_ttl() == 60.0
+
+    monkeypatch.setenv("GRAPHRAG_COURSES_CACHE_TTL", "")
+    assert _qa._parse_cache_ttl() == 60.0
+
+    monkeypatch.setenv("GRAPHRAG_COURSES_CACHE_TTL", "120")
+    assert _qa._parse_cache_ttl() == 120.0
+
+    monkeypatch.setenv("GRAPHRAG_COURSES_CACHE_TTL", "-5")
+    assert _qa._parse_cache_ttl() == 60.0  # negative → default
+
+    monkeypatch.setenv("GRAPHRAG_COURSES_CACHE_TTL", "nan")
+    assert _qa._parse_cache_ttl() == 60.0
+
+
+def test_courses_kg_cache_invalidate_helper(monkeypatch, tmp_path):
+    """v2 MED-5: `_invalidate_courses_kg_cache(courses_root)` must drop
+    that root's entry so the upload/delete hook can force a re-scan on
+    the next graphrag call."""
+    from nano_notebooklm.skills import qa_skill as _qa
+
+    art = tmp_path / "artifacts"
+    courses_root = art / "courses"
+    courses_root.mkdir(parents=True)
+
+    # Seed an entry.
+    _qa._COURSES_KG_CACHE[str(courses_root)] = (1.0, ["cFake"])
+    assert str(courses_root) in _qa._COURSES_KG_CACHE
+
+    _qa._invalidate_courses_kg_cache(courses_root)
+    assert str(courses_root) not in _qa._COURSES_KG_CACHE
+
+    # Full clear path.
+    _qa._COURSES_KG_CACHE[str(courses_root)] = (1.0, ["cFake"])
+    _qa._COURSES_KG_CACHE["other"] = (1.0, ["c1"])
+    _qa._invalidate_courses_kg_cache()
+    assert _qa._COURSES_KG_CACHE == {}
 
 
 # ── L10: GRAPHRAG_ENABLED inverts to fail-safe ───────────────────────

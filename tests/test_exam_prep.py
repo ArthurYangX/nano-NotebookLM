@@ -14,6 +14,7 @@ from pathlib import Path
 
 import pytest
 
+from nano_notebooklm.skills import exam_prep as _exam_prep_mod
 from nano_notebooklm.skills.exam_prep import (
     DEFAULT_SEEDS_PER_TYPE,
     MASTERED_THRESHOLD,
@@ -28,6 +29,15 @@ from nano_notebooklm.skills.exam_prep import (
     variant_budget,
 )
 from nano_notebooklm.types import Chunk, FileType, SearchResult
+
+
+async def _drain_background_variants():
+    """Await all fire-and-forget variant-gen tasks the skill spawned.
+    Tests use this to deterministically observe variants in the bank after
+    a wrong-answer submit (production code returns before the task runs)."""
+    pending = list(_exam_prep_mod._BACKGROUND_VARIANT_TASKS)
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
 
 
 # ── Fakes ─────────────────────────────────────────────────────────────
@@ -244,6 +254,82 @@ async def test_plan_topics_persists_topics_and_returns_view(isolated_artifacts):
 
 
 @pytest.mark.asyncio
+async def test_plan_topics_passes_min_topics_floor_to_prompt(isolated_artifacts):
+    """2026-05-13: ensure the prompt receives a `min_topics` floor of
+    3 × num_source_files so the LLM can't silently collapse a 5-file
+    course into 8 topics (the original NLP regression). The prompt
+    text is the contract — assert both bounds are interpolated and
+    that they reflect the per-file rule."""
+    # 5 distinct source_files → min=15, max=20 (target 4 per file).
+    chunks = []
+    for fi in range(5):
+        for ci in range(3):
+            chunks.append(Chunk(
+                chunk_id=f"f{fi}_c{ci}", doc_id=f"f{fi}", course_id="testcourse",
+                text=f"file {fi} chunk {ci} content about topic",
+                file_type=FileType.PDF, source_file=f"chapter_{fi}.pdf",
+                location="PDF p.1", page=1,
+            ))
+    router = _FakeRouter([{
+        "topics": [
+            {"name": f"T{i}", "weight": 0.5, "source_chunks": [f"f{i % 5}_c0"]}
+            for i in range(15)
+        ]
+    }])
+    skill = ExamPrepSkill(kb=_FakeKB(chunks), router=router)
+    await skill.execute({"action": "plan", "course_id": "c1"})
+    prompt = router.calls[0]["prompt"]
+    # Both bounds must appear; min=15, max=20 for 5 files.
+    assert "15" in prompt and "20" in prompt
+    assert "at least 15" in prompt.lower() or "AT LEAST 15" in prompt
+
+
+@pytest.mark.asyncio
+async def test_plan_topics_single_file_floor_is_three_not_five(isolated_artifacts):
+    """Single-file course → min=3, max=4. Previously the prompt hard-
+    coded a lower bound of 5, which contradicted max=4 and confused
+    the LLM. New behaviour: min and max are both computed."""
+    chunks = [_mk_chunk(f"c{i}", f"content {i}") for i in range(3)]
+    router = _FakeRouter([{
+        "topics": [
+            {"name": "T1", "weight": 0.5, "source_chunks": ["c0"]},
+            {"name": "T2", "weight": 0.5, "source_chunks": ["c1"]},
+            {"name": "T3", "weight": 0.5, "source_chunks": ["c2"]},
+        ]
+    }])
+    skill = ExamPrepSkill(kb=_FakeKB(chunks), router=router)
+    await skill.execute({"action": "plan", "course_id": "c1"})
+    prompt = router.calls[0]["prompt"]
+    # min should be 3 (floor_per_file), max should be 4 (target_per_file).
+    # The range is interpolated as "3–4" not "5–4".
+    assert "3" in prompt and "4" in prompt
+    assert "5–4" not in prompt and "5-4" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_plan_topics_explicit_max_topics_clamps_min_below(isolated_artifacts):
+    """Explicit max_topics < computed min_topics → min should clamp
+    down to match max so the prompt range stays valid (no `15-10`)."""
+    chunks = []
+    for fi in range(5):
+        chunks.append(_mk_chunk(f"f{fi}_c0", f"content {fi}"))
+        chunks[-1] = Chunk(
+            chunk_id=f"f{fi}_c0", doc_id=f"f{fi}", course_id="testcourse",
+            text=f"f{fi}", file_type=FileType.PDF,
+            source_file=f"chapter_{fi}.pdf", location="PDF p.1", page=1,
+        )
+    router = _FakeRouter([{
+        "topics": [{"name": f"T{i}", "weight": 0.5, "source_chunks": [f"f{i}_c0"]} for i in range(5)]
+    }])
+    skill = ExamPrepSkill(kb=_FakeKB(chunks), router=router)
+    await skill.execute({"action": "plan", "course_id": "c1", "max_topics": 10})
+    prompt = router.calls[0]["prompt"]
+    # min would be 15 (5*3) but max is forced to 10, so min clamps to 10.
+    assert "10" in prompt
+    assert "15–10" not in prompt and "15-10" not in prompt
+
+
+@pytest.mark.asyncio
 async def test_plan_topics_force_regenerates(isolated_artifacts):
     chunks = [_mk_chunk("c0", "Concept text")]
     router = _FakeRouter([
@@ -419,16 +505,25 @@ async def test_submit_wrong_triggers_variant_generation(isolated_artifacts):
     })
     assert res.success
     assert res.data["wrong_topic_count"] == 1
-    assert res.data["variants_added"]["topic_wrong"] == 2
-    # Only 1 LLM call (one wrong topic, no call for the other)
+    # 2026-05-13: variant gen is now fire-and-forget. The immediate
+    # response reports `variants_pending` + `expected_variant_count`;
+    # actual `variants_added` lands in the bank after the background
+    # task completes. Tests must `gather` the pending tasks to
+    # deterministically observe the merged bank.
+    assert res.data["variants_pending"] is True
+    # 1 wrong topic → budget = min(5, max(1, 20//1)) = 5 → expected = 5.
+    # The LLM response in this test only returns 2 questions, so the
+    # bank ends up with 2 actual variants — that's tested below.
+    assert res.data["expected_variant_count"] == 5
+    assert res.data["variants_added"] == {}
+    await _drain_background_variants()
+    # Now the LLM call has fired and the bank is merged.
     assert len(router.calls) == 1
-
     reloaded = load_bank("c1")
     wrong_topic = reloaded["topics"][0]
     other_topic = reloaded["topics"][1]
     assert len(wrong_topic["questions"]) == 3  # 1 original + 2 variants
     assert len(other_topic["questions"]) == 1  # untouched
-    # Variant provenance recorded
     new_qs = [q for q in wrong_topic["questions"] if q["id"] != "q1"]
     assert all(q["variant_of"] == "q1" for q in new_qs)
 

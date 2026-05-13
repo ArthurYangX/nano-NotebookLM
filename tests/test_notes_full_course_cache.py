@@ -31,6 +31,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from nano_notebooklm.types import Chunk, FileType
+from tests.test_notes_full_course import _is_review_prompt  # noqa: F401
 
 
 # ── Helpers ──────────────────────────────────────────────────────────
@@ -381,7 +382,6 @@ def test_endpoint_force_true_bypasses_cache(endpoint_client, monkeypatch):
     """force=true ignores the populated cache and runs every per-file LLM."""
     client, server_mod, art = endpoint_client
     from nano_notebooklm.skills import notes_full_course as nfc
-    from nano_notebooklm.types import LLMResponse as RouterResponse
 
     # Pre-populate with matching hashes — cache WOULD hit if not for force.
     chunks = server_mod.kb.get_chunks("testcourse")
@@ -399,16 +399,14 @@ def test_endpoint_force_true_bypasses_cache(endpoint_client, monkeypatch):
 
     call_count = {"n": 0}
 
-    async def fake_complete(prompt, *args, **kwargs):
+    async def fake_complete_stream(prompt, *args, **kwargs):
+        if _is_review_prompt(prompt):
+            yield "\\section{Reviewed}\n"
+            return
+        # Per-file phase: count + emit fresh body.
         call_count["n"] += 1
-        return RouterResponse(content="\\section{fresh}\nFRESH BODY", model="test")
+        yield "\\section{fresh}\nFRESH BODY"
 
-    async def fake_complete_stream(*args, **kwargs):
-        for delta in ("\\section{Reviewed}\n",):
-            yield delta
-
-    monkeypatch.setattr(server_mod.router, "complete",
-                        AsyncMock(side_effect=fake_complete))
     monkeypatch.setattr(server_mod.router, "complete_stream", fake_complete_stream)
 
     resp = client.post("/api/notes/full-course/stream",
@@ -432,18 +430,14 @@ def test_endpoint_fresh_worker_writes_cache(endpoint_client, monkeypatch):
     per_file_cache.json with the plan's cache_key."""
     client, server_mod, art = endpoint_client
     from nano_notebooklm.skills import notes_full_course as nfc
-    from nano_notebooklm.types import LLMResponse as RouterResponse
 
-    async def fake_complete(prompt, *args, **kwargs):
-        # Return a deterministic body so we can assert it landed in cache.
-        return RouterResponse(content="\\section{Generated}\nGEN BODY", model="test-model")
+    async def fake_complete_stream(prompt, *args, **kwargs):
+        if _is_review_prompt(prompt):
+            yield "\\section{Reviewed}\n"
+            return
+        # Per-file phase: deterministic body so we can assert it landed in cache.
+        yield "\\section{Generated}\nGEN BODY"
 
-    async def fake_complete_stream(*args, **kwargs):
-        for delta in ("\\section{Reviewed}\n",):
-            yield delta
-
-    monkeypatch.setattr(server_mod.router, "complete",
-                        AsyncMock(side_effect=fake_complete))
     monkeypatch.setattr(server_mod.router, "complete_stream", fake_complete_stream)
 
     resp = client.post("/api/notes/full-course/stream", json={"course_id": "testcourse"})
@@ -465,7 +459,6 @@ def test_endpoint_prunes_stale_cache_on_request(endpoint_client, monkeypatch):
     before generation."""
     client, server_mod, art = endpoint_client
     from nano_notebooklm.skills import notes_full_course as nfc
-    from nano_notebooklm.types import LLMResponse as RouterResponse
 
     nfc.save_cache("testcourse", {
         "ghost-file.pdf": {
@@ -476,15 +469,12 @@ def test_endpoint_prunes_stale_cache_on_request(endpoint_client, monkeypatch):
         },
     })
 
-    async def fake_complete(*args, **kwargs):
-        return RouterResponse(content="\\section{X}\nbody", model="m")
+    async def fake_complete_stream(prompt, *args, **kwargs):
+        if _is_review_prompt(prompt):
+            yield "done"
+            return
+        yield "\\section{X}\nbody"
 
-    async def fake_complete_stream(*args, **kwargs):
-        for delta in ("done",):
-            yield delta
-
-    monkeypatch.setattr(server_mod.router, "complete",
-                        AsyncMock(side_effect=fake_complete))
     monkeypatch.setattr(server_mod.router, "complete_stream", fake_complete_stream)
 
     resp = client.post("/api/notes/full-course/stream", json={"course_id": "testcourse"})

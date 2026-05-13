@@ -67,9 +67,22 @@ nano_notebooklm/   Python backend modules
   notes / quiz / mindmap are cached per-course in `localStorage`
   under `nano-nlm:v1:<course>:<kind>` so refresh doesn't lose work.
   Global visual preferences (not per-course) use a flat `nano-nlm:v1:<kind>`
-  key — currently `:backend` (codex / qwen_raft toggle), `:kg-legend-hidden`
-  (Knowledge Graph bottom-right legend visibility). Any future global-pref
-  key should follow the same flat shape and be listed here.
+  key — currently `:backend` (codex / qwen_raft toggle), `:user-lang`
+  (reply language preference zh / en, asked once on first run and via
+  the lang chip), `:persona` (user-customisable assistant name, sent to
+  /api/chat via `ChatRequest.persona`; empty → backend default
+  "Study Assistant"), `:kg-legend-hidden` (Knowledge Graph bottom-right
+  legend visibility), `:notes-toc-hidden` (Notes TOC sidebar visibility),
+  `:pdf-outline-hidden` (Reader PDFium bookmark pane visibility, defaults
+  to hidden), `:hidden-courses` (JSON array of course_ids hidden from
+  the topbar dropdown / Library / All Courses),
+  `:notes-toolbar-collapsed` (Notes toolbar collapse state —
+  rendered as `effectiveCollapsed = toolbarCollapsed && !editing`, so
+  Edit mode force-expands the toolbar regardless of the persisted
+  value; the toggle button is `disabled` during Edit mode so the user
+  can't accidentally hide the Preview escape hatch).
+  Any future global-pref key should follow the same flat shape and be
+  listed here.
 
 ## Course Data
 
@@ -248,11 +261,31 @@ nano_notebooklm/   Python backend modules
   lazy per-query embedding. Compute is folded into Stage B's 100% emit
   (no `kg_stage_c` — preserves R4-2's 4-stage NDJSON upload contract).
   qa_skill's `_maybe_graphrag` runs the disk read + cosine pass via
-  `asyncio.to_thread`; skipped when `course_filter` is None (All Courses)
-  or `checked_files` is set (graphrag hop expansion can't honour per-file
-  filtering). <2 hits → silent fall-through to existing RAG → translation
-  → cross-course → general chain. Frontend chip: green `🕸️ 图检索` via
-  `.path-chip.path-graphrag` oklch styling.
+  `asyncio.to_thread`. Single-course mode fires it for `course_filter`;
+  **All Courses mode** (2026-05-12 review-swarm graphrag-all-courses
+  follow-up) fans `_maybe_graphrag_all_courses` out across every
+  course with `knowledge_graph.json` via `asyncio.gather`, merges by
+  chunk_id (best cosine wins), caps top-30. Concurrency capped by
+  `_GRAPHRAG_FANOUT_SEM = Semaphore(GRAPHRAG_FANOUT_CONCURRENCY=4)` so
+  a burst of All Courses chats can't starve the default
+  `ThreadPoolExecutor`; courses-with-KG list cached for
+  `GRAPHRAG_COURSES_CACHE_TTL=60s` to skip per-request `iterdir()`;
+  query embedding precomputed once and threaded through
+  `graph_search(query_embedding=…)` so the fan-out doesn't pay N
+  separate `embed_fn([query])` calls. Outer `wait_for` ceiling at
+  `GRAPHRAG_TIMEOUT_SECONDS + 5s = 15s` is the chat-path backstop.
+  Skipped when `checked_files` is set (graphrag hop expansion can't
+  honour per-file filtering). <2 hits → silent fall-through to RAG →
+  translation → cross-course → general chain. Frontend chip: green
+  `🕸️ 图检索` via `.path-chip.path-graphrag` oklch styling.
+  `ChatSource.course_id` (Optional) carries each citation's origin
+  course so the **API surface** is ready for an All-Courses UI label
+  (`source_file · course_id`); single-course paths leave it `None`
+  (empty-string `SearchResult.course_id` normalised to None at the
+  serialization boundary). **Frontend `assistant.jsx` does not yet
+  render this label** — the citation chips are still parsed inline
+  from `[Source: …]` markers in the answer body — so the field is
+  API-only until that follow-up lands.
 - R4-4 review-swarm fix-all v1 (2026-05-11): 4-route review caught a
   CRITICAL data-path bug + two HIGH performance regressions in the R4-4
   patch. Fixes: (A1) `KnowledgeGraph.add_concepts` now persists
@@ -404,9 +437,21 @@ nano_notebooklm/   Python backend modules
   Notes are now LaTeX-only. The `/api/notes/full-course/stream` endpoint
   partitions per-source-file LLM calls (concurrency=4 default, capped at
   8; global `_FULL_COURSE_SEMAPHORE`=2 caps concurrent generations
-  across the process) and emits NDJSON: `plan → file_start → (file_done
-  | file_error | file_cached)* → merging → reviewing → review_chunk* →
-  done | error`. `plan` carries `cached_count` / `fresh_count` / `force`
+  across the process) and emits NDJSON: `plan → file_start →
+  (file_delta)* → (file_done | file_error | file_cached) → ... →
+  merging → reviewing → review_chunk* → done | error`. **file_delta
+  (2026-05-12)**: per-file LLM body is token-streamed via
+  `router.complete_stream` (new `generate_file_stream` async generator
+  in `nano_notebooklm/skills/notes_full_course.py`) so the UI sees text
+  growing in real time instead of waiting 5-30s for a single file_done
+  dump. `file_done.content` is the SANITIZED final body and is the
+  authoritative truth — frontend's `file_done` handler overwrites the
+  accumulated client-side delta string with it. Sanitization runs ONCE
+  on the accumulated `partial.strip()` (same `check()` gate as the
+  non-stream path); partial deltas are not sanitized, so a malicious LLM
+  delta `\input{/etc/passwd}` would render briefly through latexToHtml's
+  escape-everything-by-default shim then disappear when the sanitizer
+  rejects the final body and emits `file_error`. `plan` carries `cached_count` / `fresh_count` / `force`
   + per-file `cached: bool`. `force: true` request body bypasses the
   cache entirely (UI: 🔄 button with `window.confirm` guard). The
   Reviewed pass always runs even when every file is cached, so new files

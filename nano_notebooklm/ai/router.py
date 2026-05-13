@@ -23,6 +23,9 @@ logger = logging.getLogger(__name__)
 _BACKEND_NAME_ALIASES: dict[str, str] = {
     "codex": "openai",
     "qwen_raft": "qwen_raft",
+    # 2026-05-13: base Qwen2.5-7B-Instruct as a parallel option to the
+    # fine-tuned RAFT variant. Same backend class, different URL.
+    "qwen_base": "qwen_base",
 }
 
 
@@ -46,6 +49,16 @@ class ModelRouter:
         # `backend="qwen_raft"` requests.
         if config.QWEN_RAFT_URL:
             self.backends["qwen_raft"] = QwenRaftBackend()
+        # 2026-05-13: base Qwen2.5-7B-Instruct served on a parallel port.
+        # Reuse QwenRaftBackend class — the upstream API is the same
+        # OpenAI-compatible serve_openai.py, just bound to a different
+        # model path. Pass the base URL + model name explicitly so the
+        # backend's `.url` and `.model_name` point at the base service.
+        if config.QWEN_BASE_URL:
+            self.backends["qwen_base"] = QwenRaftBackend(
+                url=config.QWEN_BASE_URL,
+                model_name=config.QWEN_BASE_MODEL_NAME,
+            )
         if not self.backends:
             logger.warning("No AI backends configured. Set API keys in .env")
 

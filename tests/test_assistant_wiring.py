@@ -132,15 +132,15 @@ def test_styles_have_cancel_state():
 
 
 def test_qa_system_prompts_include_formatting_discipline():
-    """Both QA_SYSTEM and GENERAL_QA_SYSTEM must carry the formatting
+    """Both qa_system() and general_qa_system() must carry the formatting
     discipline that mandates `$...$` / `$$...$$` for math and forbids
     multi-blank-line gaps. Otherwise the LLM emits raw `T = a + b` prose
     which the renderer can't style."""
     from nano_notebooklm.ai.prompt_templates import (
-        QA_SYSTEM, GENERAL_QA_SYSTEM, FORMATTING_DISCIPLINE,
+        qa_system, general_qa_system, FORMATTING_DISCIPLINE,
     )
-    for name, prompt in [("QA_SYSTEM", QA_SYSTEM),
-                         ("GENERAL_QA_SYSTEM", GENERAL_QA_SYSTEM)]:
+    for name, prompt in [("qa_system", qa_system()),
+                         ("general_qa_system", general_qa_system())]:
         assert FORMATTING_DISCIPLINE in prompt, \
             f"{name} must embed FORMATTING_DISCIPLINE so equations get $...$ wrapping"
     # Spot-check the actual rules are mentioned (cheap drift detection)

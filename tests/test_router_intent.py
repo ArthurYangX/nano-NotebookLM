@@ -345,7 +345,7 @@ def _has_zh(s: str) -> bool:
 def test_chat_translation_retry_happy(chat_client, monkeypatch):
     """Mini for #2: 中文 query 在英文课 0 hits → 自动翻译重试 → path=translated.
     fix-all v1 #4 ride-along: also pins that Persona reaches the QA system on
-    translated path (Persona is in QA_SYSTEM, but no test pinned it for non-
+    translated path (Persona is in qa_system(), but no test pinned it for non-
     identity branches — review-swarm regression #4)."""
     client, server_mod = chat_client
 
@@ -385,11 +385,13 @@ def test_chat_translation_retry_happy(chat_client, monkeypatch):
     # Answer must include the translation note so the user sees what happened
     assert "translated" in body["answer"].lower() or "翻译" in body["answer"]
     # Persona pin: the QA-path system message (not the translation system) must
-    # carry "Dr. Marginalia". Both calls capture; assert at least the QA call.
+    # carry "Study Assistant" (the DEFAULT_PERSONA backstop from 2026-05-12
+    # when persona became user-customisable). Both calls capture; assert at
+    # least the QA call.
     qa_systems = [s for s in captured_systems if "Reference documents" in s
-                  or "Dr. Marginalia" in s]
-    assert any("Dr. Marginalia" in s for s in qa_systems), \
-        "translated path must inherit Persona via QA_SYSTEM"
+                  or "Study Assistant" in s]
+    assert any("Study Assistant" in s for s in qa_systems), \
+        "translated path must inherit DEFAULT_PERSONA via qa_system()"
 
 
 def test_chat_translation_failure_falls_through(chat_client, monkeypatch):
@@ -785,7 +787,7 @@ def test_chat_cross_course_fallback_happy(chat_client, monkeypatch):
     """Round 2 #3 mini: current course 0-hit + translation also 0-hit → search
     All Courses (course_id=None) → if hit, return path='cross-course' with
     `cross_course_origin` showing which course found it.
-    fix-all v1 #4 ride-along: also pins Persona reaches QA_SYSTEM on the
+    fix-all v1 #4 ride-along: also pins Persona reaches qa_system() on the
     cross-course path (review-swarm regression #4)."""
     client, server_mod = chat_client
 
@@ -821,11 +823,12 @@ def test_chat_cross_course_fallback_happy(chat_client, monkeypatch):
     assert body.get("cross_course_origin"), "must record which course matched"
     # answer should carry a "from another course" annotation
     assert "本课" in body["answer"] or "另一" in body["answer"] or "another" in body["answer"].lower()
-    # Persona pin: cross-course path reuses QA_SYSTEM, must carry Persona.
+    # Persona pin: cross-course path reuses qa_system(), must carry the
+    # DEFAULT_PERSONA fallback when ChatRequest.persona is unset.
     qa_systems = [s for s in captured_systems if "Reference documents" in s
-                  or "Dr. Marginalia" in s]
-    assert any("Dr. Marginalia" in s for s in qa_systems), \
-        "cross-course path must inherit Persona via QA_SYSTEM"
+                  or "Study Assistant" in s]
+    assert any("Study Assistant" in s for s in qa_systems), \
+        "cross-course path must inherit DEFAULT_PERSONA via qa_system()"
 
 
 def test_chat_cross_course_fallback_also_empty(chat_client, monkeypatch):
@@ -900,7 +903,7 @@ def test_courses_endpoint_includes_lang_fingerprint(chat_client):
 
 
 def test_classify_input_identity_zh_routes_general():
-    """#R4-1 mini: 中文身份问题不能进 RAG（RAG 文档里没有 Dr. Marginalia 信息）。"""
+    """#R4-1 mini: 中文身份问题不能进 RAG（RAG 文档里没有 persona 信息）。"""
     from nano_notebooklm.orchestrator import router_intent as ri
 
     for q in ("你是谁?", "你是谁", "你叫什么名字", "介绍一下自己"):
@@ -968,7 +971,8 @@ def test_classify_input_multi_token_what_question_kept():
 
 def test_chat_identity_returns_persona_blurb(chat_client, monkeypatch):
     """#R4-3 mini: 用户问"你是谁"→ persona system prompt 触发，模型该收到带
-    Dr. Marginalia 的 system，返回身份 blurb；不应回 boilerplate；sources 必须空。"""
+    DEFAULT_PERSONA ("Study Assistant") 的 system，返回身份 blurb；不应回
+    boilerplate；sources 必须空。"""
     client, server_mod = chat_client
 
     captured = {}
@@ -977,7 +981,7 @@ def test_chat_identity_returns_persona_blurb(chat_client, monkeypatch):
                    max_tokens=4096, max_retries=3):
         captured["system"] = system
         captured["task_type"] = task_type
-        return LLMResponse(content="我是 Dr. Marginalia，你的学习助手。",
+        return LLMResponse(content="I'm your Study Assistant.",
                            model="fake", input_tokens=1, output_tokens=1, latency_ms=1.0)
 
     monkeypatch.setattr(server_mod.router, "complete", stub)
@@ -989,8 +993,8 @@ def test_chat_identity_returns_persona_blurb(chat_client, monkeypatch):
     assert body["path"] == "general"
     assert body["sources"] == []
     assert "No relevant content" not in body["answer"]
-    # Persona block reaches the model — fix #R4-3
-    assert "Dr. Marginalia" in captured["system"]
+    # Persona block reaches the model with default fallback — fix #R4-3
+    assert "Study Assistant" in captured["system"]
     # Identity addendum is appended — fix #R4-1 routing → correct addendum
     assert "asking who you are" in captured["system"].lower()
     assert captured["task_type"] == "qa_general"

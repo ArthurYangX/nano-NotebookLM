@@ -185,6 +185,9 @@ function Settings({
   const statusReady = !!backendStatus;
   const qwenConfigured = !!s.qwen_raft_configured;
   const qwenAvailable = !!s.qwen_raft_available;
+  // 2026-05-13: parallel base Qwen2.5-7B-Instruct option
+  const qwenBaseConfigured = !!s.qwen_base_configured;
+  const qwenBaseAvailable = !!s.qwen_base_available;
   const embedWarm = s.embed_warm_ok;
   const embedWarmLabel = embedWarm == null ? "warming…" : (embedWarm ? "ok" : "failed");
   const loadingDash = statusReady ? "—" : "加载中…";
@@ -236,7 +239,7 @@ function Settings({
               />
               <div>
                 <div className="settings-radio-title">
-                  🎓 Qwen2.5-7B-RAFT <span className="settings-tag">微调</span>
+                  🎓 Qwen2.5-7B-RAFT <span className="settings-tag">微调 · 7B · 4-bit (nf4)</span>
                   {!statusReady && <span className="settings-badge warn">加载中…</span>}
                   {statusReady && !qwenConfigured && <Badge ok={false} labelBad="未配置 QWEN_RAFT_URL" />}
                   {statusReady && qwenConfigured && !qwenAvailable && <Badge ok={false} labelBad="AutoDL 主机不可达" />}
@@ -245,6 +248,32 @@ function Settings({
                   {qwenConfigured
                     ? <>模型: <code>{s.qwen_raft_model_name || "—"}</code> · host: <code>{s.qwen_raft_url_host || "—"}</code></>
                     : <>在 <code>.env</code> 设置 <code>QWEN_RAFT_URL</code> 启用本地微调后端</>}
+                </div>
+              </div>
+            </label>
+            {/* 2026-05-13: parallel base Qwen2.5-7B-Instruct option for
+                A/B compare with RAFT. Same backend class, different URL
+                (QWEN_BASE_URL pointing at :8002 on AutoDL host). */}
+            <label className={"settings-radio" + (backend === "qwen_base" ? " active" : "") + (!statusReady || !qwenBaseConfigured || !qwenBaseAvailable ? " disabled" : "")}>
+              <input
+                type="radio"
+                name="backend"
+                value="qwen_base"
+                checked={backend === "qwen_base"}
+                disabled={!statusReady || !qwenBaseConfigured || !qwenBaseAvailable}
+                onChange={() => onCommitBackend && onCommitBackend("qwen_base")}
+              />
+              <div>
+                <div className="settings-radio-title">
+                  🐧 Qwen2.5-7B-Instruct <span className="settings-tag">基座 · 7B · 4-bit (nf4)</span>
+                  {!statusReady && <span className="settings-badge warn">加载中…</span>}
+                  {statusReady && !qwenBaseConfigured && <Badge ok={false} labelBad="未配置 QWEN_BASE_URL" />}
+                  {statusReady && qwenBaseConfigured && !qwenBaseAvailable && <Badge ok={false} labelBad="AutoDL 主机不可达" />}
+                </div>
+                <div className="settings-radio-desc">
+                  {qwenBaseConfigured
+                    ? <>模型: <code>{s.qwen_base_model_name || "—"}</code> · 未经 RAFT 微调，更善于调用预训练知识</>
+                    : <>在 <code>.env</code> 设置 <code>QWEN_BASE_URL</code> 启用基座对照</>}
                 </div>
               </div>
             </label>

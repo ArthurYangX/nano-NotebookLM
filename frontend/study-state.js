@@ -91,7 +91,29 @@
     // prefix or the explicit `chunk <id>` form.
     const chunkMatch = raw.match(/\bchunk\s+(chunk_[A-Za-z0-9_-]+|c[0-9][A-Za-z0-9_-]*)/i)
                     || raw.match(/\b(chunk_[A-Za-z0-9_-]+)\b/);
-    const pageMatch = raw.match(/\bp(?:age|\.)?\s*([0-9]+)/i) || raw.match(/PDF\s*p\.?\s*([0-9]+)/i);
+    // Page parsing: explicit prefixes (`p.5`, `page 5`, `PDF p.5`, `slide 5`,
+    // `第 5 页`) are matched anywhere in `raw`. As of R4-6 LaTeX cite chips,
+    // the LLM-emitted `\cite{file:N}` form is normalised to `file, N` by
+    // latex-to-html.normaliseCite — that strips the `p.` prefix entirely.
+    // So we also fall back to a bare integer **after the first comma**
+    // (i.e. excluding the source-filename segment, which may itself contain
+    // digits like `ch3.pptx`). Without this fallback every R4-6-style cite
+    // resolved to page=null → URL had no `#page=N` → every citation jumped
+    // to the PDF's first page.
+    //
+    // Bare-int fallback is intentionally STRICT — the after-comma segment
+    // must be whitespace-trimmed pure digits. Reviewer caught that a loose
+    // `\b([0-9]+)\b` would mis-resolve location strings like `Position 100`
+    // (markdown line offset) or `chunk chunk_xyz_007` (chunk seq number) as
+    // page numbers. R4-6 normaliseCite's `file, N` form is exactly one
+    // integer; matching only that shape preserves the fix without false-
+    // positives on non-numeric loc strings.
+    const afterSource = raw.indexOf(",") >= 0 ? raw.slice(raw.indexOf(",") + 1) : "";
+    const pageMatch = raw.match(/\bp(?:age|\.)?\s*([0-9]+)/i)
+                  || raw.match(/PDF\s*p\.?\s*([0-9]+)/i)
+                  || raw.match(/\bslide\s*([0-9]+)/i)
+                  || raw.match(/第\s*([0-9]+)\s*[页張张]/)
+                  || (afterSource && afterSource.match(/^\s*([0-9]+)\s*$/));
     const page = pageMatch ? Number(pageMatch[1]) : null;
     const sourcePart = raw.split(",")[0].replace(/^Source:\s*/i, "").trim();
     const source = (sources || []).find(s => {
@@ -1063,22 +1085,6 @@
     return slugifyHeadingsList(markdown);
   }
 
-  function formatStatusBar(status) {
-    if (!status || !Array.isArray(status.backends) || status.backends.length === 0) {
-      return { degraded: true, ok: false, text: "Backend degraded · no active backend" };
-    }
-    const lat = status.latency_ms || {};
-    const usage = status.usage || {};
-    const cost = usage.total_cost_usd ?? usage.total_cost ?? 0;
-    const text = [
-      `Backend ${status.backends.join(", ")}`,
-      `search ${lat.search_p50 ?? "?"}ms`,
-      `chat ${lat.chat_p50 ?? "?"}ms`,
-      `cost $${Number(cost || 0).toFixed(3)}`,
-    ].join(" · ");
-    return { degraded: false, ok: true, text };
-  }
-
   // ── R3-2 (2026-05-07): explicit user language preference ──────────────
   // The backend system prompt previously had only a soft "match the user's
   // language" hint, which let the LLM drift on mixed-language input. R3-2
@@ -1182,6 +1188,7 @@
   // pattern of `nano-nlm:v1:kg-legend-hidden` + `nano-nlm:v1:backend`.
   const NOTES_TOC_HIDDEN_KEY = `${PREFIX}:notes-toc-hidden`;
   const PDF_OUTLINE_HIDDEN_KEY = `${PREFIX}:pdf-outline-hidden`;
+  const NOTES_TOOLBAR_COLLAPSED_KEY = `${PREFIX}:notes-toolbar-collapsed`;
 
   function loadNotesTocHidden(storage) {
     try { return storage.getItem(NOTES_TOC_HIDDEN_KEY) === "1"; }
@@ -1189,6 +1196,14 @@
   }
   function saveNotesTocHidden(storage, hidden) {
     try { storage.setItem(NOTES_TOC_HIDDEN_KEY, hidden ? "1" : "0"); return true; }
+    catch { return false; }
+  }
+  function loadNotesToolbarCollapsed(storage) {
+    try { return storage.getItem(NOTES_TOOLBAR_COLLAPSED_KEY) === "1"; }
+    catch { return false; }
+  }
+  function saveNotesToolbarCollapsed(storage, collapsed) {
+    try { storage.setItem(NOTES_TOOLBAR_COLLAPSED_KEY, collapsed ? "1" : "0"); return true; }
     catch { return false; }
   }
   function loadPdfOutlineHidden(storage) {
@@ -1425,7 +1440,6 @@
     retryGeneration,
     formatStreamErrorMessage,
     STREAM_ERROR_MESSAGES,
-    formatStatusBar,
     loadHighlights,
     saveHighlights,
     addHighlight,
@@ -1446,6 +1460,8 @@
     findCoursesWithCache,
     loadNotesTocHidden,
     saveNotesTocHidden,
+    loadNotesToolbarCollapsed,
+    saveNotesToolbarCollapsed,
     loadPdfOutlineHidden,
     savePdfOutlineHidden,
     saveHiddenCourses,
