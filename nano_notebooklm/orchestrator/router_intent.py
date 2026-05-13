@@ -60,10 +60,26 @@ GREETING_KEYWORDS = (
     "good afternoon", "good evening", "good night", "bye",
 )
 
-# Identity / persona questions. These are about the *assistant* (Dr. Marginalia),
-# not about course content. Routing them through RAG always misfires because
-# course chunks never contain the assistant's identity. Match as substring of
-# the cleaned (whitespace-collapsed) query.
+# Profanity / hostile inputs. These should never reach RAG — both because
+# the answer is never in course chunks and because graphrag will happily
+# pull surface-lexical noise (a chunk that happens to share BM25/cosine
+# mass with the slur's tokens) and the LLM will dutifully expand on that
+# off-topic chunk. Route to general with a deflecting persona response.
+# Substring match on the lowercased / whitespace-normalised query.
+PROFANITY_KEYWORDS = (
+    # zh — common insults / vulgarities; substring match catches inflections
+    "傻逼", "傻b", "傻瓜", "操你", "去死", "废物", "白痴", "蠢货", "智障",
+    "脑残", "贱人", "草泥马", "妈的", "妈逼", "尼玛", "sb",
+    # en
+    "fuck", "shit", "asshole", "bitch", "stupid", "idiot", "moron",
+    "dumbass", "bastard",
+)
+
+# Identity / persona questions. These are about the *assistant* (whose
+# name is user-customisable via ChatRequest.persona, default "Study
+# Assistant"), not about course content. Routing them through RAG always
+# misfires because course chunks never contain the assistant's identity.
+# Match as substring of the cleaned (whitespace-collapsed) query.
 IDENTITY_KEYWORDS = (
     # zh
     "你是谁", "你叫什么", "你是什么", "介绍一下自己", "自我介绍", "你是哪位",
@@ -181,6 +197,13 @@ def classify_input(query: str) -> RouteDecision:
     # Strip trailing/leading punctuation noise for keyword & bare-q matching
     # (without losing the original `cleaned_query` we report back).
     keyword_target = re.sub(r"[\s\W_]+", " ", lowered, flags=re.UNICODE).strip()
+
+    # Profanity check runs before identity / meta-course so a slur-laced
+    # "你是谁啊你这傻逼" doesn't get the identity branch (which would emit
+    # a friendly self-intro the user wasn't asking for).
+    for kw in PROFANITY_KEYWORDS:
+        if kw in keyword_target or kw in lowered:
+            return RouteDecision("general", f"profanity: {kw}", stripped)
 
     for kw in IDENTITY_KEYWORDS:
         if kw in keyword_target or kw in lowered:

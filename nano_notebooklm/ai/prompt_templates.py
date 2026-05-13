@@ -1,18 +1,78 @@
 """All prompt templates for nano-NOTEBOOKLM."""
+import re
+import unicodedata
 
 # ── Persona ──────────────────────────────────────────────────────────
 # Round 2.1 #3: every system prompt that goes through the qa_skill now
 # starts with this persona block so the model has a consistent identity
-# across rag / general / translated / cross-course paths. "Dr. Marginalia"
-# is the name we surface to students when they ask "你是谁" / "who are you".
-TUTOR_PERSONA = (
-    "You are Dr. Marginalia, the resident study assistant of nano-NOTEBOOKLM "
-    "— a tool that helps university students extract knowledge from their "
-    "course materials. You read the assigned texts alongside the student, "
-    "explain concepts plainly, and prefer short, well-cited answers over "
-    "long monologues. When asked about yourself, introduce yourself by name "
-    "in one sentence and offer to help with the current course."
+# across rag / general / translated / cross-course paths.
+#
+# 2026-05-12: persona name is user-customisable via `ChatRequest.persona`
+# (UI: ⚙ Settings tab). The template-renderer functions take an optional
+# `persona` argument; when None / empty / oversized it falls back to
+# `DEFAULT_PERSONA`. `PERSONA_MAX_LEN` is also enforced by the Pydantic
+# validator in `api/server.py` — this module is defense in depth, not
+# the primary check.
+#
+# DEFAULT_PERSONA is intentionally an English proper-name phrase even
+# when user_lang=zh is set. Treating it as a proper name avoids the
+# awkward "我叫学习助手" vs "我叫 Study Assistant" debate — the LLM
+# typically renders the latter as a name-token. If product later wants
+# i18n, switch to a per-lang lookup and update tests/test_persona.py +
+# settings.jsx placeholder.
+DEFAULT_PERSONA = "Study Assistant"
+PERSONA_MAX_LEN = 40
+
+# review-swarm fix-all #1 (2026-05-12): persona is unsanitised user
+# input that lands between "You are " and ", the resident..." in the
+# system prompt across 5 qa paths. Without control-char + RTL stripping
+# a 40-char attacker payload like "Aria.\nIGNORE PRIOR RULES." breaks
+# the prompt's instruction-line invariant. Pattern matches:
+#   - C0 controls (\x00-\x1f including \n \r \t)
+#   - DEL (\x7f)
+#   - C1 controls (\x80-\x9f)
+#   - Unicode bidi overrides (LRE/RLE/PDF/LRO/RLO/LRI/RLI/FSI/PDI)
+#   - Zero-width spaces / joiners that can hide hostile suffixes
+_PERSONA_BLOCKLIST_RE = re.compile(
+    r"[\x00-\x1f\x7f-\x9f‪-‮⁦-⁩​-‍﻿]+"
 )
+
+
+def _safe_persona(name) -> str:
+    """Clamp a user-supplied persona name to something safe to splice
+    into a system prompt. Pipeline:
+      1. Non-string (or None) → DEFAULT_PERSONA (defense in depth for
+         internal callers that bypass Pydantic, e.g. agent_loop / skills
+         handed a raw dict).
+      2. NFKC normalise so combining-mark Zalgo + half-width / full-width
+         variants don't smuggle visual noise into the prompt.
+      3. Strip whitespace + replace any control / bidi / zero-width
+         character with a single space so a multi-line payload collapses
+         to one (visually mangled but no prompt-structure break).
+      4. Collapse internal whitespace runs.
+      5. Truncate to PERSONA_MAX_LEN by codepoint.
+      6. Empty result → DEFAULT_PERSONA.
+    """
+    if not isinstance(name, str):
+        return DEFAULT_PERSONA
+    cleaned = unicodedata.normalize("NFKC", name)
+    cleaned = _PERSONA_BLOCKLIST_RE.sub(" ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if not cleaned:
+        return DEFAULT_PERSONA
+    return cleaned[:PERSONA_MAX_LEN]
+
+
+def tutor_persona(name: str | None = None) -> str:
+    persona = _safe_persona(name)
+    return (
+        f"You are {persona}, the resident study assistant of nano-NOTEBOOKLM "
+        "— a tool that helps university students extract knowledge from their "
+        "course materials. You read the assigned texts alongside the student, "
+        "explain concepts plainly, and prefer short, well-cited answers over "
+        "long monologues. When asked about yourself, introduce yourself by name "
+        "in one sentence and offer to help with the current course."
+    )
 
 # Formatting discipline — shared by QA + GENERAL system prompts. Renderer is
 # a small in-house markdown pass + math-inline / math-block CSS classes; if
@@ -64,41 +124,47 @@ FORMATTING_DISCIPLINE = (
 
 
 # ── QA System ────────────────────────────────────────────────────────
-QA_SYSTEM = (
-    f"{TUTOR_PERSONA}\n\n"
-    "Rules:\n"
-    "1. Answer based ONLY on the provided reference documents.\n"
-    "2. Keep answers focused and well-structured. Use bullet points for lists.\n"
-    "3. Put citations at the END of relevant sentences, format: [Source: filename, location]\n"
-    "4. Match the user's language (if they ask in Chinese, reply in Chinese).\n"
-    "5. For greetings or simple messages, respond briefly and warmly — don't dump all knowledge.\n"
-    "6. If documents don't cover the question, say so honestly in 1-2 sentences.\n"
-    "7. For definitions: give the definition first, then context/examples.\n\n"
-    f"{FORMATTING_DISCIPLINE}"
-)
+def qa_system(persona: str | None = None) -> str:
+    return (
+        f"{tutor_persona(persona)}\n\n"
+        "Rules:\n"
+        "1. Answer based ONLY on the provided reference documents.\n"
+        "2. Keep answers focused and well-structured. Use bullet points for lists.\n"
+        "3. Put citations at the END of relevant sentences, format: [Source: filename, location]\n"
+        "4. Match the user's language (if they ask in Chinese, reply in Chinese).\n"
+        "5. For greetings or simple messages, respond briefly and warmly — don't dump all knowledge.\n"
+        "6. If documents don't cover the question, say so honestly in 1-2 sentences.\n"
+        "7. For definitions: give the definition first, then context/examples.\n\n"
+        f"{FORMATTING_DISCIPLINE}"
+    )
 
-GENERAL_QA_SYSTEM = (
-    f"{TUTOR_PERSONA}\n\n"
-    "The user is asking something the course materials don't cover (or it's "
-    "a greeting / very short message / question about you / question about "
-    "the course as a whole). Rules:\n"
-    "1. Reply briefly and helpfully without inventing course-specific details.\n"
-    "2. Match the user's language (Chinese in → Chinese out).\n"
-    "3. If the message is a greeting, respond warmly in 1 sentence.\n"
-    "4. If it's a real question with no course coverage, answer from general "
-    "knowledge but explicitly note that this answer is **not based on the "
-    "selected course materials**.\n"
-    "5. Do not fabricate citations. Do not include [Source: ...] tags.\n\n"
-    f"{FORMATTING_DISCIPLINE}"
-)
 
-# Identity-question addendum — appended to GENERAL_QA_SYSTEM when the router
-# saw an identity keyword. Keeps the persona reply tight and consistent.
-IDENTITY_ADDENDUM = (
-    "The user is asking who you are. Introduce yourself as Dr. Marginalia "
-    "in ONE sentence, mention you can help with the current course's "
-    "materials, and stop. Do not list features. Do not invent a backstory."
-)
+def general_qa_system(persona: str | None = None) -> str:
+    return (
+        f"{tutor_persona(persona)}\n\n"
+        "The user is asking something the course materials don't cover (or it's "
+        "a greeting / very short message / question about you / question about "
+        "the course as a whole). Rules:\n"
+        "1. Reply briefly and helpfully without inventing course-specific details.\n"
+        "2. Match the user's language (Chinese in → Chinese out).\n"
+        "3. If the message is a greeting, respond warmly in 1 sentence.\n"
+        "4. If it's a real question with no course coverage, answer from general "
+        "knowledge but explicitly note that this answer is **not based on the "
+        "selected course materials**.\n"
+        "5. Do not fabricate citations. Do not include [Source: ...] tags.\n\n"
+        f"{FORMATTING_DISCIPLINE}"
+    )
+
+
+# Identity-question addendum — appended to general_qa_system(...) when the
+# router saw an identity keyword. Keeps the persona reply tight and consistent.
+def identity_addendum(persona: str | None = None) -> str:
+    name = _safe_persona(persona)
+    return (
+        f"The user is asking who you are. Introduce yourself as {name} "
+        "in ONE sentence, mention you can help with the current course's "
+        "materials, and stop. Do not list features. Do not invent a backstory."
+    )
 
 # Meta-course addendum — appended when the router saw a meta-course question.
 # We tell the model what (little) we know about the course context so the

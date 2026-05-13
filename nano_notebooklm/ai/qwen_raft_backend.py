@@ -40,6 +40,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 import urllib.parse
 from typing import AsyncIterator
@@ -49,6 +50,127 @@ import httpx
 from nano_notebooklm import config
 from nano_notebooklm.ai.base import LLMBackend
 from nano_notebooklm.types import LLMResponse
+
+# 2026-05-13: Qwen-7B-RAFT was fine-tuned to emit the three-stage RAFT
+# output format ("Analyze key points: ... Quote evidence: ##begin_quote##
+# ...##end_quote## Final conclusion: ..."). That structure leaks model
+# chain-of-thought + RAFT-specific markers into the user-facing answer
+# and doesn't match the codex path's plain-prose convention, so we strip
+# the preamble here and reformat the quote(s) as markdown blockquotes
+# (which the frontend already renders). The final-conclusion body
+# becomes the main answer.
+#
+# Step 2 (TODO): fuzzy-match each ##begin_quote## body against the graph
+# rag chunks the qa_skill passed in as context and append a
+# `[Source: <file>, <loc>]` tag so the existing citation-chip pipeline
+# can link quotes back to the PDF. This module only owns presentation;
+# the cross-ref enrichment lives in qa_skill where the source list is
+# in scope.
+# Optional line-leading punctuation the RAFT model sometimes prepends:
+# markdown list marker (`- `, `* `, `+ `, `• `), CJK bullet (`·`), an
+# enumeration prefix (`1.`, `1)`, `(1)`), or just plain whitespace.
+# Used at the start of both marker regexes so a "- Final conclusion:"
+# line is recognised the same as a bare "Final conclusion:".
+_LINE_LEAD = r"(?:[-*+•·]\s*|\(?\d+[.\)]\s*)?\s*"
+
+_RAFT_FINAL_RE = re.compile(
+    # The RAFT model paraphrases its "final answer" marker across runs:
+    # "Final conclusion:" / "Conclusion:" / "Final answer:" / "Answer:" /
+    # "结论:". Anchored to line start (or string start) with an optional
+    # list-marker prefix so neither "- Final conclusion:" nor "  Final
+    # conclusion:" slip through.
+    r"(?:^|\n)" + _LINE_LEAD +
+    r"(?:Final\s+conclusion|Conclusion|Final\s+answer|Answer|结论|最终结论)"
+    r"\s*[:：]\s*",
+    flags=re.IGNORECASE,
+)
+_RAFT_QUOTE_RE = re.compile(
+    r"##\s*begin_quote\s*##\s*(.*?)\s*##\s*end_quote\s*##",
+    flags=re.DOTALL | re.IGNORECASE,
+)
+_RAFT_ANALYZE_RE = re.compile(
+    # Paraphrased section markers — `Analyze key points` / `Key points to
+    # analyze` / `Quote evidence` / `Evidence from (the) document` /
+    # `Step-by-step` / `Reasoning` / `关键点分析`. Same list-prefix
+    # tolerance as the final-marker regex.
+    #
+    # 2026-05-13 (review-swarm fix-now): removed standalone "Evidence" /
+    # "分析" / "证据" alternatives — these single tokens appear as
+    # legitimate subheadings in academic Chinese / English prose and
+    # were triggering false-positive strips on non-RAFT responses.
+    # Multi-word forms ("Evidence from the document" / "关键点分析")
+    # are still kept because they're RAFT-specific.
+    r"(?:^|\n)" + _LINE_LEAD + r"(?:"
+    r"Analyze\s+key\s+points|"
+    r"Key\s+points?\s+(?:to\s+analyze|analysis)|"
+    r"Quote\s+evidence|"
+    r"Evidence\s+from\s+(?:the\s+)?(?:text|document(?:s)?|passage)|"
+    r"Step-?by-?step\s+reasoning|"
+    r"关键点分析|"
+    r"关键点\s+分析"
+    r")\s*[:：]\s*",
+    flags=re.IGNORECASE,
+)
+
+
+def _strip_raft_preamble(text: str) -> str:
+    """Convert RAFT three-stage output to a clean plain-prose answer.
+
+    Pipeline:
+      1. Detect whether the response is in RAFT three-stage format by
+         requiring at least one canonical structural marker
+         (``##begin_quote##`` OR an Analyze/Evidence section header).
+         If absent, return text unchanged — a normal qwen response that
+         happens to contain a line like "Answer: X" or "结论：X" must
+         NOT have content before that line silently sliced off.
+      2. Extract quote bodies (``##begin_quote##...##end_quote##``) — we
+         keep these as markdown blockquotes appended to the answer.
+      3. Locate ``Final conclusion:`` (or paraphrase) and take everything
+         after it as the primary body. If absent, fall back to the input
+         minus the Analyze / Quote section markers (only safe because
+         we've already confirmed RAFT format at step 1).
+      4. Re-attach the extracted quote bodies as ``> ...`` blockquotes
+         after the primary body.
+
+    Empty / whitespace-only input passes through unchanged so this is
+    safe to call unconditionally on every qwen response.
+
+    Reviewed 2026-05-13 (review-swarm fix-now CRITICAL #2): plain-prose
+    fallback removed in favour of an explicit RAFT-format precondition,
+    after reviewer flagged false-positive strips of natural Chinese
+    prose containing "分析：" / "证据：" / "结论：" subheadings.
+    """
+    if not text or not text.strip():
+        return text
+    has_quote_markers = bool(_RAFT_QUOTE_RE.search(text))
+    has_analyze_markers = bool(_RAFT_ANALYZE_RE.search(text))
+    if not (has_quote_markers or has_analyze_markers):
+        # Not RAFT format — return as-is. The `Final conclusion:` /
+        # `Conclusion:` slice would otherwise truncate plain prose.
+        return text
+    quotes = [q.strip() for q in _RAFT_QUOTE_RE.findall(text) if q.strip()]
+    # Strip the inline quote spans from text so they don't leak into
+    # the conclusion body when Final conclusion isn't present.
+    body_src = _RAFT_QUOTE_RE.sub("", text)
+    m = _RAFT_FINAL_RE.search(body_src)
+    if m:
+        body = body_src[m.end():].strip()
+    else:
+        # Fallback path is now safe because we've gated on the
+        # has_analyze_markers signal above — we know the input had at
+        # least one of the section headers we're about to strip.
+        body = _RAFT_ANALYZE_RE.sub("", body_src).strip()
+    if quotes:
+        # Render quotes as markdown blockquotes after the main body.
+        # Each line of a multi-line quote needs its own `> ` prefix.
+        quote_md = "\n\n".join(
+            "\n".join("> " + line for line in q.splitlines())
+            for q in quotes
+        )
+        if body:
+            return f"{body}\n\n{quote_md}"
+        return quote_md
+    return body
 
 logger = logging.getLogger(__name__)
 
@@ -278,6 +400,10 @@ class QwenRaftBackend(LLMBackend):
             raise QwenBackendError("malformed_response", str(exc)) from exc
 
         content, in_tok, out_tok, model = _parse_chat_completion(body)
+        # 2026-05-13: RAFT-format preamble strip. See _strip_raft_preamble
+        # docstring above. Idempotent on plain-prose output (the codex-
+        # path style), so safe to apply unconditionally.
+        content = _strip_raft_preamble(content)
         latency_ms = (time.monotonic() - start) * 1000
         return LLMResponse(
             content=content,

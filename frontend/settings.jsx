@@ -219,7 +219,7 @@ function Settings({
                 onChange={() => onCommitBackend && onCommitBackend("codex")}
               />
               <div>
-                <div className="settings-radio-title">🤖 Codex GPT-5.4 <span className="settings-tag">主路径</span></div>
+                <div className="settings-radio-title">🤖 Codex {(s.openai_model || "").replace(/^gpt-/i, "GPT-") || "GPT"} <span className="settings-tag">主路径</span></div>
                 <div className="settings-radio-desc">
                   生产默认。模型: <code>{s.openai_model || loadingDash}</code>，base URL: <code>{s.openai_base_url || loadingDash}</code>
                 </div>
@@ -310,6 +310,9 @@ function Settings({
                 }}
               />
               <span className="settings-pref-hint">{personaDraft.length}/40 字符 · 会出现在系统提示词里</span>
+              <span className="settings-pref-hint" style={{ color: "var(--ink-3, #888)" }}>
+                ⚠ 这个名字会随每次提问发送到 LLM 后端 · 不要填真名 / 邮箱 / 手机号等隐私信息
+              </span>
             </div>
           </div>
 

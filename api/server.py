@@ -530,6 +530,14 @@ class ChatSource(BaseModel):
     source_file: str
     location: str
     score: float
+    # review-swarm graphrag-all-courses MED-1 (2026-05-12): when chat
+    # runs in All Courses mode and graphrag merges chunks across
+    # multiple courses, the frontend needs to know which course each
+    # citation came from so the UI can label `source_file · course_id`.
+    # Single-course paths (rag / translated / cross-course / single-
+    # course graphrag) leave it as None for back-compat; cross-course
+    # uses the existing `cross_course_origin` sidecar on ChatResponse.
+    course_id: str | None = None
 
 
 class ChunkPayload(BaseModel):
@@ -640,8 +648,14 @@ class NoteFullCourseRequest(BaseModel):
     concurrency: int = Field(
         notes_full_course.DEFAULT_CONCURRENCY,
         ge=1, le=8,
-        description="Max parallel per-file LLM calls. Capped at 8 to stay "
-                    "well under codex rate limits.",
+        description="Max parallel per-file LLM calls. Hard cap 8 — the "
+                    "codex proxy's per-tenant SSE budget tops out around "
+                    "8 concurrent streams; above that the proxy issues "
+                    "mid-stream resets and the per-file retry burns "
+                    "tokens. Reverted from 16 → 8 on 2026-05-13 review-"
+                    "swarm fix-now HIGH #8 after measuring proxy "
+                    "capacity. Default 8 is what the OPENAI_EXECUTOR_"
+                    "WORKERS=24 bump unblocked.",
     )
     # Incremental cache (2026-05-11): default False reuses cached per-file
     # outputs from artifacts/courses/<id>/notes/per_file_cache.json when
@@ -973,6 +987,16 @@ async def delete_course(course_id: str):
     async with upload_lock:
         await _asyncio.to_thread(_do_delete)
     _maybe_evict_upload_lock(course_id)
+    # review-swarm v2 MED-5 (2026-05-13): bust the graphrag courses-with-KG
+    # cache so All Courses graphrag stops surfacing the deleted course on
+    # the next chat (instead of waiting up to GRAPHRAG_COURSES_CACHE_TTL).
+    try:
+        from nano_notebooklm.skills.qa_skill import _invalidate_courses_kg_cache
+        _invalidate_courses_kg_cache(config.ARTIFACTS_DIR / "courses")
+    except Exception as exc:
+        # Cache miss is silent; this is best-effort.
+        logger.debug("graphrag cache bust skipped after delete: %s",
+                     type(exc).__name__)
     session_log.append(course_id, "deletion", {"kind": "course-delete", "removed": removed})
     return {"deleted": True, "course_id": course_id, "removed": removed}
 
@@ -3086,6 +3110,23 @@ async def upload_files(course_id: str, files: Annotated[list[UploadFile], File(.
                 kg_path = config.ARTIFACTS_DIR / "courses" / course_id / "knowledge_graph.json"
                 await _asyncio.to_thread(kg.save, kg_path)
 
+                # review-swarm v2 MED-5 (2026-05-13): now that this course
+                # has a fresh knowledge_graph.json, bust the graphrag
+                # courses-with-KG cache so the next All Courses chat sees
+                # it immediately instead of waiting up to TTL=60s.
+                try:
+                    from nano_notebooklm.skills.qa_skill import (
+                        _invalidate_courses_kg_cache,
+                    )
+                    _invalidate_courses_kg_cache(
+                        config.ARTIFACTS_DIR / "courses",
+                    )
+                except Exception as exc:
+                    logger.debug(
+                        "graphrag cache bust skipped after upload: %s",
+                        type(exc).__name__,
+                    )
+
                 # Done.
                 current_stage = None
                 duration_ms = int((time.monotonic() - t_start) * 1000)
@@ -3381,6 +3422,7 @@ def _stream_response(skill_name: str, params: dict, course_id: str, kind: str) -
             prepared = skill.prepare_inputs(params)
             if prepared is None:
                 raise RuntimeError(f"{kind} generation failed: missing inputs (course/topic)")
+            truncated = False
             async for delta in router.complete_stream(
                 prepared["prompt"],
                 task_type=prepared["task_type"],
@@ -3388,6 +3430,18 @@ def _stream_response(skill_name: str, params: dict, course_id: str, kind: str) -
                 temperature=prepared["temperature"],
                 max_tokens=prepared["max_tokens"],
             ):
+                # Review-swarm fix-now CRITICAL #3 (2026-05-13): the
+                # codex backend may yield a trailing TruncationSignal
+                # when the upstream hit max_output_tokens. Concatenating
+                # it to `partial` raises TypeError and would crash the
+                # whole NDJSON stream — surface it as a sentinel field
+                # on the terminal `done` event so the client can warn.
+                if isinstance(delta, TruncationSignal):
+                    truncated = True
+                    logger.warning(
+                        "%s stream truncated (reason=%s)", kind, delta.reason,
+                    )
+                    continue
                 partial += delta
                 yield json.dumps({"type": "chunk", "chunk": delta, "partial": partial},
                                  ensure_ascii=False) + "\n"
@@ -3400,8 +3454,10 @@ def _stream_response(skill_name: str, params: dict, course_id: str, kind: str) -
                 content = format_response(partial)
             session_log.append(course_id, "generation",
                                {"kind": kind, "streamed": True, "real": True})
-            yield json.dumps({"type": "done", "content": content},
-                             ensure_ascii=False) + "\n"
+            done_event = {"type": "done", "content": content}
+            if truncated:
+                done_event["truncated"] = True
+            yield json.dumps(done_event, ensure_ascii=False) + "\n"
         except Exception:
             # fix-all v4 #A3: don't ship str(exc) to the client. Same
             # discipline as the global 5xx handler — log the trace, return
@@ -3523,7 +3579,7 @@ def _kg_to_mindmap(kg_data: dict, course_id: str) -> dict:
             "rootIds": [],
         }
 
-    normalized_nodes = _normalize_kg_nodes(nodes)
+    normalized_nodes = _normalize_kg_nodes(nodes, course_id)
     normalized_edges = _normalize_kg_edges(edges)
     node_map = {n["id"]: n for n in normalized_nodes}
 
@@ -3626,15 +3682,54 @@ def _kg_to_mindmap(kg_data: dict, course_id: str) -> dict:
     }
 
 
-def _normalize_kg_nodes(nodes: list[dict]) -> list[dict]:
+def _normalize_kg_nodes(nodes: list[dict], course_id: str | None = None) -> list[dict]:
+    # Build chunk_id → (source_file, page) lookup so KG detail-panel
+    # source links always carry the real filename + page (the on-disk
+    # KG persists only `chunk_ids` for most concepts, and the legacy
+    # synth fell back to an empty `source_file` → the frontend rendered
+    # the opaque chunk_id token, which made the affordance look like a
+    # text reference rather than a "view the PDF page" link).
+    chunk_meta: dict[str, tuple[str, int | None]] = {}
+    if course_id:
+        try:
+            for c in kb.get_chunks(course_id):
+                chunk_meta[c.chunk_id] = (c.source_file or "", getattr(c, "page", None))
+        except Exception:
+            logger.debug("KG chunk meta lookup failed for course %s", course_id)
+
+    def _hydrate(cid: str, current_file: str = "", current_page: int | None = None) -> tuple[str, int | None]:
+        if current_file and current_page is not None:
+            return current_file, current_page
+        meta = chunk_meta.get(cid)
+        if not meta:
+            return current_file, current_page
+        sf, pg = meta
+        return (current_file or sf, current_page if current_page is not None else pg)
+
     normalized = []
     for idx, node in enumerate(nodes):
         node_id = str(node.get("id", node.get("concept_id", f"node_{idx}")))
         chunk_ids = node.get("chunk_ids", [])
-        source_chunks = node.get("source_chunks") or [
-            {"chunk_id": cid, "source_file": node.get("source_file", ""), "page": node.get("page")}
-            for cid in chunk_ids
-        ]
+        raw_chunks = node.get("source_chunks") or []
+        if raw_chunks:
+            source_chunks = []
+            for sc in raw_chunks:
+                cid = sc.get("chunk_id") or ""
+                sf, pg = _hydrate(cid, sc.get("source_file") or "", sc.get("page"))
+                source_chunks.append({
+                    "chunk_id": cid,
+                    "source_file": sf,
+                    "page": pg,
+                })
+        else:
+            source_chunks = []
+            for cid in chunk_ids:
+                sf, pg = _hydrate(cid)
+                source_chunks.append({
+                    "chunk_id": cid,
+                    "source_file": sf,
+                    "page": pg,
+                })
         # R3-3: learning_order absent on legacy / no-prereq KGs → None.
         # Coerce non-int (e.g. stringified) values to None defensively
         # so the frontend doesn't have to guard on type.

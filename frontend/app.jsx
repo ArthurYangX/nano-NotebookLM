@@ -667,12 +667,16 @@ function App() {
       return out;
     }
     function rebuildDraftFromFiles() {
-      // Incremental cache (2026-05-11): both `done` (fresh from LLM)
-      // and `cached` (replayed from per_file_cache.json) contribute to
-      // the merged draft. Order is plan-index order, matching backend's
-      // concat_draft.
+      // 2026-05-12: include `running` files too so token-streamed
+      // file_delta deltas show up in the rendered draft. Earlier code
+      // only emitted `done`/`cached` here, which meant the entire
+      // per-file phase rendered as an empty document under the
+      // "Generating..." overlay — defeating the whole point of
+      // file_delta streaming. The terminal file_done event overwrites
+      // the accumulated partial with the sanitized authoritative body,
+      // so this can't ship unsanitized content past the LLM call.
       return fileSections
-        .filter(f => f && (f.status === "done" || f.status === "cached") && f.content)
+        .filter(f => f && (f.status === "done" || f.status === "cached" || f.status === "running") && f.content)
         .map(f => `\\section{${escapeLatexTitle(f.source_file)}}\n${f.content}`)
         .join("\n\n");
     }
@@ -1027,8 +1031,16 @@ function App() {
   }
 
   function handleMindmapSource(chunk) {
+    // Prefer the original-document path (PDF preview modal) over the
+    // Reader text view: `handleCitationPreview` opens an in-place PDF
+    // iframe when the resolved source is a `.pdf` (or pptx-with-sidecar)
+    // and falls back to the Reader for `.md`/`.docx`/`.txt`. Previously
+    // this went straight to `handleCitation`, so a KG concept anchored
+    // to a PDF chunk would route the user into Reader text mode instead
+    // of the underlying slide — which read as "the KG only knows about
+    // text" from the student's perspective.
     const ref = `[Source: ${chunk.source_file || ""}, PDF p.${chunk.page || 1}, chunk ${chunk.chunk_id || ""}]`;
-    handleCitation(ref);
+    handleCitationPreview(ref);
   }
 
   async function handleRetryGeneration() {
@@ -1232,6 +1244,10 @@ function App() {
           </button>
           {/* R4-5 part 2: backend chip — toggles codex / qwen_raft. Greys
               out when /api/status reports Qwen unavailable or unconfigured. */}
+          {/* 2026-05-13: read codex model name from /api/status so the
+              chip label and tooltips reflect whatever OPENAI_MODEL is
+              actually in use (default gpt-5.5, was gpt-5.4 until tonight).
+              Falls back to a generic "GPT" when /api/status hasn't loaded. */}
           <button
             className={"backend-chip mono backend-" + (backend === "qwen_raft" ? "qwen" : "codex")}
             title={
@@ -1240,8 +1256,10 @@ function App() {
                 : !backendStatus.qwen_raft_configured
                 ? "Qwen-RAFT 未配置 (设置 QWEN_RAFT_URL 启用)"
                 : !backendStatus.qwen_raft_available
-                ? "Qwen-RAFT 不可用，自动使用 codex GPT-5.4"
-                : "当前后端: " + (backend === "qwen_raft" ? "Qwen2.5-7B-RAFT" : "codex GPT-5.4") + " (点击切换)"
+                ? "Qwen-RAFT 不可用，自动使用 codex " + ((backendStatus && backendStatus.openai_model) || "GPT")
+                : "当前后端: " + (backend === "qwen_raft"
+                    ? ((backendStatus && backendStatus.qwen_raft_model_name) || "Qwen-RAFT")
+                    : "codex " + ((backendStatus && backendStatus.openai_model) || "GPT")) + " (点击切换)"
             }
             onClick={() => {
               const next = backend === "qwen_raft" ? "codex" : "qwen_raft";
@@ -1249,7 +1267,9 @@ function App() {
             }}
             disabled={streaming || !backendStatus || !backendStatus.qwen_raft_configured || !backendStatus.qwen_raft_available}
           >
-            {backend === "qwen_raft" ? "🎓 Qwen" : "🤖 GPT-5.4"}
+            {backend === "qwen_raft"
+              ? "🎓 Qwen"
+              : "🤖 " + (((backendStatus && backendStatus.openai_model) || "GPT").replace(/^gpt-/i, "GPT-"))}
           </button>
           <button className="icon-btn" title="Generate Notes (uses cache when available)" onClick={() => handleGenerateNotes()} disabled={streaming}>📝</button>
           <button

@@ -16,6 +16,7 @@ Flow:
 from __future__ import annotations
 
 import asyncio
+import difflib
 import html
 import logging
 import os
@@ -59,6 +60,78 @@ TRANSLATION_TIMEOUT_SECONDS = 5.0
 # leaving headroom for legacy KGs that pay the per-node batch on first use.
 GRAPHRAG_TIMEOUT_SECONDS = 10.0
 
+# review-swarm graphrag-all-courses HIGH-1 (2026-05-12): bound the fan-out
+# of `_maybe_graphrag_all_courses` so a flood of All Courses chats can't
+# saturate the default ThreadPoolExecutor (~12-20 workers on typical
+# hosts) and starve notes / upload / mindmap to_thread calls. 4 is the
+# steady-state ceiling: each graph_search holds one thread for up to
+# GRAPHRAG_TIMEOUT_SECONDS, so 4 simultaneous keeps the impact <30% of
+# a default 16-worker pool. v2 MED-1 (2026-05-13): wrap env parse in
+# try/except so a typo like `GRAPHRAG_FANOUT_CONCURRENCY=abc` warns +
+# defaults instead of crashing FastAPI startup with an opaque ImportError.
+def _parse_fanout_concurrency() -> int:
+    raw = os.getenv("GRAPHRAG_FANOUT_CONCURRENCY")
+    if not raw:
+        return 4
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(
+            "GRAPHRAG_FANOUT_CONCURRENCY=%r is not an int; using default 4", raw,
+        )
+        return 4
+    return max(1, value)
+
+
+_GRAPHRAG_FANOUT_CONCURRENCY = _parse_fanout_concurrency()
+# Sized at module import; tuning requires a process restart. Lazily binds
+# to the running event loop on first acquire (Py3.12 semaphore is
+# loop-agnostic at construction).
+_GRAPHRAG_FANOUT_SEM = asyncio.Semaphore(_GRAPHRAG_FANOUT_CONCURRENCY)
+
+
+# review-swarm graphrag-all-courses MED-4 (2026-05-12): cache the
+# courses-with-KG listing per ARTIFACTS_DIR. Without this, every All
+# Courses chat would `iterdir()` + per-dir `exists()` on the courses
+# tree (~11 stat calls for 10 courses). The cache is invalidated by TTL
+# OR by an explicit `_invalidate_courses_kg_cache(courses_root)` call
+# from the upload/delete endpoints (v2 MED-5) so a freshly-ingested or
+# just-deleted course becomes graphrag-visible immediately, not after
+# TTL. Map shape: `{artifacts_dir_str: (monotonic_seconds, list[course_id])}`.
+_COURSES_KG_CACHE: dict[str, tuple[float, list[str]]] = {}
+
+
+# v2 MED-1: same defensive parse for the TTL env knob.
+def _parse_cache_ttl() -> float:
+    raw = os.getenv("GRAPHRAG_COURSES_CACHE_TTL")
+    if not raw:
+        return 60.0
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning(
+            "GRAPHRAG_COURSES_CACHE_TTL=%r is not a float; using default 60", raw,
+        )
+        return 60.0
+    if value < 0 or value != value or value in (float("inf"), float("-inf")):
+        return 60.0
+    return value
+
+
+_COURSES_KG_CACHE_TTL = _parse_cache_ttl()
+
+
+def _invalidate_courses_kg_cache(courses_root=None) -> None:
+    """Drop one cache entry (by courses_root) or the entire cache.
+    Called from `/api/upload/{id}` Stage-B-done and
+    `DELETE /api/courses/{id}` so the All Courses graphrag fan-out
+    sees a new/deleted course on the next chat instead of waiting up
+    to `_COURSES_KG_CACHE_TTL` seconds."""
+    if courses_root is None:
+        _COURSES_KG_CACHE.clear()
+        return
+    _COURSES_KG_CACHE.pop(str(courses_root), None)
+
 # R4-5 part 2 + fix-all v1 #V5: bound an explicit `backend="qwen_raft"`
 # LLM call. AutoDL Qwen2.5-7B-RAFT inference is typically 3-15s on warm
 # GPU; 30s catches a hung HTTP connection / cold-start anomaly while
@@ -71,19 +144,27 @@ GRAPHRAG_TIMEOUT_SECONDS = 10.0
 # operators raising this above this constant will see chat still time
 # out at the chat-path budget.
 def _qwen_backend_timeout() -> float:
+    """Chat-path wall-clock budget for qwen_raft.
+
+    2026-05-13: raised default 30 → 60. Monitor run on 2026-05-12T17:23Z
+    showed 24/30 questions on test-slides timed out at 30s and silently
+    fell back to codex. AutoDL Qwen2.5-7B-RAFT under load consistently
+    answers in 35-50s; 60s gives qwen a real chance while still bounding
+    the worst case below the user's tolerance.
+    """
     raw = os.getenv("QWEN_BACKEND_TIMEOUT_SECONDS")
     if not raw:
-        return 30.0
+        return 60.0
     try:
         value = float(raw)
     except ValueError:
         logger.warning(
-            "QWEN_BACKEND_TIMEOUT_SECONDS=%r is not a float; using default 30.0",
+            "QWEN_BACKEND_TIMEOUT_SECONDS=%r is not a float; using default 60.0",
             raw,
         )
-        return 30.0
+        return 60.0
     if value <= 0 or value != value or value in (float("inf"), float("-inf")):
-        return 30.0
+        return 60.0
     return value
 
 
@@ -97,6 +178,30 @@ QWEN_BACKEND_TIMEOUT_SECONDS = _qwen_backend_timeout()
 # GRAPHRAG_ENABLED is the kill-switch — operators can disable graphrag
 # without redeploying when a particular KG shape causes regressions.
 DEFAULT_GRAPHRAG_TOP1_THRESHOLD = 0.15
+# 2026-05-13 Path B: marginal-confidence ceiling for graphrag. A top1
+# cosine between the admission floor (0.15) and this ceiling (0.30) is
+# admitted but flagged as low-confidence — the system prompt gains a
+# "refuse if context is insufficient" addendum and the response carries
+# a "_(检索置信度较低)_" preface so the user knows the model may be
+# stretching. Tunable via GRAPHRAG_LOW_CONFIDENCE_CEILING.
+DEFAULT_GRAPHRAG_LOW_CONF_CEILING = 0.30
+
+
+def _graphrag_low_conf_ceiling() -> float:
+    raw = os.getenv("GRAPHRAG_LOW_CONFIDENCE_CEILING")
+    if raw is None or raw == "":
+        return DEFAULT_GRAPHRAG_LOW_CONF_CEILING
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning(
+            "GRAPHRAG_LOW_CONFIDENCE_CEILING=%r is not a float; using default %s",
+            raw, DEFAULT_GRAPHRAG_LOW_CONF_CEILING,
+        )
+        return DEFAULT_GRAPHRAG_LOW_CONF_CEILING
+    if value != value or value in (float("inf"), float("-inf")):
+        return DEFAULT_GRAPHRAG_LOW_CONF_CEILING
+    return max(0.0, min(1.0, value))
 
 
 def _graphrag_score_floor() -> float:
@@ -166,6 +271,16 @@ _MD_SPECIAL = "[]()*_`!#<>|\\~"
 
 
 def _serialize_sources(results: Iterable[SearchResult]) -> list[dict]:
+    # review-swarm graphrag-all-courses MED-1: propagate r.course_id so
+    # All Courses graphrag answers can label each citation with its
+    # origin course.
+    # v2 MED-2 (2026-05-13): SearchResult.course_id is a mandatory
+    # `str` field (default ""), not Optional. The v1 `getattr(..., None)`
+    # both lied about the contract (returned "" not None) and masked a
+    # future SearchResult refactor that drops the attribute. Now:
+    # direct attribute access for the field, with "" → None at the
+    # dict boundary so the ChatSource.course_id: str | None contract
+    # accurately reflects "no origin course attribution" semantics.
     return [
         {
             "chunk_id": r.chunk_id,
@@ -173,9 +288,175 @@ def _serialize_sources(results: Iterable[SearchResult]) -> list[dict]:
             "source_file": r.source_file,
             "location": r.location,
             "score": r.score,
+            "course_id": r.course_id or None,
         }
         for r in results
     ]
+
+
+_BLOCKQUOTE_RE = re.compile(r"(?:^|\n)((?:>[ \t]?.*(?:\n|$))+)", flags=re.MULTILINE)
+_QUOTE_SOURCE_MIN_RATIO = float(os.getenv("QWEN_QUOTE_SOURCE_MIN_RATIO", "0.25"))
+_QUOTE_NORMALIZE_WS_RE = re.compile(r"\s+")
+
+# Formula-block heuristics: detect blockquotes that are predominantly
+# math notation (e.g. `P(X=x|ωk)= P(ωk|x) P(ωk) P(x)` spread across PDF
+# lines) so we can rewrap them as `$$...$$` KaTeX blocks. The frontend
+# already renders `$$...$$` via KaTeX auto-render; without this step
+# PDF-extracted formulas show as raw broken-line text.
+_MATH_SYMBOL_RE = re.compile(r"[=≤≥≠≈±∑∫∂∇√×÷≡≅∈∉∪∩→↔]")
+_CJK_RUN_RE = re.compile(r"[一-鿿]{3,}")   # 3+ consecutive CJK = likely prose
+_ENGLISH_WORD_RE = re.compile(r"\b[A-Za-z]{4,}\b")  # 4+ char word = likely prose
+
+
+def _normalize_for_match(s: str) -> str:
+    """Collapse all whitespace runs to a single space for fuzzy / substring
+    matching. Quote text from RAFT models often preserves PDF line breaks
+    that don't appear in the original chunk text, killing exact-substring
+    matches; collapsing whitespace makes both sides directly comparable.
+    """
+    return _QUOTE_NORMALIZE_WS_RE.sub(" ", s).strip()
+
+
+def _looks_like_formula_block(quote_text: str) -> bool:
+    """True iff `quote_text` is dominantly math notation rather than
+    natural-language prose. Used by `_annotate_quote_sources` to decide
+    whether to rewrap a blockquote as a `$$...$$` KaTeX block.
+
+    Heuristic:
+      - reject anything containing `<`, `>`, or `&` to defeat the
+        frontend math-stash XSS vector: `renderMarkdown` lifts the
+        block between `$$...$$` into a math token BEFORE running
+        `_escapeHtml`, so `</div><img src=x onerror=alert(1)>=x` would
+        otherwise be auto-promoted into a math block and injected raw
+        into the DOM via `dangerouslySetInnerHTML`. Review-swarm fix-now
+        CRITICAL #2 (2026-05-13).
+      - must contain at least one canonical math operator/symbol
+      - rejected if any run of 3+ consecutive CJK chars (prose)
+      - rejected if 3+ ASCII words of length >= 4 (prose, ignoring
+        single-letter symbols like x, k, n)
+    """
+    stripped = quote_text.strip()
+    if not stripped:
+        return False
+    if any(c in stripped for c in "<>&"):
+        return False
+    if not _MATH_SYMBOL_RE.search(stripped):
+        return False
+    if _CJK_RUN_RE.search(stripped):
+        return False
+    eng_words = _ENGLISH_WORD_RE.findall(stripped)
+    if len(eng_words) >= 3:
+        return False
+    return True
+
+
+def _formula_block_to_math(quote_text: str) -> str:
+    """Collapse a multi-line PDF-extracted formula into a single
+    `$$ ... $$` block so KaTeX can render it. Multi-line is the common
+    pathology: PDF columnation splits `P(X=x|ωk)= P(ωk|x) P(ωk) P(x)`
+    across four lines; KaTeX needs them on one logical line. Unicode
+    Greek letters (`ω`) and operators pass through to KaTeX as-is.
+    """
+    one_line = _QUOTE_NORMALIZE_WS_RE.sub(" ", quote_text).strip()
+    return f"$${one_line}$$"
+
+
+def _annotate_quote_sources(answer: str, results: list[SearchResult]) -> str:
+    """Step 2 of qwen-raft integration: match each markdown blockquote in
+    the answer against the search results handed to the LLM as context,
+    and append a ``[Source: file, location]`` tag so the existing
+    citation chip pipeline can link the quote back to the PDF.
+
+    Markdown blockquotes (``> ...``) come from
+    ``qwen_raft_backend._strip_raft_preamble`` (it converts the RAFT
+    model's ``##begin_quote##...##end_quote##`` spans). Codex / other
+    backends don't emit this format, so this is a no-op on their output
+    (no blockquote regex match → unchanged).
+
+    Matching strategy (in order):
+      1. **Whitespace-normalized substring**: collapse spaces/newlines
+         on both sides and check whether quote is a contiguous substring
+         of chunk.text. This is the strongest signal — short symbolic
+         quotes (`P(X=x|ωk)= P(ωk|x) P(ωk) P(x)`) that fail
+         SequenceMatcher's character-level ratio score will succeed
+         here because the chunk text contains the same symbols just
+         with different line breaks.
+      2. **SequenceMatcher quick_ratio fallback**: `QWEN_QUOTE_SOURCE_MIN_RATIO`
+         floor (default 0.25, lowered from 0.4 because RAFT quotes are
+         often short and lose ratio quickly to PDF-extraction artifacts).
+      3. **Top-rank fallback**: if both methods fail but `results` is
+         non-empty, attribute to `results[0]` — the highest-ranked
+         chunk is the most plausible source for a quote the LLM
+         produced from a context window we built. Marked with a `?`
+         to signal lower confidence to the reader.
+    """
+    if not answer or not results:
+        return answer
+    # Pre-normalize each chunk text once. SequenceMatcher gets the raw
+    # text (its quick_ratio is whitespace-sensitive but the floor is
+    # low enough that it still matches).
+    candidates = [
+        (r.source_file, r.location, r.text, _normalize_for_match(r.text))
+        for r in results
+    ]
+
+    def _replace(m):
+        block = m.group(1).rstrip("\n")
+        quote_text = "\n".join(
+            re.sub(r"^>[ \t]?", "", line) for line in block.split("\n")
+        ).strip()
+        if len(quote_text) < 4:
+            return m.group(0)
+        quote_norm = _normalize_for_match(quote_text)
+
+        # Resolve source. Three-tier:
+        #   1. whitespace-normalized substring match → confident tag
+        #   2. SequenceMatcher quick_ratio ≥ floor → confident tag
+        #   3. neither matches → no tag (review-swarm fix-now HIGH #6,
+        #      2026-05-13). Previous code fell back to candidates[0]
+        #      and tagged it identically to a real match, producing
+        #      "phantom citations" that jumped users to a wrong page
+        #      with no visual cue that the link was a guess. Better to
+        #      ship an untagged blockquote than a misleading link.
+        source_tag = None
+        for i, (_sf, _loc, _txt, txt_norm) in enumerate(candidates):
+            if quote_norm in txt_norm:
+                sf, loc, _txt, _txt_norm = candidates[i]
+                source_tag = f"[Source: {sf}, {loc}]"
+                break
+        if source_tag is None:
+            best = (-1, 0.0)
+            for i, (_sf, _loc, txt, _txt_norm) in enumerate(candidates):
+                ratio = difflib.SequenceMatcher(
+                    None, quote_text, txt, autojunk=True,
+                ).quick_ratio()
+                if ratio > best[1]:
+                    best = (i, ratio)
+            if best[0] >= 0 and best[1] >= _QUOTE_SOURCE_MIN_RATIO:
+                sf, loc, _txt, _txt_norm = candidates[best[0]]
+                source_tag = f"[Source: {sf}, {loc}]"
+
+        trailing_newline = "\n" if m.group(0).endswith("\n") else ""
+        # When source_tag is None (neither substring nor fuzzy match
+        # cleared the floor) we ship the blockquote / math block bare —
+        # no misleading link.
+        tag_suffix = f" {source_tag}" if source_tag else ""
+
+        # Formula-block rewrite: PDF-extracted formulas come out as
+        # multi-line raw unicode (`P(X=x|ωk)=` / `P(ωk|x)` / ...). Wrap
+        # the whole thing in `$$...$$` so KaTeX renders it as math.
+        # Drop the blockquote prefix — display math doesn't need it.
+        if _looks_like_formula_block(quote_text):
+            math = _formula_block_to_math(quote_text)
+            return f"\n{math}{tag_suffix}{trailing_newline}"
+
+        # Normal prose blockquote.
+        return f"\n{block}{tag_suffix}{trailing_newline}"
+
+    annotated = _BLOCKQUOTE_RE.sub(_replace, answer)
+    # Clean up the leading newline _replace adds for the first block
+    # if the original answer started directly with a blockquote.
+    return annotated.lstrip("\n") if not answer.startswith("\n") else annotated
 
 
 def _md_safe(text: str) -> str:
@@ -286,15 +567,25 @@ class QASkill(Skill):
                 top1_threshold=_graphrag_score_floor(),
                 min_hits=1,
             ):
-                logger.info("qa.path=graphrag scope=%s top1=%.4f hits=%d",
-                            graphrag_scope, graphrag_results[0].score,
-                            len(graphrag_results))
+                # review-swarm graphrag-all-courses MED-2 / LOW: keep the
+                # field name `course=` consistent with the other 4 path
+                # log lines (rag / translated / cross-course / general)
+                # so log greps don't need a per-path special case. For
+                # All Courses graphrag, the literal "all-courses" stands
+                # in for course_filter.
+                low_conf = graphrag_results[0].score < _graphrag_low_conf_ceiling()
+                logger.info(
+                    "qa.path=graphrag course=%s top1=%.4f hits=%d low_conf=%s",
+                    graphrag_scope, graphrag_results[0].score,
+                    len(graphrag_results), low_conf,
+                )
                 return await self._answer_rag(
                     question, course_filter, graphrag_results,
                     path="graphrag",
                     user_lang=user_lang,
                     backend=backend,
                     persona=persona,
+                    low_confidence=low_conf,
                 )
 
         # ── Path A (rag): retrieve, gate, fall back if low-quality ──
@@ -445,6 +736,7 @@ class QASkill(Skill):
         self,
         question: str,
         course_filter: str,
+        query_embedding=None,
     ) -> list[SearchResult] | None:
         """R4-4: try GraphRAG retrieve for `course_filter`. Returns:
           - ``None`` when the course has no ``knowledge_graph.json`` (caller
@@ -457,6 +749,11 @@ class QASkill(Skill):
         The KG file existence check + the synchronous load + cosine pass
         are off-loaded via ``asyncio.to_thread`` so event-loop responsiveness
         is preserved during the 30-100 ms KG load on a cold course.
+
+        `query_embedding` (review-swarm graphrag-all-courses #MED-3):
+        precomputed query embedding shared across an All Courses fan-out
+        so each per-course `graph_search` skips its own `embed_fn([query])`
+        call (~80-640ms saved on 8 courses, API mode).
         """
         from nano_notebooklm import config
         kg_path = config.ARTIFACTS_DIR / "courses" / course_filter / "knowledge_graph.json"
@@ -474,6 +771,7 @@ class QASkill(Skill):
             return await asyncio.wait_for(
                 asyncio.to_thread(
                     graph_search, question, course_filter, self.kb.embed_fn,
+                    query_embedding=query_embedding,
                 ),
                 timeout=GRAPHRAG_TIMEOUT_SECONDS,
             )
@@ -488,8 +786,11 @@ class QASkill(Skill):
             # API-mode openai-python tracebacks don't ship user query text
             # into log shippers / on-call alerts. Exception type + repr is
             # enough for triage.
-            logger.warning("graph_search failed for course=%s (%s: %s)",
-                           course_filter, type(exc).__name__, exc)
+            # graphrag-all-courses #LOW: drop str(exc) per same reason —
+            # APIError.__str__ includes request body. Type-name only.
+            code = getattr(exc, "code", type(exc).__name__)
+            logger.warning("graph_search failed for course=%s (%s)",
+                           course_filter, code)
             return None
 
     async def _maybe_graphrag_all_courses(
@@ -505,41 +806,108 @@ class QASkill(Skill):
         caller falls through to plain RAG / cross-course / general the
         same way single-course graphrag does on a miss.
 
-        Cost: bounded by the slowest per-course `graph_search` +
-        `GRAPHRAG_TIMEOUT_SECONDS` ceiling. Each per-course call already
-        has its own timeout, so the worst-case wall time is one timeout
-        window (10s) even with 20 courses.
+        Cost / safety guarantees:
+          - Wall time bounded by `GRAPHRAG_TIMEOUT_SECONDS` (per-task)
+            plus an outer `wait_for` backstop = 15s (review-swarm #LOW).
+            If `embed_fn` isn't truly parallel-safe (e.g. tiny httpx
+            connection pool serialising the per-course calls), the outer
+            backstop prevents N×10s degenerate cases.
+          - Fan-out concurrency bounded by `_GRAPHRAG_FANOUT_SEM` so a
+            burst of All Courses chats can't saturate the default
+            ThreadPoolExecutor and starve notes / upload / mindmap
+            to_thread calls (HIGH-1).
+          - `courses_with_kg` cached by `(ARTIFACTS_DIR, mtime)` for 60s
+            so a hot path doesn't `iterdir()` on every chat (MED-4 cache).
+          - Per-course `embed_fn([query])` is amortised: this method
+            precomputes the query embedding once and threads it through
+            `graph_search.query_embedding` (MED-3).
         """
         from nano_notebooklm import config
         courses_root = config.ARTIFACTS_DIR / "courses"
-        if not courses_root.exists():
-            return []
-        courses_with_kg: list[str] = []
-        try:
-            for course_dir in courses_root.iterdir():
-                if not course_dir.is_dir():
-                    continue
-                if (course_dir / "knowledge_graph.json").exists():
-                    courses_with_kg.append(course_dir.name)
-        except OSError:
-            return []
+        courses_with_kg = self._discover_courses_with_kg(courses_root)
         if not courses_with_kg:
             return []
-        # Parallel fan-out. `_maybe_graphrag` already swallows per-call
-        # exceptions (returns None on KG-missing / Timeout / load error)
-        # so `return_exceptions=True` only catches the unexpected.
-        tasks = [self._maybe_graphrag(question, cid) for cid in courses_with_kg]
+
+        # Precompute the query embedding once. Off-loaded to a thread
+        # because embed_fn is sync (sentence-transformer or HTTP). If the
+        # embed fails we still fan-out without a precomputed value —
+        # graph_search falls back to its own embed_fn path, identical to
+        # single-course behaviour. So the failure mode is "no amortisation
+        # benefit", not "no retrieval".
+        precomputed_q_emb = None
+        try:
+            import numpy as np
+            q_out = await asyncio.wait_for(
+                asyncio.to_thread(self.kb.embed_fn, [question.strip()]),
+                timeout=GRAPHRAG_TIMEOUT_SECONDS,
+            )
+            precomputed_q_emb = np.asarray(q_out, dtype=np.float32)
+        except Exception as exc:  # noqa: BLE001
+            code = getattr(exc, "code", type(exc).__name__)
+            logger.warning(
+                "graphrag_all_courses: shared query embed failed (%s); "
+                "falling back to per-course embed", code,
+            )
+
+        # Bounded fan-out. `Semaphore` caps simultaneous to_thread calls
+        # so a flood of All Courses chats can't drain the default pool.
+        # Module-level instance is sized by review-swarm HIGH-1 default.
+        async def _bounded(cid: str):
+            async with _GRAPHRAG_FANOUT_SEM:
+                return await self._maybe_graphrag(
+                    question, cid, query_embedding=precomputed_q_emb,
+                )
+
+        tasks = [_bounded(cid) for cid in courses_with_kg]
+        # review-swarm v2 HIGH (2026-05-13): the v1 fix wrapped the gather
+        # in a 15s outer `wait_for`. Two reviewers flagged this:
+        #   (a) on cancel, `_bounded`'s `async with _GRAPHRAG_FANOUT_SEM`
+        #       releases the permit on __aexit__, but the underlying
+        #       `asyncio.to_thread(graph_search, ...)` thread keeps
+        #       running (Python has no thread-cancel primitive). The
+        #       next batch then acquires fresh permits while the
+        #       previous batch's threads are still alive → actual
+        #       thread-pool worker count exceeds the semaphore limit,
+        #       breaking the HIGH-1 DoS-defense premise.
+        #   (b) for N≥5 courses + 1 cold-start (one 10s outlier), the
+        #       outer 15s cap pre-empts the second batch's healthy
+        #       tasks before their own 10s ceiling fires, so a chat
+        #       with 6/8 courses ready silently returns [].
+        # Fix: drop the outer wait_for. Each per-task `wait_for` inside
+        # `_maybe_graphrag` already enforces 10s per course; combined
+        # with semaphore=4 this naturally bounds total wall time at
+        # `ceil(N / _GRAPHRAG_FANOUT_CONCURRENCY) * GRAPHRAG_TIMEOUT_SECONDS`.
+        # For N=10, k=4 → 30s worst case; the chat path is acceptable
+        # in that pathological "every course has cold-start API embed"
+        # scenario, and crucially we no longer cancel threads we can't
+        # actually stop.
         per_course = await asyncio.gather(*tasks, return_exceptions=True)
-        # Merge by chunk_id: best cosine score wins. Same chunk could
-        # appear under different per-course searches if the same
-        # source_file lives in multiple courses (rare but harmless to
-        # dedup). For the typical case the chunk_id is unique to one
-        # course, so dedup is a no-op.
+
+        # Merge by chunk_id: best cosine score wins. chunk_id embeds
+        # course_id in this codebase (chunker.py), so cross-course
+        # collisions are content-equivalent — the score-max picks the
+        # higher cosine, not "different content overwrites lower".
         merged: dict[str, SearchResult] = {}
-        for r in per_course:
-            if isinstance(r, Exception) or r is None:
+        for cid, r in zip(courses_with_kg, per_course):
+            if isinstance(r, Exception):
+                # review-swarm MED-4 / R3-1: surface unexpected per-course
+                # failures. `_maybe_graphrag` already swallows known
+                # errors and returns None; an exception here means
+                # something escaped its catch — log code + course, no
+                # str(exc) (could leak query in API mode).
+                code = getattr(r, "code", type(r).__name__)
+                logger.warning(
+                    "graphrag_all_courses: course=%s unexpected exception (%s)",
+                    cid, code,
+                )
                 continue
-            for hit in r:
+            if r is None:
+                continue
+            # Defensive intake cap (review-swarm #LOW): graph_search
+            # currently returns ≤30, but if a future bump raises the
+            # per-course cap the merge dict shouldn't grow N×K
+            # unboundedly. Local guard makes the invariant explicit.
+            for hit in r[:30]:
                 existing = merged.get(hit.chunk_id)
                 if existing is None or hit.score > existing.score:
                     merged[hit.chunk_id] = hit
@@ -548,6 +916,50 @@ class QASkill(Skill):
         # Cap at 30 chunks — matches the single-course graphrag cap so
         # the LLM context size stays bounded irrespective of fan-out.
         return sorted(merged.values(), key=lambda x: -x.score)[:30]
+
+    def _discover_courses_with_kg(self, courses_root) -> list[str]:
+        """List of course_ids that have a `knowledge_graph.json` on disk.
+
+        Cached for `_COURSES_KG_CACHE_TTL` seconds (review-swarm MED-4)
+        so each All Courses chat doesn't `iterdir()` + stat each course.
+        Invalidates on TTL expiry; upload pipeline doesn't push to this
+        cache, but TTL ≤ 60s ensures a newly-ingested course is visible
+        within a minute. Acceptable for the typical "upload → wait for
+        Stage B → chat" flow.
+        """
+        import time
+        global _COURSES_KG_CACHE
+        now = time.monotonic()
+        root_str = str(courses_root)
+        entry = _COURSES_KG_CACHE.get(root_str)
+        if entry is not None:
+            cached_at, cached_list = entry
+            if now - cached_at < _COURSES_KG_CACHE_TTL:
+                return list(cached_list)
+        if not courses_root.exists():
+            _COURSES_KG_CACHE[root_str] = (now, [])
+            return []
+        discovered: list[str] = []
+        try:
+            for course_dir in courses_root.iterdir():
+                if not course_dir.is_dir():
+                    continue
+                if (course_dir / "knowledge_graph.json").exists():
+                    discovered.append(course_dir.name)
+        except OSError as exc:
+            # v2 LOW (R1-M3): symmetric short cache so a transient OSError
+            # (NFS hiccup, permission flap) doesn't make every All Courses
+            # chat re-pay the iterdir attempt. Cache the empty result for
+            # 5s — enough to deflect a burst, short enough that recovery
+            # is bounded.
+            logger.debug(
+                "_discover_courses_with_kg iterdir OSError: %s; caching empty 5s",
+                type(exc).__name__,
+            )
+            _COURSES_KG_CACHE[root_str] = (now - _COURSES_KG_CACHE_TTL + 5.0, [])
+            return []
+        _COURSES_KG_CACHE[root_str] = (now, list(discovered))
+        return discovered
 
     def _maybe_cross_course_fallback(
         self,
@@ -740,6 +1152,7 @@ class QASkill(Skill):
         user_lang: str | None = None,
         backend: str | None = None,
         persona: str | None = None,
+        low_confidence: bool = False,
     ) -> SkillResult:
         context = "\n\n---\n\n".join(
             f"[Source: {r.source_file}, {r.location}]\n{r.text}" for r in results
@@ -751,6 +1164,23 @@ class QASkill(Skill):
         binding = prompts.USER_LANG_BINDING(user_lang)
         if binding:
             system += f"\n\n{binding}"
+        # 2026-05-13 Path B: marginal-confidence graphrag. The retrieval
+        # passed the admission floor but is below the high-confidence
+        # ceiling, so the chunks may not directly answer the question.
+        # Tell the model explicitly that refusing is better than
+        # confabulating from tangential context.
+        if low_confidence:
+            system += (
+                "\n\nIMPORTANT — context confidence is LOW. The retrieved "
+                "chunks may not directly address the user's question. If, "
+                "after reading them, you cannot point to a specific passage "
+                "that answers what the user actually asked, say so clearly "
+                "in one or two sentences (in their language) and suggest a "
+                "more specific question. Do NOT pad a non-answer with "
+                "background, do NOT quote a chunk that's only loosely "
+                "related. A short honest 'this isn't covered directly in "
+                "what I found' is the correct answer in that case."
+            )
 
         prompt = prompts.QA_PROMPT.format(context=context, question=question)
         resp, fell_back = await self._complete_with_backend_fallback(
@@ -759,6 +1189,14 @@ class QASkill(Skill):
         )
 
         answer = resp.content
+        # 2026-05-13 Step 2: qwen-raft Quote → citation. When the response
+        # came from the qwen backend, _strip_raft_preamble has already
+        # converted ##begin_quote##...##end_quote## spans into markdown
+        # blockquotes. Tag each blockquote with the best-matching source
+        # so the frontend citation pipeline can route clicks to the PDF.
+        # Idempotent on codex answers (no blockquotes to match).
+        if resp.model and "qwen" in resp.model.lower():
+            answer = _annotate_quote_sources(answer, results)
         if path == "translated" and original_query and translated_query:
             note = (
                 f"_(原问：「{_md_safe(original_query)}」在本课无直接资料；"
@@ -770,6 +1208,12 @@ class QASkill(Skill):
             note = (
                 f"_(本课无相关内容，从《{_md_safe(cross_course_origin)}》"
                 "课中找到相关材料；Found in another course.)_"
+            )
+            answer = f"{note}\n\n{answer}"
+        elif low_confidence:
+            note = (
+                "_(本次检索置信度较低，回答可能不完全贴合问题。"
+                "Low retrieval confidence — the answer may not directly match.)_"
             )
             answer = f"{note}\n\n{answer}"
 
@@ -837,6 +1281,22 @@ class QASkill(Skill):
                     f"The user said only \"{question}\" — a bare interrogative "
                     "with no topic. Reply with a single short clarification "
                     "question that matches their language."
+                )
+            elif route_reason.startswith("profanity"):
+                # 2026-05-13 Path A: hostile input — don't retrieve, don't
+                # explain, don't lecture. The model overrides everything to
+                # acknowledge briefly and pivot back to the course.
+                system += (
+                    "\n\nThe user's message contains hostility or insults "
+                    "directed at you. Do NOT lecture them or moralise. Reply "
+                    "in their language, in one short sentence: politely "
+                    "acknowledge that you're here to help with their course "
+                    "and invite them to ask a real question about the "
+                    "material. No more than 25 words."
+                )
+                prompt = (
+                    f"The user wrote: \"{question}\". Reply per the rules in "
+                    "the system prompt — short, calm, redirect to course help."
                 )
 
         fell_back = False

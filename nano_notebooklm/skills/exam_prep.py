@@ -59,7 +59,7 @@ QUIZ_DEFAULT_SIZE = 8
 # GRAPHRAG_TIMEOUT_SECONDS / NANO_NLM_MAX_TECTONIC_CONCURRENCY conventions.
 # Without an env hook, operators on slow codex deployments can't raise the
 # 45 s ceiling without editing source.
-EXAM_PREP_LLM_TIMEOUT_S = float(os.getenv("EXAM_PREP_LLM_TIMEOUT_SECONDS", "45.0"))
+EXAM_PREP_LLM_TIMEOUT_S = float(os.getenv("EXAM_PREP_LLM_TIMEOUT_SECONDS", "120.0"))
 # fix-all v1 H3: cap concurrent variant-generation LLM calls. Notes pipeline
 # uses _FULL_COURSE_SEMAPHORE=2 for the analogous burst; here we sit at 4 to
 # match the shared ThreadPoolExecutor(max_workers=4) so we don't oversubscribe

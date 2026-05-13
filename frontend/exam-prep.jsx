@@ -254,7 +254,7 @@ function ExamPrep({ activeCourse, userLang }) {
       {loading && (
         <div className="exam-prep-loading">
           <div className="exam-prep-loading-label">{loadingLabel || "Working…"}</div>
-          <div className="exam-prep-loading-elapsed mono">{elapsedSec}s elapsed{elapsedSec >= 30 ? " — codex calls can take up to 45s before timing out" : ""}</div>
+          <div className="exam-prep-loading-elapsed mono">{elapsedSec}s elapsed{elapsedSec >= 60 ? " — GPT-5.5 reasoning can take up to 120s before timing out" : ""}</div>
         </div>
       )}
 

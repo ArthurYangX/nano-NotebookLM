@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from nano_notebooklm.ai import prompt_templates as prompts
+from nano_notebooklm.ai.base import TruncationSignal
 from nano_notebooklm.skills.latex_sanitizer import LaTeXUnsafeError, check
 from nano_notebooklm.types import Chunk
 
@@ -111,9 +112,24 @@ def _get_course_cache_lock(course_id: str) -> asyncio.Lock:
 # lecture (where the definitions live) and drop only the trailing exercises.
 MAX_CHUNKS_PER_FILE = 60
 
-DEFAULT_CONCURRENCY = 4
-PER_FILE_MAX_TOKENS = 8192
-REVIEW_MAX_TOKENS = 8192
+# 2026-05-13: raised 2 → 8 per user judgement that 2 was too slow on
+# multi-file courses. The per-file retry in `generate_file_stream`
+# (max_retries=1) tolerates the mid-stream resets the codex proxy
+# occasionally issues under high concurrency; if 8 turns out to retry
+# excessively in practice, dial back via NOTES_DEFAULT_CONCURRENCY env.
+# Hard ceiling stays at 8 in ChatRequest.concurrency Pydantic validator
+# (server.py) so a stray UI value can't go higher.
+DEFAULT_CONCURRENCY = int(os.getenv("NOTES_DEFAULT_CONCURRENCY", "8"))
+# Output-length caps for the two LLM passes. Both default well above the
+# previous 8192 because (a) per-file notes for a dense 90-minute lecture
+# can legitimately need ~10K tokens to cover every \begin{definition} /
+# \begin{theorem} env, and (b) the review pass concatenates N files and
+# needs proportionally more room — an 8192 cap was silently truncating
+# the tail of long courses inside `\begin{...}` envs, producing notes
+# that "stop without closing the last definition". Tunable via env so
+# operators with stricter budget caps can dial them back.
+PER_FILE_MAX_TOKENS = int(os.getenv("NOTES_PER_FILE_MAX_TOKENS", "12288"))
+REVIEW_MAX_TOKENS = int(os.getenv("NOTES_REVIEW_MAX_TOKENS", "24576"))
 PER_FILE_TEMPERATURE = 0.3
 REVIEW_TEMPERATURE = 0.2
 
@@ -144,12 +160,23 @@ class FilePlan:
 @dataclass(frozen=True)
 class FileResult:
     """Outcome of one per-file LLM call. Exactly one of content/error
-    is non-None."""
+    is non-None.
+
+    ``truncated`` is True when the upstream LLM stopped because it hit
+    max_output_tokens / finish_reason='length' rather than completing
+    naturally. The accumulated content is still kept (and the sanitizer
+    still runs on it), but the caller MUST surface a visible "⚠️ this
+    file's notes were truncated — consider raising NOTES_PER_FILE_MAX_TOKENS
+    or splitting the source file" affordance to the user; otherwise a
+    half-written ``\\begin{definition}`` env ships silently into the
+    merge step.
+    """
     idx: int
     source_file: str
     chunk_count: int
     content: str | None
     error: str | None
+    truncated: bool = False
 
 
 # ── Incremental per-file cache ─────────────────────────────────────
@@ -451,6 +478,115 @@ def plan_for_course(
             cached_content=cached_content,
         ))
     return plans
+
+
+async def generate_file_stream(
+    router: "ModelRouter | Any",
+    plan: FilePlan,
+    max_retries: int = 1,
+):
+    """Streaming variant of generate_file. Async-generator that yields
+    ``("delta", str)`` tuples as the LLM produces tokens, followed by
+    exactly one terminal ``("result", FileResult)``.
+
+    Why this exists: ``generate_file`` blocks until the full per-file
+    body returns, which makes the UI freeze for the 5-30s a typical
+    LLM call takes. The user perceives Notes generation as flickering
+    between "stuck silence" (file phase) and "smooth streaming"
+    (review phase). Streaming the file phase too smooths the experience.
+
+    Sanitization happens once at the end on the accumulated content —
+    the same ``check()`` gate the non-stream path uses. Caller is
+    responsible for caching the terminal result.
+
+    2026-05-13: ``max_retries`` (default 1 = total 2 attempts) covers
+    the proxy-side mid-stream TCP reset that codex.ysaikeji.cn issues
+    when its per-tenant SSE concurrency cap fires. The retry re-runs
+    ``router.complete_stream`` from scratch with a backoff and re-yields
+    fresh deltas; the frontend's ``file_done.content`` overwrite
+    invariant means the visible duplicate accumulated text gets
+    replaced by the sanitized final body, so UX is "looks weird for a
+    second, then snaps to the correct content" instead of a hard
+    file_error.
+    """
+    partial = ""
+    truncated = False
+    last_exc: Exception | None = None
+    for attempt in range(max_retries + 1):
+        partial = ""
+        truncated = False
+        try:
+            async for item in router.complete_stream(
+                plan.prompt,
+                task_type=plan.task_type,
+                system=plan.system,
+                temperature=plan.temperature,
+                max_tokens=plan.max_tokens,
+            ):
+                # Truncation sentinel: upstream hit max_output_tokens. Keep
+                # any partial content (the sanitizer still runs on it) but
+                # tag the FileResult so the endpoint can surface a warning.
+                if isinstance(item, TruncationSignal):
+                    truncated = True
+                    logger.warning(
+                        "per-file note streaming truncated for %s (reason=%s)",
+                        plan.source_file, item.reason,
+                    )
+                    continue
+                if item:
+                    partial += item
+                    yield ("delta", item)
+            break  # success
+        except Exception as e:  # noqa: BLE001
+            last_exc = e
+            logger.warning(
+                "per-file streaming failed attempt %d/%d for %s: %s",
+                attempt + 1, max_retries + 1, plan.source_file,
+                type(e).__name__,
+            )
+            if attempt < max_retries:
+                # Linear backoff: 1.5s then 3.0s. Codex proxy mid-stream
+                # resets are bursty; a short cool-down lets the per-tenant
+                # SSE cap drain before we re-fire.
+                await asyncio.sleep(1.5 + attempt * 1.5)
+                continue
+            # Final attempt failed — surface error to caller.
+            logger.exception("per-file note streaming exhausted retries for %s",
+                             plan.source_file)
+            yield ("result", FileResult(
+                idx=plan.idx, source_file=plan.source_file,
+                chunk_count=plan.chunk_count,
+                content=None, error=type(e).__name__,
+                truncated=truncated,
+            ))
+            return
+    content = partial.strip()
+    if not content:
+        yield ("result", FileResult(
+            idx=plan.idx, source_file=plan.source_file,
+            chunk_count=plan.chunk_count,
+            content=None, error="empty_llm_response",
+            truncated=truncated,
+        ))
+        return
+    try:
+        safe = check(content)
+    except LaTeXUnsafeError as e:
+        logger.warning("per-file sanitizer rejected %s: %s",
+                       plan.source_file, e.reason)
+        yield ("result", FileResult(
+            idx=plan.idx, source_file=plan.source_file,
+            chunk_count=plan.chunk_count,
+            content=None, error=f"latex_unsafe: {e.reason}",
+            truncated=truncated,
+        ))
+        return
+    yield ("result", FileResult(
+        idx=plan.idx, source_file=plan.source_file,
+        chunk_count=plan.chunk_count,
+        content=safe, error=None,
+        truncated=truncated,
+    ))
 
 
 async def generate_file(

@@ -224,10 +224,13 @@ def test_qwen_backend_timeout_reads_env(monkeypatch):
 
 
 def test_qwen_backend_timeout_rejects_invalid_values(monkeypatch):
+    # 2026-05-13: default raised 30 → 60 after qwen_monitor showed
+    # 80% of requests timing out at 30s. Invalid env values still
+    # fall back to the default, but the default is now 60.
     from nano_notebooklm.skills import qa_skill
     for bad in ("not-a-float", "0", "-5", "inf"):
         monkeypatch.setenv("QWEN_BACKEND_TIMEOUT_SECONDS", bad)
-        assert qa_skill._qwen_backend_timeout() == 30.0
+        assert qa_skill._qwen_backend_timeout() == 60.0
 
 
 # ── V6: frontend chip auto-rollback + polling jitter ──────────────────

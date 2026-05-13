@@ -149,14 +149,21 @@ class ModelRouter:
         without genuine streaming fall back to single-chunk yield via the
         default `LLMBackend.complete_stream` implementation.
 
+        Truncation contract: yielded items are normally str content deltas,
+        but a backend MAY emit a trailing ``TruncationSignal`` (see
+        ``ai.base.TruncationSignal``) when the upstream stopped at
+        max_output_tokens / finish_reason='length'. The signal passes
+        through this router unchanged — opt-in callers ``isinstance``-guard
+        for it to surface a "⚠️ truncated" affordance to the user.
+
         R4-5 part 2: optional `backend` override (same semantics as
         `complete()`).
         """
         backend_obj = self._resolve_backend(task_type, backend)
-        async for delta in backend_obj.complete_stream(
+        async for item in backend_obj.complete_stream(
             prompt, system=system, temperature=temperature, max_tokens=max_tokens,
         ):
-            yield delta
+            yield item
 
     async def complete_structured(
         self,
