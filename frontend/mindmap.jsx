@@ -187,20 +187,32 @@ function MindMap({ data, layout, courseId, highlightedId, onNodeClick, onSourceC
           }, 16), 1);
     };
     try {
+      // 2026-05-13: tuned down the simulation aggressiveness. Pre-fix
+      // values (charge=-420, velocityDecay default 0.4) produced the
+      // "nodes punch each other" effect on KGs with ~100+ nodes where
+      // a strong collide push fought the strong charge repulsion across
+      // tightly-coupled subtrees, causing visible oscillation for ~30s
+      // after load. New tuning:
+      //   charge -420 → -260 (softer global repulsion)
+      //   collide iterations 2 → 1 (less hard push back)
+      //   velocityDecay 0.4 → 0.55 (more friction, settles faster)
+      //   alpha 0.9 → 0.7 (smaller initial kick)
+      //   alphaDecay slightly higher → sim freezes ~30% faster
       sim = forceApi.forceSimulation(forceNodes)
         .force("link", forceApi.forceLink(forceLinks).id(d => d.id).distance(d => {
           const rel = String(d.relation || "");
           if (rel === "part-of") return 135;
           if (rel === "depends-on" || rel === "prerequisite-of") return 180;
           return 155;
-        }).strength(d => String(d.relation || "") === "part-of" ? 0.72 : 0.36))
-        .force("charge", forceApi.forceManyBody().strength(-420))
-        .force("collide", forceApi.forceCollide().radius(d => d.kind === "root" ? 112 : d.kind === "branch" ? 78 : 54).iterations(2))
+        }).strength(d => String(d.relation || "") === "part-of" ? 0.6 : 0.3))
+        .force("charge", forceApi.forceManyBody().strength(-260).distanceMax(420))
+        .force("collide", forceApi.forceCollide().radius(d => d.kind === "root" ? 112 : d.kind === "branch" ? 78 : 54).iterations(1))
         .force("center", forceApi.forceCenter(0, 0))
-        .force("x", forceApi.forceX(0).strength(0.035))
-        .force("y", forceApi.forceY(0).strength(0.035))
-        .alpha(0.9)
-        .alphaDecay(forceNodes.length > 100 ? 0.08 : 0.045)
+        .force("x", forceApi.forceX(0).strength(0.04))
+        .force("y", forceApi.forceY(0).strength(0.04))
+        .velocityDecay(0.55)
+        .alpha(0.7)
+        .alphaDecay(forceNodes.length > 100 ? 0.1 : 0.06)
         .on("tick", scheduleFlush);
     } catch (err) {
       if (typeof console !== "undefined") console.warn("d3 force layout unavailable:", err);

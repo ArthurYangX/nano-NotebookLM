@@ -675,9 +675,25 @@ function App() {
       // file_delta streaming. The terminal file_done event overwrites
       // the accumulated partial with the sanitized authoritative body,
       // so this can't ship unsanitized content past the LLM call.
+      //
+      // 2026-05-13 batch split: when one source_file is split into
+      // multiple batches (large PDFs > MAX_CHUNKS_PER_FILE chunks),
+      // each batch arrives as a separate `fileSections[idx]` entry
+      // with the same source_file. Wrap `\section{<file>}` only the
+      // FIRST time we see a given source_file in plan-index order;
+      // continuation batches append their content directly. Mirrors
+      // the backend's concat_draft fix.
+      const seen = new Set();
       return fileSections
         .filter(f => f && (f.status === "done" || f.status === "cached" || f.status === "running") && f.content)
-        .map(f => `\\section{${escapeLatexTitle(f.source_file)}}\n${f.content}`)
+        .map(f => {
+          let body = String(f.content || "").replace(/^\\section\{[^}]*\}\s*/, "");
+          if (seen.has(f.source_file)) {
+            return body;
+          }
+          seen.add(f.source_file);
+          return `\\section{${escapeLatexTitle(f.source_file)}}\n${body}`;
+        })
         .join("\n\n");
     }
     let reviewPartial = "";
@@ -724,12 +740,17 @@ function App() {
       const final = await API.streamFullCourseNotes(activeCourse, event => {
         if (event.type === "plan") {
           for (let i = 0; i < event.total; i += 1) {
+            const f = event.files && event.files[i] ? event.files[i] : null;
             fileSections[i] = {
-              source_file: event.files && event.files[i] ? event.files[i].source_file : `file_${i}`,
+              source_file: f ? f.source_file : `file_${i}`,
               status: "pending",
               content: null,
               error: null,
-              cached: !!(event.files && event.files[i] && event.files[i].cached),
+              cached: !!(f && f.cached),
+              // 2026-05-13 batch split metadata, used by the TOC + the
+              // streaming progress chip to show "lecture_8.pdf · 1/2".
+              batchIndex: f && typeof f.batch_index === "number" ? f.batch_index : 0,
+              batchTotal: f && typeof f.batch_total === "number" ? f.batch_total : 1,
             };
           }
           setStreamProgress(0);
@@ -1039,7 +1060,20 @@ function App() {
     // to a PDF chunk would route the user into Reader text mode instead
     // of the underlying slide — which read as "the KG only knows about
     // text" from the student's perspective.
-    const ref = `[Source: ${chunk.source_file || ""}, PDF p.${chunk.page || 1}, chunk ${chunk.chunk_id || ""}]`;
+    //
+    // 2026-05-13: fall back from `chunk.page` (pdf/docx) to `chunk.slide`
+    // (pptx) so KG citations on pptx courses no longer all land on
+    // page 1. The pptx sidecar PDFs preserve slide order, so slide N
+    // ≈ page N in the rendered PDF. If neither is present, parse the
+    // location string (e.g. "Slide 3/97" / "Page 75/122") as a last
+    // resort, then default to 1.
+    let pageNum = chunk.page || chunk.slide;
+    if (!pageNum && typeof chunk.location === "string") {
+      const m = chunk.location.match(/(?:Slide|Page|第)\s*([0-9]+)/i);
+      if (m) pageNum = Number(m[1]);
+    }
+    pageNum = pageNum || 1;
+    const ref = `[Source: ${chunk.source_file || ""}, PDF p.${pageNum}, chunk ${chunk.chunk_id || ""}]`;
     handleCitationPreview(ref);
   }
 
@@ -1177,7 +1211,15 @@ function App() {
     { id: "notes", label: "Notes", num: realNotes ? "✓" : "—" },
     { id: "mindmap", label: "Knowledge Graph", num: realMindmap ? "✓" : "—" },
     { id: "exam-prep", label: "Exam Prep", num: "★" },
-    { id: "skills", label: "Skills", num: [examAnalysis, reportData, masteryData].filter(Boolean).length || "—" },
+    // 2026-05-13: Skills tab hidden — its three cards (Exam Analysis /
+    // Course Report / Mastery Dashboard) overlap conceptually with Exam
+    // Prep, which has a clearer closed-loop UX. The view + handlers
+    // still exist (effectiveMode === "skills" renders normally; the ⌁
+    // / ▤ / ◎ topbar icon-buttons keep working) so power users can
+    // still reach those reports via the topbar icons, but the tab bar
+    // doesn't carry the slot anymore. Restore by uncommenting if you
+    // want Skills back in the main nav.
+    // { id: "skills", label: "Skills", num: [examAnalysis, reportData, masteryData].filter(Boolean).length || "—" },
     { id: "history", label: "History", num: Object.keys(sessionDays || {}).length || "—" },
     // Settings tab retired 2026-05-12 — single entry point is the ⚙
     // icon-btn in the topbar. The Settings view (effectiveMode==="settings")
@@ -1431,7 +1473,7 @@ function App() {
               : <ActionPlaceholder
                   title="Knowledge Graph"
                   desc={activeCourse ? `Extract concepts and relationships from ${activeCourse} materials` : "Select a course first"}
-                  btnLabel={streaming ? "Generating (~30s)..." : "Build Knowledge Graph"}
+                  btnLabel={streaming ? "Generating (1-5 min)..." : "Build Knowledge Graph"}
                   onAction={handleGenerateMindmap}
                   disabled={!activeCourse || streaming}
                   hint="Uses AI to analyze course chunks and build a visual concept map."

@@ -369,7 +369,14 @@ async def extract_concepts_from_chunk(
                     "chunk_id": chunk.chunk_id,
                     "source_file": chunk.source_file,
                     "location": chunk.location,
+                    # 2026-05-13: include both `page` (pdf/docx) and
+                    # `slide` (pptx) so the frontend's PDF-preview deep
+                    # link can fall back to slide-N when page is null.
+                    # Previously pptx courses had every KG citation
+                    # land on PDF page 1 because the serializer only
+                    # carried `page`, and pptx chunks have page=None.
                     "page": chunk.page,
+                    "slide": chunk.slide,
                 }],
                 parent_topic=parent_topic_id,
             ))

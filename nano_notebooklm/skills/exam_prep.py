@@ -400,34 +400,88 @@ class ExamPrepSkill(Skill):
     async def _plan_topics_locked(
         self, course_id: str, params: dict, user_lang: str | None,
     ) -> SkillResult:
-        max_topics = int(params.get("max_topics", 8))
+        # 2026-05-13: default max_topics is now computed as 4 × number
+        # of source_files (clamped to [4, 20]), set later once we've
+        # grouped the chunks by source_file. Single-file courses get 4,
+        # 2-file courses get 8, 5-file courses get 20. Callers can
+        # still pass `max_topics` explicitly to override.
+        explicit_max_topics = params.get("max_topics")
         force = bool(params.get("force", False))
 
         bank = load_bank(course_id)
         if bank.get("topics") and not force:
             return SkillResult(success=True, data={"bank": bank, "reused": True, "view": self._compute_view(bank)})
 
-        results = self.kb.search(
-            "exam midterm final test quiz key concepts review",
-            top_k=20,
-            course_id=course_id,
-        )
-        if not results:
-            chunks = self.kb.get_chunks(course_id)[:20]
-            from nano_notebooklm.types import SearchResult
-            results = [
-                SearchResult(
-                    chunk_id=c.chunk_id, text=c.text, source_file=c.source_file,
-                    location=c.location, score=0.0, course_id=c.course_id,
-                )
-                for c in chunks
-            ]
+        # 2026-05-13: switched from a single hardcoded English search
+        # ("exam midterm final test quiz key concepts review") to a
+        # per-source-file even sample. The search-based approach
+        # biased the top-15 hits toward whichever chapter had the
+        # highest BM25/vector similarity to the English exam-prep
+        # keywords — on a multi-chapter Chinese course this routinely
+        # silenced 3-4 chapters out of 5 (e.g. NLP course only
+        # surfaced ch4(2) attention chunks, dropping ch4's decision
+        # tree / Naive Bayes / SVM entirely). Even sampling gives
+        # every source_file a representative slice so the LLM sees
+        # the whole course breadth when choosing topics.
+        from collections import defaultdict
+        from nano_notebooklm.types import SearchResult
+
+        all_chunks = self.kb.get_chunks(course_id)
+        if not all_chunks:
+            return SkillResult(success=False, error="no_course_content")
+
+        groups: dict[str, list] = defaultdict(list)
+        for c in all_chunks:
+            groups[c.source_file].append(c)
+
+        # Default max_topics = 4 per source_file (clamped to [4, 20]).
+        # Explicit `params.max_topics` always wins.
+        if explicit_max_topics is not None:
+            max_topics = int(explicit_max_topics)
+        else:
+            max_topics = max(4, min(20, len(groups) * 4))
+
+        # Target ~20 sample chunks total, evenly spread. With 1 file
+        # this picks 20 chunks (head + middle + tail of the file); with
+        # 5 files this picks ~4 per file.
+        sample_budget = 20
+        per_file = max(2, sample_budget // max(1, len(groups)))
+        sampled: list = []
+        for source_file, chunks in groups.items():
+            if not chunks:
+                continue
+            n = len(chunks)
+            if n <= per_file:
+                picks = list(chunks)
+            else:
+                # Even sample across [0, n-1] so the picks include both
+                # the FIRST and the LAST chunk of the file (and `per_file`
+                # evenly-spaced indices in between). Previous version
+                # used `chunks[::step][:per_file]` which only covered
+                # the head N*step indices — for a 28-chunk file with
+                # per_file=10 it stopped at index 18, missing the last
+                # 9 chunks (where Transformer / Self-Attention live
+                # in ch4(2).pptx, etc.).
+                picks = [
+                    chunks[round(i * (n - 1) / (per_file - 1))]
+                    for i in range(per_file)
+                ]
+            sampled.extend(picks)
+        sampled = sampled[:sample_budget * 2]  # safety cap
+
+        results = [
+            SearchResult(
+                chunk_id=c.chunk_id, text=c.text, source_file=c.source_file,
+                location=c.location, score=0.0, course_id=c.course_id,
+            )
+            for c in sampled
+        ]
         if not results:
             return SkillResult(success=False, error="no_course_content")
 
         source_text = "\n\n---\n\n".join(
             f"[chunk_id={r.chunk_id} · {r.source_file} · {r.location}]\n{r.text}"
-            for r in results[:15]
+            for r in results
         )
 
         prompt = prompts.EXAM_PREP_TOPIC_PROMPT.format(

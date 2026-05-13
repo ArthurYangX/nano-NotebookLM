@@ -1469,15 +1469,32 @@ body::before {
 }
 .notes-toolbar-toggle:hover { opacity: 1; }
 .notes-toolbar-collapsed {
-  margin-bottom: 8px;
-  padding: 4px 0;
   /* Collapsed view (Preview mode only — Edit mode force-expands via
      effectiveCollapsed) has just 1-2 visible buttons: the Tools toggle
-     itself, plus an optional Retry when a generation has failed. Pin
-     them to the right edge so the toolbar feels like a compact
-     "actions" cluster instead of an orphan left-aligned row.
-     User-requested 2026-05-12. */
+     itself, plus an optional Retry when a generation has failed.
+     2026-05-13: previously this still reserved a ~36px tall row even
+     when only the Tools toggle was visible, pushing notes content
+     down for no visual benefit. Now the collapsed bar shrinks to
+     fit-content + negative margin-bottom pulls the following content
+     up over the empty row, so notes reading area starts flush with
+     the previous container. The button still pins right (sticky
+     top:0 inherited from .notes-toolbar) so it stays reachable while
+     scrolling. pointer-events on the wrapper is none, restored on
+     each child so clicks on empty space behind the bar still hit the
+     content (highlight selection, etc). */
+  padding: 4px 0;
   justify-content: flex-end;
+  width: fit-content;
+  margin: 0 0 -32px auto;
+  pointer-events: none;
+  background: transparent;
+}
+.notes-toolbar-collapsed > * { pointer-events: auto; }
+.notes-toolbar-collapsed .notes-toolbar-toggle {
+  background: var(--paper);
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
 }
 .notes-editor {
   width: 100%;

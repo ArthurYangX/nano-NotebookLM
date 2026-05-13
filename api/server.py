@@ -1635,7 +1635,9 @@ async def stream_full_course_notes(req: NoteFullCourseRequest, request: Request)
                     "files": [
                         {"idx": p.idx, "source_file": p.source_file,
                          "chunk_count": p.chunk_count,
-                         "cached": p.cached_content is not None}
+                         "cached": p.cached_content is not None,
+                         "batch_index": p.batch_index,
+                         "batch_total": p.batch_total}
                         for p in plans
                     ],
                     "total": len(plans),
@@ -1656,6 +1658,7 @@ async def stream_full_course_notes(req: NoteFullCourseRequest, request: Request)
                         idx=p.idx, source_file=p.source_file,
                         chunk_count=p.chunk_count,
                         content=p.cached_content, error=None,
+                        batch_index=p.batch_index, batch_total=p.batch_total,
                     )
                     yield json.dumps({
                         "type": "file_cached",
@@ -1663,6 +1666,8 @@ async def stream_full_course_notes(req: NoteFullCourseRequest, request: Request)
                         "source_file": p.source_file,
                         "content": p.cached_content,
                         "chunks_used": p.chunk_count,
+                        "batch_index": p.batch_index,
+                        "batch_total": p.batch_total,
                     }, ensure_ascii=False) + "\n"
 
                 semaphore = asyncio.Semaphore(concurrency)
@@ -1683,6 +1688,8 @@ async def stream_full_course_notes(req: NoteFullCourseRequest, request: Request)
                             "idx": plan.idx,
                             "source_file": plan.source_file,
                             "total": len(plans),
+                            "batch_index": plan.batch_index,
+                            "batch_total": plan.batch_total,
                         })
                         # 2026-05-12: stream the per-file LLM call so the UI
                         # gets progressive `file_delta` events instead of
@@ -1698,6 +1705,8 @@ async def stream_full_course_notes(req: NoteFullCourseRequest, request: Request)
                                     "idx": plan.idx,
                                     "source_file": plan.source_file,
                                     "delta": payload,
+                                    "batch_index": plan.batch_index,
+                                    "batch_total": plan.batch_total,
                                 })
                             elif kind == "result":
                                 result = payload
@@ -1709,6 +1718,8 @@ async def stream_full_course_notes(req: NoteFullCourseRequest, request: Request)
                                 idx=plan.idx, source_file=plan.source_file,
                                 chunk_count=plan.chunk_count,
                                 content=None, error="stream_no_result",
+                                batch_index=plan.batch_index,
+                                batch_total=plan.batch_total,
                             )
                         results[plan.idx] = result
                         if result.content:
@@ -1719,8 +1730,13 @@ async def stream_full_course_notes(req: NoteFullCourseRequest, request: Request)
                             # file_done so the user sees the partial body.
                             if not result.truncated:
                                 try:
+                                    # 2026-05-13 batch split: use the
+                                    # plan's derived cache_file_key so
+                                    # multi-batch files store each part
+                                    # under its own slot
+                                    # (`<source_file>#<batch_index>`).
                                     await notes_full_course.write_cache_entry(
-                                        course_id, plan.source_file,
+                                        course_id, plan.cache_file_key,
                                         chunk_hash_value=plan.cache_key,
                                         content=result.content,
                                         model=getattr(router, "current_model", ""),
@@ -1728,7 +1744,7 @@ async def stream_full_course_notes(req: NoteFullCourseRequest, request: Request)
                                 except Exception:  # noqa: BLE001
                                     logger.warning(
                                         "write_cache_entry failed course=%s file=%s",
-                                        course_id, plan.source_file, exc_info=True,
+                                        course_id, plan.cache_file_key, exc_info=True,
                                     )
                             await queue.put({
                                 "type": "file_done",
@@ -1737,6 +1753,8 @@ async def stream_full_course_notes(req: NoteFullCourseRequest, request: Request)
                                 "content": result.content,
                                 "chunks_used": result.chunk_count,
                                 "truncated": bool(result.truncated),
+                                "batch_index": result.batch_index,
+                                "batch_total": result.batch_total,
                             })
                         else:
                             await queue.put({
@@ -1745,6 +1763,8 @@ async def stream_full_course_notes(req: NoteFullCourseRequest, request: Request)
                                 "source_file": result.source_file,
                                 "error": result.error or "unknown",
                                 "truncated": bool(result.truncated),
+                                "batch_index": result.batch_index,
+                                "batch_total": result.batch_total,
                             })
 
                 tasks = [asyncio.create_task(run_one(p)) for p in fresh_plans]
@@ -3683,28 +3703,43 @@ def _kg_to_mindmap(kg_data: dict, course_id: str) -> dict:
 
 
 def _normalize_kg_nodes(nodes: list[dict], course_id: str | None = None) -> list[dict]:
-    # Build chunk_id → (source_file, page) lookup so KG detail-panel
-    # source links always carry the real filename + page (the on-disk
-    # KG persists only `chunk_ids` for most concepts, and the legacy
-    # synth fell back to an empty `source_file` → the frontend rendered
-    # the opaque chunk_id token, which made the affordance look like a
-    # text reference rather than a "view the PDF page" link).
-    chunk_meta: dict[str, tuple[str, int | None]] = {}
+    # Build chunk_id → (source_file, page, slide, location) lookup so
+    # KG detail-panel source links always carry the real navigation
+    # coordinates. The on-disk KG persists only `chunk_ids` for most
+    # concepts, and legacy on-disk source_chunks for pptx courses
+    # carry `page=null` (chunker uses `slide` instead). Hydrate at
+    # serialisation time so the frontend's deep-link works without
+    # forcing a Re-extract.
+    chunk_meta: dict[str, tuple[str, int | None, int | None, str]] = {}
     if course_id:
         try:
             for c in kb.get_chunks(course_id):
-                chunk_meta[c.chunk_id] = (c.source_file or "", getattr(c, "page", None))
+                chunk_meta[c.chunk_id] = (
+                    c.source_file or "",
+                    getattr(c, "page", None),
+                    getattr(c, "slide", None),
+                    getattr(c, "location", "") or "",
+                )
         except Exception:
             logger.debug("KG chunk meta lookup failed for course %s", course_id)
 
-    def _hydrate(cid: str, current_file: str = "", current_page: int | None = None) -> tuple[str, int | None]:
-        if current_file and current_page is not None:
-            return current_file, current_page
+    def _hydrate(
+        cid: str,
+        current_file: str = "",
+        current_page: int | None = None,
+        current_slide: int | None = None,
+        current_location: str = "",
+    ) -> tuple[str, int | None, int | None, str]:
         meta = chunk_meta.get(cid)
         if not meta:
-            return current_file, current_page
-        sf, pg = meta
-        return (current_file or sf, current_page if current_page is not None else pg)
+            return current_file, current_page, current_slide, current_location
+        sf, pg, sl, loc = meta
+        return (
+            current_file or sf,
+            current_page if current_page is not None else pg,
+            current_slide if current_slide is not None else sl,
+            current_location or loc,
+        )
 
     normalized = []
     for idx, node in enumerate(nodes):
@@ -3715,20 +3750,30 @@ def _normalize_kg_nodes(nodes: list[dict], course_id: str | None = None) -> list
             source_chunks = []
             for sc in raw_chunks:
                 cid = sc.get("chunk_id") or ""
-                sf, pg = _hydrate(cid, sc.get("source_file") or "", sc.get("page"))
+                sf, pg, sl, loc = _hydrate(
+                    cid,
+                    sc.get("source_file") or "",
+                    sc.get("page"),
+                    sc.get("slide"),
+                    sc.get("location") or "",
+                )
                 source_chunks.append({
                     "chunk_id": cid,
                     "source_file": sf,
                     "page": pg,
+                    "slide": sl,
+                    "location": loc,
                 })
         else:
             source_chunks = []
             for cid in chunk_ids:
-                sf, pg = _hydrate(cid)
+                sf, pg, sl, loc = _hydrate(cid)
                 source_chunks.append({
                     "chunk_id": cid,
                     "source_file": sf,
                     "page": pg,
+                    "slide": sl,
+                    "location": loc,
                 })
         # R3-3: learning_order absent on legacy / no-prereq KGs → None.
         # Coerce non-int (e.g. stringified) values to None defensively

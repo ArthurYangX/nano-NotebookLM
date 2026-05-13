@@ -27,6 +27,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -144,6 +145,16 @@ class FilePlan:
     ``cache_key`` is the content hash of the file's chunks; the endpoint
     writes ``{cache_key, content}`` back to per_file_cache.json after a
     fresh successful generation.
+
+    Batch split (2026-05-13): when a source file has more chunks than
+    ``MAX_CHUNKS_PER_FILE`` allows in a single prompt, ``plan_for_course``
+    emits *multiple* FilePlans for that file — each covering a different
+    chunk range. ``batch_index`` runs ``0 .. batch_total-1``; when
+    ``batch_total == 1`` the file fits in a single LLM call and the
+    behaviour matches the pre-split path. ``cache_file_key`` derives a
+    cache slot that preserves back-compat with the pre-split format for
+    single-batch files (no ``#`` suffix), and gives each batch its own
+    slot for multi-batch files.
     """
     idx: int
     source_file: str
@@ -155,6 +166,14 @@ class FilePlan:
     max_tokens: int
     cache_key: str = ""
     cached_content: str | None = None
+    batch_index: int = 0
+    batch_total: int = 1
+
+    @property
+    def cache_file_key(self) -> str:
+        if self.batch_total <= 1:
+            return self.source_file
+        return f"{self.source_file}#{self.batch_index}"
 
 
 @dataclass(frozen=True)
@@ -177,6 +196,14 @@ class FileResult:
     content: str | None
     error: str | None
     truncated: bool = False
+    batch_index: int = 0
+    batch_total: int = 1
+
+    @property
+    def cache_file_key(self) -> str:
+        if self.batch_total <= 1:
+            return self.source_file
+        return f"{self.source_file}#{self.batch_index}"
 
 
 # ── Incremental per-file cache ─────────────────────────────────────
@@ -365,9 +392,19 @@ async def write_cache_entry(
 def prune_stale_cache(course_id: str, active_source_files: set[str]) -> int:
     """Drop cache entries for source_files no longer present in the course
     (e.g. user deleted a file and re-ingested). Returns the number of
-    entries removed. No-op when nothing changed."""
+    entries removed. No-op when nothing changed.
+
+    2026-05-13: cache keys for multi-batch files are
+    ``<source_file>#<batch_index>``; this strips the `#` suffix before
+    checking against the active set so a deleted file's batches all
+    prune together. Single-batch keys (no `#`) are unchanged.
+    """
     cache = load_cache(course_id)
-    stale = [k for k in cache if k not in active_source_files]
+    stale = []
+    for k in cache:
+        source_file = k.split("#", 1)[0]
+        if source_file not in active_source_files:
+            stale.append(k)
     if not stale:
         return 0
     for k in stale:
@@ -414,69 +451,125 @@ def plan_for_course(
     groups = _group_chunks_by_file(chunks)
     cache = {} if force_refresh else load_cache(course_id)
 
+    import math
     plans: list[FilePlan] = []
-    for idx, (source_file, file_chunks) in enumerate(groups.items()):
-        capped = file_chunks[:MAX_CHUNKS_PER_FILE]
-        cache_key = chunk_hash(capped)
-        cached_content: str | None = None
-        entry = cache.get(source_file)
-        if entry and isinstance(entry, dict):
-            stored_hash = entry.get("chunk_hash")
-            stored_body = entry.get("content")
-            stored_prompt_version = entry.get("prompt_version")
-            # All three of (chunk_hash, prompt_version, content) must match
-            # current state. Stale prompt_version → entry was produced by
-            # an older prompt; regen so the LLM uses the current rubric.
-            if (
-                stored_hash == cache_key
-                and stored_prompt_version == _NOTE_PROMPT_VERSION
-                and isinstance(stored_body, str)
-                and stored_body.strip()
-            ):
-                # Defense in depth: re-run the sanitizer on the cached body.
-                # A tampered cache file (or one written by a buggy build
-                # that bypassed the per-file sanitizer) MUST NOT ship
-                # malicious LaTeX to the client / tectonic.
-                try:
-                    cached_content = check(stored_body)
-                except LaTeXUnsafeError as e:
-                    logger.warning(
-                        "cache entry rejected for course=%s file=%s — "
-                        "unsafe LaTeX: %s",
-                        course_id, source_file, e.reason,
-                    )
-                    cached_content = None
+    for _, (source_file, file_chunks) in enumerate(groups.items()):
+        # 2026-05-13 batch split: instead of dropping chunks past
+        # MAX_CHUNKS_PER_FILE, slice the file into ceil(n/cap) parts and
+        # plan one FilePlan per part. Each part runs as an independent
+        # LLM call through the same concurrency pool. The cache file
+        # uses a `<source_file>#<batch_index>` key for multi-batch
+        # files; single-batch files keep the bare `<source_file>` key
+        # so existing caches stay valid.
+        batch_total = max(1, math.ceil(len(file_chunks) / MAX_CHUNKS_PER_FILE))
+        for batch_index in range(batch_total):
+            start = batch_index * MAX_CHUNKS_PER_FILE
+            end = min(start + MAX_CHUNKS_PER_FILE, len(file_chunks))
+            batch_chunks = file_chunks[start:end]
+            cache_key = chunk_hash(batch_chunks)
+            cache_file_key = (
+                source_file if batch_total <= 1
+                else f"{source_file}#{batch_index}"
+            )
+            cached_content: str | None = None
+            entry = cache.get(cache_file_key)
+            if entry and isinstance(entry, dict):
+                stored_hash = entry.get("chunk_hash")
+                stored_body = entry.get("content")
+                stored_prompt_version = entry.get("prompt_version")
+                # All three of (chunk_hash, prompt_version, content) must
+                # match current state. Stale prompt_version → entry was
+                # produced by an older prompt; regen so the LLM uses the
+                # current rubric.
+                if (
+                    stored_hash == cache_key
+                    and stored_prompt_version == _NOTE_PROMPT_VERSION
+                    and isinstance(stored_body, str)
+                    and stored_body.strip()
+                ):
+                    # Defense in depth: re-run the sanitizer on the cached
+                    # body. A tampered cache file (or one written by a
+                    # buggy build that bypassed the per-file sanitizer)
+                    # MUST NOT ship malicious LaTeX to the client / tectonic.
+                    try:
+                        cached_content = check(stored_body)
+                    except LaTeXUnsafeError as e:
+                        logger.warning(
+                            "cache entry rejected for course=%s file=%s — "
+                            "unsafe LaTeX: %s",
+                            course_id, cache_file_key, e.reason,
+                        )
+                        cached_content = None
 
-        # LaTeX-output fix-all v3 #1: prime LLM with `\cite{}` not `[Source:]`.
-        # Same fix as note_generator.prepare_inputs — without it the LLM
-        # mirrored the markdown-flavoured [Source:] marker straight into the
-        # output, dragging the rest of the response into markdown shape.
-        source_text = "\n\n---\n\n".join(
-            f"\\cite{{{c.source_file}:{c.location}}}\n{c.text}"
-            for c in capped
-        )
-        prompt = prompts.NOTE_GENERATION_PROMPT.format(
-            course_name=course_id,
-            topic=f"Detailed notes for {source_file}",
-            source_text=source_text,
-            format_instructions=prompts.NOTE_FORMAT_LATEX,
-        )
-        system = prompts.NOTE_GENERATION_SYSTEM
-        binding = prompts.USER_LANG_BINDING(user_lang)
-        if binding:
-            system = f"{system}\n\n{binding}"
-        plans.append(FilePlan(
-            idx=idx,
-            source_file=source_file,
-            chunk_count=len(capped),
-            prompt=prompt,
-            system=system,
-            task_type="note_generation",
-            temperature=PER_FILE_TEMPERATURE,
-            max_tokens=PER_FILE_MAX_TOKENS,
-            cache_key=cache_key,
-            cached_content=cached_content,
-        ))
+            # LaTeX-output fix-all v3 #1: prime LLM with `\cite{}` not
+            # `[Source:]`. Same fix as note_generator.prepare_inputs.
+            source_text = "\n\n---\n\n".join(
+                f"\\cite{{{c.source_file}:{c.location}}}\n{c.text}"
+                for c in batch_chunks
+            )
+            # Batch-aware prefix: tell the LLM which slice it's seeing so
+            # part>0 continues rather than restarting the intro, and so
+            # part 1 knows more parts follow (don't write a wrap-up
+            # "考点" Remark at the end of part 1 of N — wait for the
+            # last part). prompt_version hashing is over the *template*
+            # text only, so this user-message prefix doesn't invalidate
+            # any single-batch cache entries.
+            if batch_total > 1:
+                if batch_index == 0:
+                    part_hint = (
+                        f"[NOTE: this is Part 1 of {batch_total} of "
+                        f"{source_file}. More parts follow — do NOT "
+                        f"write a final wrap-up / exam-summary Remark "
+                        f"at the end of this part.]\n\n"
+                    )
+                elif batch_index < batch_total - 1:
+                    part_hint = (
+                        f"[NOTE: this is Part {batch_index + 1} of "
+                        f"{batch_total} of {source_file}. Earlier parts "
+                        f"already wrote \\section{{{source_file}}} and "
+                        f"introductory material. Continue the notes — "
+                        f"do NOT emit \\section{{}} again, use "
+                        f"\\subsection{{}} or direct content. More parts "
+                        f"still follow.]\n\n"
+                    )
+                else:
+                    part_hint = (
+                        f"[NOTE: this is the FINAL Part {batch_index + 1} "
+                        f"of {batch_total} of {source_file}. Earlier parts "
+                        f"already wrote \\section{{{source_file}}}. "
+                        f"Continue — do NOT emit \\section{{}}, use "
+                        f"\\subsection{{}} or direct content. This is the "
+                        f"last part, so a wrap-up / exam-summary Remark "
+                        f"is appropriate here.]\n\n"
+                    )
+                source_text = part_hint + source_text
+            topic_label = source_file if batch_total <= 1 else (
+                f"{source_file} (Part {batch_index + 1}/{batch_total})"
+            )
+            prompt = prompts.NOTE_GENERATION_PROMPT.format(
+                course_name=course_id,
+                topic=f"Detailed notes for {topic_label}",
+                source_text=source_text,
+                format_instructions=prompts.NOTE_FORMAT_LATEX,
+            )
+            system = prompts.NOTE_GENERATION_SYSTEM
+            binding = prompts.USER_LANG_BINDING(user_lang)
+            if binding:
+                system = f"{system}\n\n{binding}"
+            plans.append(FilePlan(
+                idx=len(plans),
+                source_file=source_file,
+                chunk_count=len(batch_chunks),
+                prompt=prompt,
+                system=system,
+                task_type="note_generation",
+                temperature=PER_FILE_TEMPERATURE,
+                max_tokens=PER_FILE_MAX_TOKENS,
+                cache_key=cache_key,
+                cached_content=cached_content,
+                batch_index=batch_index,
+                batch_total=batch_total,
+            ))
     return plans
 
 
@@ -558,6 +651,7 @@ async def generate_file_stream(
                 chunk_count=plan.chunk_count,
                 content=None, error=type(e).__name__,
                 truncated=truncated,
+                batch_index=plan.batch_index, batch_total=plan.batch_total,
             ))
             return
     content = partial.strip()
@@ -567,6 +661,7 @@ async def generate_file_stream(
             chunk_count=plan.chunk_count,
             content=None, error="empty_llm_response",
             truncated=truncated,
+            batch_index=plan.batch_index, batch_total=plan.batch_total,
         ))
         return
     try:
@@ -579,6 +674,7 @@ async def generate_file_stream(
             chunk_count=plan.chunk_count,
             content=None, error=f"latex_unsafe: {e.reason}",
             truncated=truncated,
+            batch_index=plan.batch_index, batch_total=plan.batch_total,
         ))
         return
     yield ("result", FileResult(
@@ -586,6 +682,7 @@ async def generate_file_stream(
         chunk_count=plan.chunk_count,
         content=safe, error=None,
         truncated=truncated,
+        batch_index=plan.batch_index, batch_total=plan.batch_total,
     ))
 
 
@@ -629,6 +726,7 @@ async def _generate_file_inner(
                 idx=plan.idx, source_file=plan.source_file,
                 chunk_count=plan.chunk_count,
                 content=None, error="empty_llm_response",
+                batch_index=plan.batch_index, batch_total=plan.batch_total,
             )
         try:
             safe = check(content)
@@ -639,11 +737,13 @@ async def _generate_file_inner(
                 idx=plan.idx, source_file=plan.source_file,
                 chunk_count=plan.chunk_count,
                 content=None, error=f"latex_unsafe: {e.reason}",
+                batch_index=plan.batch_index, batch_total=plan.batch_total,
             )
         return FileResult(
             idx=plan.idx, source_file=plan.source_file,
             chunk_count=plan.chunk_count,
             content=safe, error=None,
+            batch_index=plan.batch_index, batch_total=plan.batch_total,
         )
     except Exception as e:  # noqa: BLE001
         logger.exception("per-file note generation failed for %s",
@@ -652,21 +752,48 @@ async def _generate_file_inner(
             idx=plan.idx, source_file=plan.source_file,
             chunk_count=plan.chunk_count,
             content=None, error=type(e).__name__,
+            batch_index=plan.batch_index, batch_total=plan.batch_total,
         )
 
 
 def concat_draft(file_results: list[FileResult]) -> str:
-    """Programmatic merge — wrap each succeeded file in \\section{<file>}
-    and join in idx order. Failed files are skipped silently (their
-    file_error event tells the user). Returns the empty string when
-    nothing succeeded.
+    """Programmatic merge — wrap each succeeded source_file in
+    \\section{<file>} and join in idx order. Failed files are skipped
+    silently (their file_error event tells the user). Returns the empty
+    string when nothing succeeded.
+
+    2026-05-13 batch split: when one source_file has multiple
+    FileResults (one per batch), wrap the section header ONCE around
+    the first batch and append later batches as continuation prose.
+    The batch>0 prompt already tells the LLM to not emit \\section{},
+    but we also defense-in-depth strip a leading \\section{<same file>}
+    from continuation parts so a non-compliant model can't double-stamp
+    the heading.
     """
     pieces: list[str] = []
+    seen_files: set[str] = set()
     for r in sorted(file_results, key=lambda x: x.idx):
         if not r.content:
             continue
-        safe_title = _escape_latex_title(r.source_file)
-        pieces.append(f"\\section{{{safe_title}}}\n{r.content.strip()}\n")
+        body = r.content.strip()
+        if r.source_file in seen_files:
+            # Continuation batch — strip a leading \section{<file>} that
+            # a non-compliant model might have re-emitted, and skip the
+            # wrapper. The section header from the first batch covers it.
+            body = re.sub(
+                r"^\\section\{[^}]*\}\s*", "", body, count=1,
+            )
+            pieces.append(body + "\n")
+        else:
+            safe_title = _escape_latex_title(r.source_file)
+            # Strip a leading \section{...} that the LLM emitted itself,
+            # so we don't double-wrap. (Prompt may or may not produce
+            # one for batch_index==0.)
+            body = re.sub(
+                r"^\\section\{[^}]*\}\s*", "", body, count=1,
+            )
+            pieces.append(f"\\section{{{safe_title}}}\n{body}\n")
+            seen_files.add(r.source_file)
     return "\n".join(pieces)
 
 

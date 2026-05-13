@@ -26,7 +26,29 @@ from nano_notebooklm.skills.notes_full_course import (
     plan_for_course,
     prepare_review_inputs,
     generate_file,
+    generate_file_stream,
 )
+from nano_notebooklm.ai import prompt_templates as _prompts
+
+
+# Sentinel used by the `fake_complete_stream` helpers below to route between
+# the review-pass prompt and the per-file prompt. Pinned to the production
+# template's literal prefix so a future prompt-template rename (e.g. "Polish"
+# → "Refine") trips this assertion at module load, instead of silently
+# routing every prompt through the per-file branch and producing opaque
+# content-substring failures downstream. Keep the comparison case-sensitive.
+_REVIEW_PROMPT_DISCRIMINATOR = "Polish"
+assert _prompts.NOTE_MERGE_REVIEW_PROMPT.startswith(_REVIEW_PROMPT_DISCRIMINATOR), (
+    "NOTE_MERGE_REVIEW_PROMPT no longer starts with 'Polish' — update "
+    "_REVIEW_PROMPT_DISCRIMINATOR in tests/test_notes_full_course.py to "
+    "match the new prefix so the fake_complete_stream helpers continue to "
+    "route review vs per-file prompts correctly."
+)
+
+
+def _is_review_prompt(prompt: str) -> bool:
+    """True iff `prompt` is the merge/review LLM call (vs per-file)."""
+    return prompt.lstrip().startswith(_REVIEW_PROMPT_DISCRIMINATOR)
 
 
 # ── Unit tests: helpers ──────────────────────────────────────────────
@@ -70,11 +92,15 @@ def test_plan_for_course_empty_when_no_chunks():
     assert plan_for_course(EmptyKB(), "testcourse") == []
 
 
-def test_plan_for_course_caps_chunks_per_file(sample_chunks, monkeypatch):
-    """A file with more than MAX_CHUNKS_PER_FILE chunks should be truncated
-    to the cap — protects the per-file prompt from overflowing context."""
+def test_plan_for_course_splits_oversized_file_into_batches(sample_chunks, monkeypatch):
+    """A file with more than MAX_CHUNKS_PER_FILE chunks should be split
+    into multiple FilePlans — one per chunk batch. Pre-2026-05-13 the
+    overflow chunks were dropped silently; now they ride a second LLM
+    call instead. Each batch carries (batch_index, batch_total) so the
+    NDJSON events and cache slots can distinguish them."""
+    cap = notes_full_course.MAX_CHUNKS_PER_FILE
     big_chunks = []
-    for i in range(notes_full_course.MAX_CHUNKS_PER_FILE + 10):
+    for i in range(cap + 10):
         c = sample_chunks[0].model_copy(update={
             "chunk_id": f"big-{i}",
             "text": f"chunk number {i}",
@@ -86,10 +112,24 @@ def test_plan_for_course_caps_chunks_per_file(sample_chunks, monkeypatch):
             return big_chunks
 
     plans = plan_for_course(BigKB(), "testcourse")
-    assert len(plans) == 1
-    assert plans[0].chunk_count == notes_full_course.MAX_CHUNKS_PER_FILE
-    # The capped-off chunks should be absent from the prompt
-    assert f"chunk number {notes_full_course.MAX_CHUNKS_PER_FILE + 5}" not in plans[0].prompt
+    assert len(plans) == 2, f"expected 2 batches, got {len(plans)}"
+    assert plans[0].batch_index == 0
+    assert plans[0].batch_total == 2
+    assert plans[0].chunk_count == cap
+    assert plans[1].batch_index == 1
+    assert plans[1].batch_total == 2
+    assert plans[1].chunk_count == 10
+    # Cache slot keys distinguish batches; single-batch files keep the
+    # bare source_file key (verified elsewhere).
+    assert plans[0].cache_file_key.endswith("#0")
+    assert plans[1].cache_file_key.endswith("#1")
+    # Previously-dropped chunks now appear in plans[1]:
+    assert f"chunk number {cap + 5}" in plans[1].prompt
+    # And NOT in plans[0]:
+    assert f"chunk number {cap + 5}" not in plans[0].prompt
+    # Part hints tell the LLM how to behave per part:
+    assert "Part 1 of 2" in plans[0].prompt
+    assert "FINAL Part 2" in plans[1].prompt
 
 
 def test_escape_latex_title_handles_specials_and_paths():
@@ -181,6 +221,21 @@ class _FakeRouter:
             async with self._lock:
                 self.in_flight -= 1
 
+    async def complete_stream(self, prompt, task_type="", system="",
+                              temperature=0.7, max_tokens=4096):
+        """Streaming counterpart to `complete` — used by generate_file_stream
+        unit tests. Splits the responder's output into 2 chunks so the
+        delta-accumulation path is exercised; if responder raises, the
+        exception surfaces from the `async for` driver."""
+        self.calls.append({"prompt": prompt, "task_type": task_type})
+        result = self.responder(prompt)
+        if isinstance(result, Exception):
+            raise result
+        # Split into 2 chunks so the stream isn't trivially a single yield
+        midpoint = max(1, len(result) // 2)
+        yield result[:midpoint]
+        yield result[midpoint:]
+
 
 def _make_plan(idx=0, source_file="a.pdf"):
     return FilePlan(
@@ -269,6 +324,71 @@ def test_generate_file_respects_semaphore_concurrency():
     )
 
 
+# ── Unit tests: generate_file_stream (mirrors generate_file branches) ──
+#
+# The non-stream `generate_file` has 4 outcome branches covered above
+# (happy / Exception / unsafe-latex / empty). Mirror them for the
+# streaming variant so each FileResult error code is independently
+# pinned. End-to-end endpoint coverage only exercises happy + unsafe-
+# latex, conflating "all errors" without checking the specific code.
+
+
+async def _collect_file_stream(router, plan):
+    """Drive `generate_file_stream` to completion, returning
+    (deltas, final_result)."""
+    deltas: list[str] = []
+    final: FileResult | None = None
+    async for kind, payload in generate_file_stream(router, plan):
+        if kind == "delta":
+            deltas.append(payload)
+        elif kind == "result":
+            final = payload
+    return deltas, final
+
+
+def test_generate_file_stream_happy_path():
+    router = _FakeRouter(lambda p: r"\section{a}\textbf{ok body}")
+    deltas, result = asyncio.run(_collect_file_stream(router, _make_plan()))
+    assert result is not None
+    assert result.error is None
+    assert r"\textbf{ok body}" in result.content
+    # Stream split into 2 chunks (see _FakeRouter.complete_stream)
+    assert len(deltas) == 2
+    # Accumulation reconstructs the LLM body
+    assert "".join(deltas) == r"\section{a}\textbf{ok body}"
+
+
+def test_generate_file_stream_catches_llm_exception():
+    router = _FakeRouter(lambda p: RuntimeError("backend down"))
+    deltas, result = asyncio.run(_collect_file_stream(router, _make_plan()))
+    assert result is not None
+    assert result.content is None
+    assert result.error == "RuntimeError"
+    # No delta emitted before the raise — exception fires at the first
+    # `async for` step inside generate_file_stream.
+    assert deltas == []
+
+
+def test_generate_file_stream_rejects_unsafe_latex():
+    router = _FakeRouter(lambda p: r"\input{/etc/passwd}")
+    deltas, result = asyncio.run(_collect_file_stream(router, _make_plan()))
+    assert result is not None
+    assert result.content is None
+    assert result.error and result.error.startswith("latex_unsafe:")
+    # Deltas DID stream out before the terminal sanitization rejected
+    # them — that's the documented mid-stream UX (user sees text grow,
+    # sanitizer catches forbidden commands only at end-of-stream).
+    assert "".join(deltas) == r"\input{/etc/passwd}"
+
+
+def test_generate_file_stream_empty_response():
+    router = _FakeRouter(lambda p: "   \n  ")
+    deltas, result = asyncio.run(_collect_file_stream(router, _make_plan()))
+    assert result is not None
+    assert result.content is None
+    assert result.error == "empty_llm_response"
+
+
 # ── Endpoint tests (TestClient + monkeypatched router) ─────────────────
 
 
@@ -304,27 +424,27 @@ def _read_events(response):
 def test_endpoint_happy_path_emits_full_pipeline(fc_client, monkeypatch):
     client, server_mod = fc_client
 
-    async def fake_complete(prompt, task_type="", system="",
-                            temperature=0.7, max_tokens=4096):
-        # Return a deterministic-but-unique body per file so we can spot
-        # them in the concat draft.
+    async def fake_complete_stream(prompt, task_type="", system="",
+                                   temperature=0.7, max_tokens=4096):
+        # 2026-05-12: per-file phase now uses router.complete_stream too
+        # (file_delta events). Distinguish review vs per-file by the
+        # NOTE_MERGE_REVIEW_PROMPT's leading "Polish" verb.
+        if _is_review_prompt(prompt):
+            yield r"\section{ml.pdf}"
+            yield "\n"
+            yield r"\textbf{polished ml body}"
+            return
+        # Per-file phase: deterministic-but-unique body per file so we
+        # can spot them in the file_delta stream / concat draft.
         body = r"\textbf{body}"
         if "ml.pdf" in prompt:
             body = r"\textbf{ml body}"
         elif "rl.pdf" in prompt:
             body = r"\textbf{rl body}"
-        return _FakeResponse(body)
+        # Emit as 2-3 deltas so the test exercises the delta-accumulation path
+        yield body[:5]
+        yield body[5:]
 
-    async def fake_complete_stream(prompt, task_type="", system="",
-                                   temperature=0.7, max_tokens=4096):
-        # Pretend the review pass polished the draft — emit a couple of
-        # deltas containing the merged \section headers so the test can
-        # assert pass-through.
-        yield r"\section{ml.pdf}"
-        yield "\n"
-        yield r"\textbf{polished ml body}"
-
-    monkeypatch.setattr(server_mod.router, "complete", fake_complete)
     monkeypatch.setattr(server_mod.router, "complete_stream", fake_complete_stream)
 
     response = client.post("/api/notes/full-course/stream",
@@ -341,6 +461,30 @@ def test_endpoint_happy_path_emits_full_pipeline(fc_client, monkeypatch):
     dones = [e for e in events if e["type"] == "file_done"]
     assert len(starts) == 5
     assert len(dones) == 5
+    # file_delta events stream the per-file body — at least 2 per file
+    # (we yield 2 chunks above) × 5 files = ≥10 total.
+    deltas = [e for e in events if e["type"] == "file_delta"]
+    assert len(deltas) >= 10
+    # Each delta carries `idx` matching the eventual file_done.
+    delta_idxs = {e["idx"] for e in deltas}
+    done_idxs = {e["idx"] for e in dones}
+    assert delta_idxs == done_idxs
+    # Truth-pin invariant: accumulated delta string == file_done.content
+    # (when the LLM body is sanitization-stable, i.e. doesn't contain
+    # forbidden commands and isn't stripped of surrounding whitespace).
+    # Pins the contract that file_done.content is the authoritative
+    # final body that overrides any client-side delta accumulation —
+    # the frontend's `file_done` handler relies on this to install the
+    # sanitized body once mid-stream rendering is done.
+    done_by_idx = {e["idx"]: e for e in dones}
+    for idx, done in done_by_idx.items():
+        accumulated = "".join(
+            e["delta"] for e in deltas if e["idx"] == idx
+        )
+        assert accumulated == done["content"], (
+            f"truth-pin broken for idx={idx}: deltas accumulated "
+            f"{accumulated!r} but file_done.content={done['content']!r}"
+        )
     # merging + reviewing markers appear once each, after all file_done events
     assert types.count("merging") == 1
     assert types.count("reviewing") == 1
@@ -357,18 +501,17 @@ def test_endpoint_happy_path_emits_full_pipeline(fc_client, monkeypatch):
 def test_endpoint_emits_file_error_for_unsafe_latex(fc_client, monkeypatch):
     client, server_mod = fc_client
 
-    async def fake_complete(prompt, task_type="", system="",
-                            temperature=0.7, max_tokens=4096):
-        # Inject a forbidden command for the rl.pdf file only
-        if "rl.pdf" in prompt:
-            return _FakeResponse(r"\input{/etc/passwd}")
-        return _FakeResponse(r"\textbf{ok}")
-
     async def fake_complete_stream(prompt, task_type="", system="",
                                    temperature=0.7, max_tokens=4096):
-        yield r"\textbf{reviewed}"
+        if _is_review_prompt(prompt):
+            yield r"\textbf{reviewed}"
+            return
+        # Per-file phase: inject a forbidden command for rl.pdf only.
+        if "rl.pdf" in prompt:
+            yield r"\input{/etc/passwd}"
+        else:
+            yield r"\textbf{ok}"
 
-    monkeypatch.setattr(server_mod.router, "complete", fake_complete)
     monkeypatch.setattr(server_mod.router, "complete_stream", fake_complete_stream)
 
     response = client.post("/api/notes/full-course/stream",
@@ -392,19 +535,20 @@ def test_endpoint_emits_latex_unsafe_when_review_stream_returns_forbidden(fc_cli
     assert a terminal `{type: "error", error: "latex_unsafe"}` event."""
     client, server_mod = fc_client
 
-    async def fake_complete(prompt, task_type="", system="",
-                            temperature=0.7, max_tokens=4096):
-        return _FakeResponse(r"\textbf{ok}")
-
     async def fake_complete_stream(prompt, task_type="", system="",
                                    temperature=0.7, max_tokens=4096):
-        yield r"\section{Polished}"
-        yield "\n"
-        yield r"\input{/etc/passwd}"
-        yield "\n"
-        yield r"\textbf{trailing}"
+        if _is_review_prompt(prompt):
+            # The review stream emits a forbidden command — sanitizer
+            # should catch it at the terminal check_unbounded gate.
+            yield r"\section{Polished}"
+            yield "\n"
+            yield r"\input{/etc/passwd}"
+            yield "\n"
+            yield r"\textbf{trailing}"
+            return
+        # Per-file phase: harmless body.
+        yield r"\textbf{ok}"
 
-    monkeypatch.setattr(server_mod.router, "complete", fake_complete)
     monkeypatch.setattr(server_mod.router, "complete_stream", fake_complete_stream)
 
     response = client.post("/api/notes/full-course/stream",
@@ -436,11 +580,12 @@ def test_endpoint_rejects_empty_course(fc_client, monkeypatch):
 def test_endpoint_handles_all_files_failed(fc_client, monkeypatch):
     client, server_mod = fc_client
 
-    async def fake_complete(prompt, task_type="", system="",
-                            temperature=0.7, max_tokens=4096):
+    async def fake_complete_stream(prompt, task_type="", system="",
+                                   temperature=0.7, max_tokens=4096):
         raise RuntimeError("backend down")
+        yield ""  # unreachable; presence makes this a valid async generator
 
-    monkeypatch.setattr(server_mod.router, "complete", fake_complete)
+    monkeypatch.setattr(server_mod.router, "complete_stream", fake_complete_stream)
 
     response = client.post("/api/notes/full-course/stream",
                            json={"course_id": "testcourse"})
@@ -474,15 +619,15 @@ def test_endpoint_cancels_outstanding_tasks_on_disconnect(fc_client, monkeypatch
     started = 0
     started_lock = _aio.Lock()
 
-    async def slow_complete(prompt, task_type="", system="",
-                            temperature=0.7, max_tokens=4096):
+    async def slow_complete_stream(prompt, task_type="", system="",
+                                   temperature=0.7, max_tokens=4096):
         nonlocal started
         async with started_lock:
             started += 1
         await _aio.sleep(30)
-        return _FakeResponse(r"\textbf{never reached}")
+        yield r"\textbf{never reached}"
 
-    monkeypatch.setattr(server_mod.router, "complete", slow_complete)
+    monkeypatch.setattr(server_mod.router, "complete_stream", slow_complete_stream)
 
     # Drive the underlying StreamingResponse generator directly rather than
     # through TestClient — TestClient buffers the full response before
