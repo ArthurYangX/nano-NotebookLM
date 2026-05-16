@@ -2351,7 +2351,8 @@ async def get_mindmap(course_id: str):
             raise HTTPException(404, f"No chunks for course '{course_id}'")
 
         concepts, relations = await extract_from_chunks(
-            chunks, course_id, router, max_chunks=30,
+            chunks, course_id, router,
+            max_chunks=_kg_stage_b_sample_size(len(chunks)),
             # R4-4: pass kb.embed_fn so the extractor caches concept_embedding
             # on every non-root concept for GraphRAG cosine ranking. Falls
             # back to lazy graph_search compute if this call fails.
@@ -2940,6 +2941,36 @@ async def ingest_course(req: IngestRequest):
     }
 
 
+# KG Stage B sampling: previously a hard `max_chunks=30` regardless of
+# corpus size, which gave 8% coverage on a 374-chunk course and 0.6%
+# on a 5000-chunk one — both produce sparse KGs that miss key concepts
+# (e.g. "维特比" was missing because ch3 random-sampled chunks didn't
+# cover the Viterbi pages). Switch to a ratio with bounds:
+#   sample_size = clamp(int(total * RATIO), MIN, MAX)
+#
+# Defaults: 30% of chunks, floor 30, ceiling 500. Floor protects tiny
+# courses (single-doc uploads). Ceiling caps LLM cost for huge corpora
+# (5000-chunk course at 30% would otherwise cost ~30min × concurrency
+# slowdown through codex proxy).
+KG_STAGE_B_SAMPLE_RATIO = float(os.getenv("KG_STAGE_B_SAMPLE_RATIO", "0.3"))
+KG_STAGE_B_SAMPLE_MIN = int(os.getenv("KG_STAGE_B_SAMPLE_MIN", "30"))
+KG_STAGE_B_SAMPLE_MAX = int(os.getenv("KG_STAGE_B_SAMPLE_MAX", "500"))
+
+
+def _kg_stage_b_sample_size(total_chunks: int) -> int:
+    """Clamp ``int(total * RATIO)`` to ``[MIN, MAX]``. The extractor's
+    own ``max_chunks`` is a CEILING (uses all chunks when fewer than
+    that exist) so MIN being larger than ``total_chunks`` is fine —
+    the extractor will just use all available chunks.
+    """
+    if total_chunks <= 0:
+        return KG_STAGE_B_SAMPLE_MIN
+    return max(
+        KG_STAGE_B_SAMPLE_MIN,
+        min(KG_STAGE_B_SAMPLE_MAX, int(total_chunks * KG_STAGE_B_SAMPLE_RATIO)),
+    )
+
+
 # R4-2: per-course upload-pipeline lock — two concurrent uploads to the
 # same course id race on `chunks.json` / `course_meta.json` / FAISS index
 # rebuild. Serialise them so the second waits behind the first instead of
@@ -3294,10 +3325,12 @@ async def _run_upload_pipeline(
     """
     import asyncio as _asyncio
 
+    logger.info("upload.pipeline.entered task=%s course=%s", task_id, course_id)
     tasks_dict = getattr(app.state, "upload_tasks", None) or _UPLOAD_TASKS
     state = tasks_dict.get(task_id)
     if state is None:
         # Evicted before we even started — nothing to drive.
+        logger.warning("upload.pipeline.state-missing task=%s", task_id)
         return
 
     current_stage: str | None = None
@@ -3308,7 +3341,9 @@ async def _run_upload_pipeline(
     t_start = time.monotonic()
 
     try:
+        logger.info("upload.pipeline.lock-acquire task=%s", task_id)
         async with _upload_lock_for(course_id):
+            logger.info("upload.pipeline.lock-acquired task=%s", task_id)
             state["status"] = "running"
             try:
                 # Stage 1: chunking (synchronous; off-loaded to worker).
@@ -3380,7 +3415,8 @@ async def _run_upload_pipeline(
                         _progress("kg_stage_b", 100)
                         return [], []
                     return await extract_from_chunks(
-                        chunks, course_id, router, max_chunks=30,
+                        chunks, course_id, router,
+                        max_chunks=_kg_stage_b_sample_size(len(chunks)),
                         progress_callback=_progress,
                         embed_fn=kb.embed_fn,
                     )
@@ -3464,7 +3500,18 @@ async def _run_upload_pipeline(
                 state["ended_at"] = time.time()
             finally:
                 _maybe_evict_upload_lock(course_id)
+    except Exception:
+        # OUTER exception path: lock acquire failed OR pre-lock code
+        # raised. The inner except only catches stage-execution errors;
+        # without this, the task dies silently and state.status stays
+        # "waiting" forever, giving the frontend nothing to render.
+        logger.exception("upload.pipeline.outer-error task=%s course=%s", task_id, course_id)
+        state["error"] = "upload_pipeline_failed_outer"
+        state["error_stage"] = current_stage
+        state["status"] = "error"
+        state["ended_at"] = time.time()
     finally:
+        logger.info("upload.pipeline.exiting task=%s status=%s", task_id, state.get("status"))
         _maybe_evict_upload_tasks()
 
 
