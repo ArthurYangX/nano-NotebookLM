@@ -291,12 +291,36 @@ class KBStore:
         """
         index_dir = self.artifacts_dir / "indices"
 
+        # review-swarm fix-all v2 (2026-05-16): load cached embeddings
+        # from the previously-saved global index so unchanged chunks
+        # (same chunk_id) reuse their vectors instead of being re-embed
+        # via the API. Before this fix, every upload triggered a full
+        # re-embed of all 10k chunks at ~60s/batch through codex proxy
+        # = ~2.5 hours. With cache, a 374-chunk delta uploads in ~6 min.
+        global_cache_dir = index_dir / "faiss" / "global"
+        cached_global = VectorIndex.load_cached_vectors(global_cache_dir)
+
         if course_id:
             course_chunks = self._load_all_chunks(course_id)
             if course_chunks:
+                # Per-course rebuild also benefits from the same cache —
+                # course's own chunks may already be in the global cache
+                # from a prior rebuild.
+                course_cache_dir = index_dir / "faiss" / course_id
+                cached_course = VectorIndex.load_cached_vectors(course_cache_dir)
+                # Merge global cache as fallback (covers chunks that
+                # exist globally but aren't yet in this course's per-
+                # course saved index — e.g. first time this course is
+                # rebuilt after a global rebuild created them).
+                merged_cache = {**cached_global, **cached_course}
                 course_vector = VectorIndex(self.embed_fn)
-                course_vector.build(course_chunks)
-                course_vector.save(index_dir / "faiss" / course_id)
+                course_vector.build(course_chunks, cached_vectors=merged_cache)
+                course_vector.save(course_cache_dir)
+                # Pull freshly-embedded vectors so the global build
+                # below can reuse them instead of re-embedding the same
+                # chunks a second time. Without this, the per-course +
+                # global rebuild pattern double-pays for new chunks.
+                cached_global.update(VectorIndex.load_cached_vectors(course_cache_dir))
                 course_bm25 = BM25Index()
                 course_bm25.build(course_chunks)
                 course_bm25.save(index_dir / "bm25" / f"{course_id}.json")
@@ -310,7 +334,7 @@ class KBStore:
 
         logger.info(f"Building global vector index for {len(all_chunks)} chunks...")
         self._vector_index = VectorIndex(self.embed_fn)
-        self._vector_index.build(all_chunks)
+        self._vector_index.build(all_chunks, cached_vectors=cached_global)
 
         logger.info("Building global BM25 index...")
         self._bm25_index = BM25Index()
