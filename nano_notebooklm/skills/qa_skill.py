@@ -1499,22 +1499,26 @@ class QASkill(Skill):
         binding = prompts.USER_LANG_BINDING(user_lang)
         if binding:
             system += f"\n\n{binding}"
-        # 2026-05-13 Path B: marginal-confidence graphrag. The retrieval
-        # passed the admission floor but is below the high-confidence
-        # ceiling, so the chunks may not directly answer the question.
-        # Tell the model explicitly that refusing is better than
-        # confabulating from tangential context.
+        # 2026-05-13 Path B (relaxed 2026-05-16): marginal-confidence
+        # graphrag. The retrieval passed the admission floor but is below
+        # the high-confidence ceiling, so the chunks may not directly
+        # answer the question. Per the supplementation policy (system
+        # rules 6 + 7), instead of refusing the model should split the
+        # reply: cite whatever the chunks actually mention, then add a
+        # "补充背景" part with general knowledge — unless the topic is
+        # so obscure that general knowledge wouldn't help.
         if low_confidence:
             system += (
-                "\n\nIMPORTANT — context confidence is LOW. The retrieved "
-                "chunks may not directly address the user's question. If, "
-                "after reading them, you cannot point to a specific passage "
-                "that answers what the user actually asked, say so clearly "
-                "in one or two sentences (in their language) and suggest a "
-                "more specific question. Do NOT pad a non-answer with "
-                "background, do NOT quote a chunk that's only loosely "
-                "related. A short honest 'this isn't covered directly in "
-                "what I found' is the correct answer in that case."
+                "\n\nNOTE — retrieval confidence is LOW. The retrieved "
+                "chunks may only loosely touch the user's question. "
+                "Don't fabricate course-specific claims from tangential "
+                "context (no inventing citations or extrapolating from "
+                "what isn't there). DO still split the reply into the "
+                "two-part structure: name the partial / adjacent content "
+                "the chunks DO have (with [Source: ...] citations), "
+                "then under '补充背景 / Background' answer the "
+                "user's real question from general knowledge. This is "
+                "more helpful than a refusal."
             )
 
         # 2026-05-13: Qwen-RAFT empirically weights user-message instructions
