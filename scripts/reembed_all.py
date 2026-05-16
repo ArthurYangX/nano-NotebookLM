@@ -73,24 +73,53 @@ def main() -> None:
 
     embed_fn = kb.embed_fn
     texts = [c.text for c in chunks]
-    # Re-introduce per-batch logging — bge-base on MPS in one big encode()
-    # call entered uninterruptible I/O wait at ~70% through, never
-    # finishing. all-MiniLM-L6-v2 on CPU is small enough to finish a 10K
-    # job in 2-3 min and we get incremental progress visibility.
-    batch_size = 256
+    # R5 step C (2026-05-16): the default _build_api_embed_fn in
+    # kb/store.py is fully serial — one HTTP request after another, no
+    # concurrency. With text-embedding-3-large on the codex proxy each
+    # 64-input request takes 60-120s, so 10k chunks at inner batch=64
+    # serial = 3.3 hours. We bypass it here and drive the OpenAI client
+    # directly with a ThreadPoolExecutor + larger inner batches. The
+    # main code path is untouched (ingest still goes through embed_fn
+    # the normal way; only this one-shot rebuild uses the parallel path).
+    import openai
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    client = openai.OpenAI(api_key=config.OPENAI_API_KEY, base_url=config.OPENAI_BASE_URL)
+    batch_size = 256          # OpenAI limit: 2048 inputs per call. 256 keeps
+                              # per-call body small enough that codex proxy
+                              # rarely OOMs / times out.
+    concurrency = 8           # 8 parallel inflight requests. codex proxy
+                              # has been tested up to 8 without 429s.
     n_batches = (len(texts) + batch_size - 1) // batch_size
-    log(f"Embedding {len(texts)} chunks in {n_batches} batches of {batch_size}…")
-    all_embs: list[np.ndarray] = []
+    log(f"Embedding {len(texts)} chunks in {n_batches} batches of {batch_size} "
+        f"(concurrency={concurrency})…")
+
+    def _embed_one(idx_and_batch):
+        idx, batch = idx_and_batch
+        t_start = time.time()
+        resp = client.embeddings.create(model=config.EMBEDDING_MODEL, input=batch)
+        arr = np.asarray([d.embedding for d in resp.data], dtype=np.float32)
+        # L2-normalize so FAISS inner-product == cosine
+        norms = np.linalg.norm(arr, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        return idx, arr / norms, time.time() - t_start
+
+    batches = [(i // batch_size, texts[i : i + batch_size])
+               for i in range(0, len(texts), batch_size)]
+    results: dict[int, np.ndarray] = {}
     t0 = time.time()
-    for i in range(0, len(texts), batch_size):
-        batch = texts[i : i + batch_size]
-        emb = embed_fn(batch)
-        all_embs.append(np.asarray(emb, dtype=np.float32))
-        idx = i // batch_size + 1
-        elapsed = time.time() - t0
-        rate = (idx * batch_size) / max(elapsed, 0.001)
-        log(f"  · batch {idx}/{n_batches} · {elapsed:.1f}s · {rate:.0f} chunks/s")
-    embeddings = np.vstack(all_embs)
+    completed = 0
+    with ThreadPoolExecutor(max_workers=concurrency) as ex:
+        for idx, arr, dur in (
+            f.result() for f in as_completed(ex.submit(_embed_one, b) for b in batches)
+        ):
+            results[idx] = arr
+            completed += 1
+            chunks_done = completed * batch_size
+            elapsed = time.time() - t0
+            log(f"  · batch {idx+1}/{n_batches} ({dur:.1f}s req) · "
+                f"elapsed {elapsed:.1f}s · {chunks_done/elapsed:.0f} chunks/s")
+    embeddings = np.vstack([results[i] for i in range(n_batches)])
     log(f"Embeddings ready: {embeddings.shape} in {time.time()-t0:.1f}s")
 
     vector = VectorIndex(embed_fn)
