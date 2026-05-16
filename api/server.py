@@ -1370,12 +1370,18 @@ async def chat(req: ChatRequest):
     data = dict(result.data)
     if "answer" in data:
         data["answer"] = format_response(str(data["answer"]))
+    # fix-all v1 #M6 (2026-05-16 review-swarm): record rewritten_query +
+    # history_len so post-hoc analysis can correlate retrieval quality
+    # with multi-turn rewrites. history payload itself is NOT recorded
+    # (contains user-controllable content; would inflate session log size).
     session_log.append(req.course_id, "question", {
         "question": req.question,
         "answer": data.get("answer", ""),
         "path": data.get("path"),
         "original_query": data.get("original_query"),
         "translated_query": data.get("translated_query"),
+        "rewritten_query": data.get("rewritten_query"),
+        "history_len": len(req.history) if req.history else 0,
     })
     return data
 
@@ -3473,6 +3479,15 @@ async def status_endpoint():
         "qwen_raft_model_name": config.QWEN_RAFT_MODEL_NAME if qwen_configured else None,
         "qwen_raft_url_host": qwen_url_host,
         "qwen_base_model_name": config.QWEN_BASE_MODEL_NAME if qwen_base_configured else None,
+        # fix-all v1 #M5 (2026-05-16 review-swarm): expose which backend
+        # actually serves the rewrite_history task_type. Falls through
+        # the same router resolution path as production (TASK_ROUTES →
+        # DEFAULT_BACKEND → first-available fallback) so operators see
+        # the *effective* binding, not the static config entry.
+        "rewrite_history_backend": (
+            router.get_backend("rewrite_history").name
+            if router.backends else None
+        ),
         "version": app.version,
     }
 

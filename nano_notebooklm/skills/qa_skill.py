@@ -56,15 +56,90 @@ TRANSLATION_TIMEOUT_SECONDS = 5.0
 # 2026-05-16: multi-turn history rewrite — disambiguate follow-up questions
 # ("公式是什么？" after "什么是贝叶斯？") into self-contained retrieval
 # queries before hitting BM25/vector/graphrag. Same shape as translation:
-# bound by wall time so a stalled provider can't double chat latency. 8s
-# (≈ generous translation budget) gives small models headroom; on success
-# the rewrite is typically <1s.
-HISTORY_REWRITE_TIMEOUT_SECONDS = 8.0
+# bound by wall time so a stalled provider can't double chat latency.
+# fix-all v1 #M4 (2026-05-16): trimmed 8s → 5s after codex GPT typically
+# completes the rewrite in <2s; 5s catches a stalled provider quickly
+# while leaving headroom matching TRANSLATION_TIMEOUT_SECONDS.
+HISTORY_REWRITE_TIMEOUT_SECONDS = 5.0
 # Cap the per-turn content length we feed into the rewrite prompt — full
 # answers can run thousands of chars, but for disambiguation the lead
 # sentence is enough. Keeps the rewrite prompt under ~1.5k tokens even
 # with 6 round-trips of history.
 _HISTORY_REWRITE_TURN_CHAR_CAP = 400
+
+# fix-all v1 #H3 (2026-05-16 review-swarm): bound the fan-out of the
+# rewrite LLM call so a burst of multi-turn /api/chat requests can't
+# saturate codex. Mirrors `_GRAPHRAG_FANOUT_SEM = Semaphore(4)` and the
+# notes/tectonic semaphores. Each multi-turn chat acquires once before
+# the router.complete call. Env override mirrors GRAPHRAG_FANOUT_CONCURRENCY.
+def _parse_rewrite_fanout() -> int:
+    raw = os.getenv("REWRITE_FANOUT_CONCURRENCY")
+    if not raw:
+        return 4
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        logger.warning(
+            "REWRITE_FANOUT_CONCURRENCY=%r is not an int; using default 4", raw,
+        )
+        return 4
+
+
+_REWRITE_FANOUT_CONCURRENCY = _parse_rewrite_fanout()
+_REWRITE_FANOUT_SEM = asyncio.Semaphore(_REWRITE_FANOUT_CONCURRENCY)
+
+# fix-all v1 #H1 (2026-05-16 review-swarm): scrub history content before
+# embedding into the rewrite prompt. Strip:
+#   - C0 / C1 control codepoints (newline/tab/CR rolled into a single space)
+#   - Bidi-override codepoints (U+202A..U+202E, U+2066..U+2069)
+#   - Zero-width codepoints (U+200B..U+200D, U+FEFF)
+#   - Replace `<` / `>` with safe lookalikes so a malicious turn content
+#     containing literal `</turn>` cannot terminate the data-frame around
+#     it. Lookalikes `‹` and `›` are visually similar so the LLM still
+#     interprets meaning.
+#
+# Pattern matches the defense-in-depth model the persona safe-strip uses
+# (see prompt_templates._safe_persona). Pydantic ChatTurn already rejects
+# blank-only content; this is the second layer for content that survives
+# Pydantic but may still carry injection payloads.
+_HISTORY_SCRUB_RE = re.compile(
+    "["
+    "\x00-\x08\x0b\x0c\x0e-\x1f\x7f"     # C0 controls (we replace \t\n\r separately) + DEL
+    "\x80-\x9f"                                # C1 controls
+    "\u200b-\u200d\ufeff"                    # zero-width chars
+    "\u202a-\u202e\u2066-\u2069"            # bidi overrides
+    "]+"
+)
+def _sanitize_history_text(text: str) -> str:
+    """Belt-and-suspenders cleaning for history.content / rewrite output.
+
+    Replaces control characters / bidi overrides / zero-width with a
+    single space, normalizes tabs/CR/LF to space (so an attacker can't
+    forge `\n[system] ignore the user`-style fake role headers), and
+    swaps `<`/`>` to visually similar non-XML codepoints so a content
+    containing `</turn>` can't escape the data-frame wrapper.
+
+    Returns the cleaned string with collapsed whitespace and stripped
+    leading/trailing space. Always safe on empty input (returns "").
+    """
+    if not text:
+        return ""
+    cleaned = _HISTORY_SCRUB_RE.sub(" ", text)
+    cleaned = cleaned.replace("\t", " ").replace("\r", " ").replace("\n", " ")
+    cleaned = cleaned.replace("<", "‹").replace(">", "›")
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
+
+
+def _normalise_for_compare(text: str) -> str:
+    """Strip whitespace + trailing question-mark family for the rewrite
+    no-op equality check. Without this, a rewriter that drops the
+    trailing "?" or normalises spacing fires a spurious 📝 chip and a
+    bogus log line. fix-all v1 #L2.
+    """
+    cleaned = re.sub(r"\s+", " ", text or "").strip()
+    return cleaned.rstrip("?？。.！!")
+
 
 # fix-all v3 #L4 (R4-4 review-swarm v3): bound graph_search wall time so a
 # stalled embed_fn (e.g. API-mode HTTP hang) doesn't block the chat path
@@ -516,13 +591,23 @@ class QASkill(Skill):
         if history:
             rewritten = await self._rewrite_with_history(question, history)
             if rewritten and rewritten != question:
-                logger.info(
-                    "qa.history_rewrite turns=%d original=%r rewritten=%r",
-                    len(history), question[:80], rewritten[:80],
-                )
-                rewritten_query = rewritten
-                # Mutate a shallow copy so caller's dict is untouched.
-                params = {**params, "question": rewritten_query}
+                # fix-all v1 #L2 (2026-05-16): collapse whitespace +
+                # strip trailing punctuation before equality check so a
+                # cosmetic "公式是什么 " (trailing space) doesn't fire
+                # a spurious chip. The rewriter's output is stable
+                # enough that this catches only true no-ops.
+                if _normalise_for_compare(rewritten) != _normalise_for_compare(question):
+                    logger.info(
+                        "qa.history_rewrite turns=%d", len(history),
+                    )
+                    rewritten_query = rewritten
+                    # fix-all v1 #M2 (2026-05-16 review-swarm): set a
+                    # SEPARATE `retrieval_query` instead of mutating
+                    # `question`. Retrieval paths use retrieval_query;
+                    # `_answer_*` paths keep `question` (the user's
+                    # literal text) so a bad rewrite cannot drift the
+                    # final answer prompt.
+                    params = {**params, "retrieval_query": rewritten_query}
 
         result = await self._execute_core(params)
 
@@ -551,6 +636,10 @@ class QASkill(Skill):
         truncate per-turn content to `_HISTORY_REWRITE_TURN_CHAR_CAP` so
         a hostile prior assistant turn can't bloat the prompt.
         """
+        # fix-all v1 #H1 (2026-05-16 review-swarm): scrub each turn's
+        # content via `_sanitize_history_text` so a malicious assistant /
+        # user turn containing control chars, bidi overrides, zero-width
+        # codepoints, or literal `</turn>` cannot terminate the data-frame.
         cleaned: list[tuple[str, str]] = []
         for turn in history:
             if not isinstance(turn, dict):
@@ -561,7 +650,9 @@ class QASkill(Skill):
                 continue
             if not isinstance(content, str) or not content.strip():
                 continue
-            text = content.strip()
+            text = _sanitize_history_text(content)
+            if not text:
+                continue
             if len(text) > _HISTORY_REWRITE_TURN_CHAR_CAP:
                 text = text[:_HISTORY_REWRITE_TURN_CHAR_CAP] + "…"
             cleaned.append((role, text))
@@ -569,53 +660,71 @@ class QASkill(Skill):
         if not cleaned:
             return None
 
+        # fix-all v1 #H1: wrap each turn in `<turn role="...">...</turn>`
+        # data-frame matching the system prompt's instruction to treat
+        # everything inside <turn> as data, not as instructions. Combined
+        # with the `<` / `>` lookalike substitution in the sanitizer,
+        # content cannot inject a fake role marker.
         history_block = "\n".join(
-            f"[{role}] {text}" for role, text in cleaned
+            f'<turn role="{role}">{text}</turn>' for role, text in cleaned
         )
+        # Also sanitize the latest question — it's the LLM's
+        # "Latest user message:" target and shares the same trust surface.
+        sanitized_question = _sanitize_history_text(question) or question
         prompt = prompts.REWRITE_HISTORY_PROMPT.format(
-            history=history_block, question=question,
+            history=history_block, question=sanitized_question,
         )
 
+        # fix-all v1 #H3: bound fan-out so a burst of multi-turn chats
+        # can't saturate codex. The semaphore is acquired around the
+        # router.complete call so the wait_for timeout still applies.
         try:
-            resp = await asyncio.wait_for(
-                self.router.complete(
-                    prompt,
-                    task_type="rewrite_history",
-                    system=prompts.REWRITE_HISTORY_SYSTEM,
-                    temperature=0.0,
-                    max_tokens=160,
-                    # Single attempt: outer wait_for is the budget; the
-                    # router's default 3-retry exponential backoff would
-                    # silently exceed HISTORY_REWRITE_TIMEOUT_SECONDS.
-                    max_retries=1,
-                ),
-                timeout=HISTORY_REWRITE_TIMEOUT_SECONDS,
-            )
+            async with _REWRITE_FANOUT_SEM:
+                resp = await asyncio.wait_for(
+                    self.router.complete(
+                        prompt,
+                        task_type="rewrite_history",
+                        system=prompts.REWRITE_HISTORY_SYSTEM,
+                        temperature=0.0,
+                        max_tokens=160,
+                        # Single attempt: outer wait_for is the budget; the
+                        # router's default 3-retry exponential backoff would
+                        # silently exceed HISTORY_REWRITE_TIMEOUT_SECONDS.
+                        max_retries=1,
+                    ),
+                    timeout=HISTORY_REWRITE_TIMEOUT_SECONDS,
+                )
         except asyncio.TimeoutError:
             logger.warning(
                 "history rewrite timed out after %ss; using original question",
                 HISTORY_REWRITE_TIMEOUT_SECONDS,
             )
             return None
-        except Exception as exc:  # noqa: BLE001 — graceful fallback
+        except Exception as exc:  # noqa: BLE001 — graceful fallback.
+            # In Python 3.8+ asyncio.CancelledError inherits BaseException,
+            # so this except does NOT swallow user-initiated cancellation.
             logger.warning(
                 "history rewrite LLM call failed (%s); using original question",
                 type(exc).__name__,
             )
             return None
 
+        # fix-all v1 #M3 (2026-05-16 review-swarm): drop the legacy
+        # "Rewritten:" / "改写:" / etc. label-strip. The prompt explicitly
+        # says "no prefix, no explanation"; trusting the rewriter is safer
+        # than stripping arbitrary leading labels, because a jailbreak that
+        # emits `Rewritten: <attacker payload>` would have had its prefix
+        # dutifully removed by the old logic, laundering the attack into
+        # a clean retrieval query. With temperature=0.0 codex GPT-5.5
+        # reliably obeys the no-prefix instruction.
         rewritten = (resp.content or "").strip().strip(_QUOTE_STRIP).strip()
         if not rewritten:
             return None
-        # Some small models like to prefix with "Rewritten:" or similar —
-        # strip a handful of common labels. Match is conservative: a
-        # case-insensitive bare label followed by `:` or `：` at the
-        # start, single pass.
-        for label in ("rewritten query", "rewritten", "query", "改写", "重写"):
-            lower = rewritten.lower()
-            if lower.startswith(label + ":") or lower.startswith(label + "："):
-                rewritten = rewritten[len(label) + 1:].strip()
-                break
+        # fix-all v1 #H1: belt-and-suspenders — sanitize the rewriter's
+        # OUTPUT too. If the rewriter was jailbroken into echoing an
+        # attacker's control-char / bidi payload, scrubbing here keeps
+        # it out of the downstream retrieval + answer LLM prompt.
+        rewritten = _sanitize_history_text(rewritten) or rewritten
         # Defensive length cap mirrors ChatRequest.question's max_length
         # so a runaway rewrite can't smuggle a 100KB string through the
         # rest of the pipeline.
@@ -625,6 +734,12 @@ class QASkill(Skill):
 
     async def _execute_core(self, params: dict) -> SkillResult:
         question = params.get("question", "")
+        # fix-all v1 #M2 (2026-05-16 review-swarm): retrieval_query is
+        # the history-rewritten search string when present; question is
+        # always the user's literal text. ALL retrieval call sites use
+        # retrieval_query; ALL `_answer_*` LLM prompts use `question`
+        # so a bad rewrite cannot drift the user-visible answer.
+        retrieval_query = params.get("retrieval_query") or question
         course_filter = params.get("course_filter")
         top_k = params.get("top_k", 5)
         checked_files = params.get("checked_files")
@@ -651,7 +766,11 @@ class QASkill(Skill):
         if not question:
             return SkillResult(success=False, error="No question provided")
 
-        decision = router_intent.classify_input(question)
+        # Route on the retrieval query — for a short follow-up like "为什么?"
+        # the rewriter expands it into a substantive RAG-shaped question,
+        # which is the intended UX for a study tool. If no rewrite happened,
+        # retrieval_query == question and the routing is unchanged.
+        decision = router_intent.classify_input(retrieval_query)
 
         # ── Path B (general): short / greeting / pure punctuation / identity / meta_course / bare_q ──
         if decision.path == "general":
@@ -696,10 +815,10 @@ class QASkill(Skill):
         # → general chain.
         if not checked_files and _graphrag_enabled():
             if course_filter:
-                graphrag_results = await self._maybe_graphrag(question, course_filter)
+                graphrag_results = await self._maybe_graphrag(retrieval_query, course_filter)
                 graphrag_scope = course_filter
             else:
-                graphrag_results = await self._maybe_graphrag_all_courses(question)
+                graphrag_results = await self._maybe_graphrag_all_courses(retrieval_query)
                 graphrag_scope = "all-courses"
             # 2026-05-13: active-file soft boost + injection.
             # Phase 1 — boost already-retrieved chunks from the active file.
@@ -734,7 +853,7 @@ class QASkill(Skill):
                     # ad-hoc result list and merge.
                     try:
                         fallback = self.kb.search(
-                            question, top_k=10, course_id=course_filter,
+                            retrieval_query, top_k=10, course_id=course_filter,
                         )
                         # filter to the active file
                         from_file = [r for r in fallback if r.source_file == active_source_file]
@@ -796,9 +915,9 @@ class QASkill(Skill):
                 )
 
         # ── Path A (rag): retrieve, gate, fall back if low-quality ──
-        raw = self.kb.search(question, top_k=top_k, course_id=course_filter)
+        raw = self.kb.search(retrieval_query, top_k=top_k, course_id=course_filter)
         results = self._apply_checked_files(raw, checked_files,
-                                            question, top_k, course_filter)
+                                            retrieval_query, top_k, course_filter)
 
         # If the user explicitly narrowed via checked_files and the filter
         # caused the failure, return the #R1 boilerplate so they see their
@@ -869,7 +988,7 @@ class QASkill(Skill):
 
         # ── Translation retry (#2): zh query on en course (or vice versa) ──
         translated = await self._maybe_translate_retry(
-            question, course_filter, top_k, checked_files,
+            retrieval_query, course_filter, top_k, checked_files,
         )
         if translated is not None:
             translated_query, translated_results = translated
@@ -893,7 +1012,7 @@ class QASkill(Skill):
         # already in All-Courses mode (course_filter is None) — there is no
         # "current course" to fall back from.
         cross = self._maybe_cross_course_fallback(
-            question, course_filter, top_k, checked_files,
+            retrieval_query, course_filter, top_k, checked_files,
         )
         if cross is not None:
             cross_results, origin = cross
