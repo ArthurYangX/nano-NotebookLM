@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="zh"><head>
+<meta charset="utf-8">
+<title>PyMuPDF vs MinerU · 对比页索引</title>
+<style>
+body{font:15px/1.55 -apple-system,Segoe UI,Helvetica,"PingFang SC";max-width:780px;margin:40px auto;padding:0 20px;color:#222}
+h1{margin:0 0 4px;font-size:22px}
+.sub{color:#666;margin:0 0 24px;font-size:13px}
+ul{list-style:none;padding:0}
+li{margin:8px 0;padding:14px 18px;border:1px solid #d9dee4;border-radius:8px;background:#fff;display:flex;justify-content:space-between;align-items:center}
+li:hover{border-color:#27ae60;box-shadow:0 1px 4px rgba(0,0,0,0.05)}
+li a{font-weight:600;color:#2c5aa0;text-decoration:none;font-size:16px}
+li a:hover{color:#27ae60}
+li small{color:#666;font-size:12px}
+.note{background:#fffbe6;border:1px solid #ffe58f;padding:10px 14px;border-radius:6px;margin-top:24px;font-size:13px;color:#5a4f1a}
+code{background:#f6f8fa;padding:1px 5px;border-radius:3px;font-size:12.5px}
+</style>
+</head><body>
+<h1>PyMuPDF vs MinerU · 提取效果对比</h1>
+<p class="sub">同一份 PDF 同样页范围 · 左：现行抽取（RAG 实际吃到的文本）· 右：MinerU pipeline 抽取</p>
+<ul>  <li><a href="output/ch3_hmm/compare_visual.html">ch3_hmm</a><small>1,970 chars PyMuPDF · 6,047 chars MinerU</small></li></ul>
+<div class="note">想给其它 PDF 生成对比页：先把样本 PDF 拷到 <code>samples/</code>，跑 <code>python experiments/mineru_validation/run_pymupdf_baseline.py</code> 和 <code>python -m mineru -p &lt;pdf&gt; -o output/&lt;name&gt;/mineru -b pipeline -l ch</code>，最后 <code>python experiments/mineru_validation/make_compare_visual.py</code>，本页会自动更新。</div>
+</body></html>

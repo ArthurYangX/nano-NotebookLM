@@ -1,0 +1,1644 @@
+[
+    [
+        {
+            "type": "title",
+            "content": {
+                "title_content": [
+                    {
+                        "type": "text",
+                        "content": "自然语言处理第二章 隐马尔科夫模型"
+                    }
+                ],
+                "level": 2
+            },
+            "bbox": [
+                238,
+                292,
+                758,
+                551
+            ]
+        }
+    ],
+    [
+        {
+            "type": "title",
+            "content": {
+                "title_content": [
+                    {
+                        "type": "text",
+                        "content": "马尔科夫模型 (Markov Model)"
+                    }
+                ],
+                "level": 2
+            },
+            "bbox": [
+                54,
+                229,
+                447,
+                283
+            ]
+        },
+        {
+            "type": "paragraph",
+            "content": {
+                "paragraph_content": [
+                    {
+                        "type": "text",
+                        "content": "一最早由AndreiA.Markov，（切比雪夫Chebyshev的一个学生）于1913年提出，它的最原始目的是为了语言上的应用"
+                    }
+                ]
+            },
+            "bbox": [
+                89,
+                290,
+                940,
+                383
+            ]
+        },
+        {
+            "type": "paragraph",
+            "content": {
+                "paragraph_content": [
+                    {
+                        "type": "text",
+                        "content": "● 隐马尔科夫模型(Hidden Markov Model，HMM)"
+                    }
+                ]
+            },
+            "bbox": [
+                54,
+                388,
+                633,
+                442
+            ]
+        },
+        {
+            "type": "paragraph",
+            "content": {
+                "paragraph_content": [
+                    {
+                        "type": "text",
+                        "content": "－其数学思想是由Baum等人於1966~1970提出"
+                    }
+                ]
+            },
+            "bbox": [
+                88,
+                450,
+                577,
+                496
+            ]
+        },
+        {
+            "type": "paragraph",
+            "content": {
+                "paragraph_content": [
+                    {
+                        "type": "text",
+                        "content": "一从某种意义上讲，HMM本身是一个马尔科夫过程的概率函数"
+                    }
+                ]
+            },
+            "bbox": [
+                88,
+                501,
+                764,
+                550
+            ]
+        },
+        {
+            "type": "paragraph",
+            "content": {
+                "paragraph_content": [
+                    {
+                        "type": "text",
+                        "content": "在20世纪70年代被CMU的Baker以及IBM的Jelinek等人应用在了语音处理上"
+                    }
+                ]
+            },
+            "bbox": [
+                88,
+                555,
+                877,
+                603
+            ]
+        },
+        {
+            "type": "paragraph",
+            "content": {
+                "paragraph_content": [
+                    {
+                        "type": "text",
+                        "content": "之后被广泛应用在了汉语自动分词、词性标注、统计机器翻译等很多方面"
+                    }
+                ]
+            },
+            "bbox": [
+                88,
+                609,
+                920,
+                659
+            ]
+        },
+        {
+            "type": "page_header",
+            "content": {
+                "page_header_content": [
+                    {
+                        "type": "text",
+                        "content": "3.0 「 引信"
+                    }
+                ]
+            },
+            "bbox": [
+                28,
+                64,
+                156,
+                112
+            ]
+        },
+        {
+            "type": "page_header",
+            "content": {
+                "page_header_content": []
+            },
+            "bbox": [
+                936,
+                51,
+                996,
+                129
+            ]
+        }
+    ],
+    [
+        {
+            "type": "title",
+            "content": {
+                "title_content": [
+                    {
+                        "type": "text",
+                        "content": "目录 Contents"
+                    }
+                ],
+                "level": 2
+            },
+            "bbox": [
+                44,
+                187,
+                181,
+                305
+            ]
+        },
+        {
+            "type": "index",
+            "content": {
+                "list_type": "text_list",
+                "list_items": [
+                    {
+                        "item_type": "text",
+                        "item_content": [
+                            {
+                                "type": "text",
+                                "content": "3.1 马尔科夫模型"
+                            }
+                        ]
+                    },
+                    {
+                        "item_type": "text",
+                        "item_content": [
+                            {
+                                "type": "text",
+                                "content": "3.2 隐马尔科夫模型"
+                            }
+                        ]
+                    },
+                    {
+                        "item_type": "text",
+                        "item_content": [
+                            {
+                                "type": "text",
+                                "content": "3.3 HMM的三个基本问题"
+                            }
+                        ]
+                    }
+                ]
+            },
+            "bbox": [
+                67,
+                412,
+                500,
+                687
+            ]
+        },
+        {
+            "type": "chart",
+            "content": {
+                "image_source": {
+                    "path": "images/2258c6f58b08e0e52e53efbc4f88c5c5957d21e2c6da5c85c7bd65759c3bf575.jpg"
+                },
+                "content": "",
+                "chart_caption": [],
+                "chart_footnote": []
+            },
+            "bbox": [
+                541,
+                0,
+                1000,
+                1000
+            ]
+        }
+    ],
+    [
+        {
+            "type": "paragraph",
+            "content": {
+                "paragraph_content": [
+                    {
+                        "type": "text",
+                        "content": "• Markov, 1913"
+                    }
+                ]
+            },
+            "bbox": [
+                165,
+                242,
+                334,
+                279
+            ]
+        },
+        {
+            "type": "paragraph",
+            "content": {
+                "paragraph_content": [
+                    {
+                        "type": "text",
+                        "content": "• 随机过程"
+                    }
+                ]
+            },
+            "bbox": [
+                166,
+                292,
+                284,
+                333
+            ]
+        },
+        {
+            "type": "paragraph",
+            "content": {
+                "paragraph_content": [
+                    {
+                        "type": "text",
+                        "content": "又称“随机函数”，是随时间而随机变化的过程"
+                    }
+                ]
+            },
+            "bbox": [
+                201,
+                346,
+                670,
+                387
+            ]
+        },
+        {
+            "type": "paragraph",
+            "content": {
+                "paragraph_content": [
+                    {
+                        "type": "text",
+                        "content": "• 马尔科夫模型描述了一类重要的随机过程"
+                    }
+                ]
+            },
+            "bbox": [
+                166,
+                400,
+                576,
+                442
+            ]
+        },
+        {
+            "type": "paragraph",
+            "content": {
+                "paragraph_content": [
+                    {
+                        "type": "text",
+                        "content": "设系统有N个状态 "
+                    },
+                    {
+                        "type": "equation_inline",
+                        "content": "{ \\cal S } = \\{ s _ { 1 } , s _ { 2 } , \\cdots , s _ { N } \\}"
+                    }
+                ]
+            },
+            "bbox": [
+                196,
+                481,
+                522,
+                529
+            ]
+        },
+        {
+            "type": "paragraph",
+            "content": {
+                "paragraph_content": [
+                    {
+                        "type": "text",
+                        "content": "随着时间的推移，系统将从某一状态转移到另一状态。"
+                    }
+                ]
+            },
+            "bbox": [
+                195,
+                542,
+                705,
+                587
+            ]
+        },
+        {
+            "type": "paragraph",
+            "content": {
+                "paragraph_content": [
+                    {
+                        "type": "equation_inline",
+                        "content": "\\mathcal { Q } = \\{ q _ { 1 } , q _ { 2 } , \\cdots , q _ { T } \\}"
+                    },
+                    {
+                        "type": "text",
+                        "content": "为一随机变量序列， "
+                    },
+                    {
+                        "type": "equation_inline",
+                        "content": "\\textstyle q _ { t } \\in S , t = 1 , 2 , \\cdots , T"
+                    }
+                ]
+            },
+            "bbox": [
+                196,
+                603,
+                721,
+                650
+            ]
+        },
+        {
+            "type": "paragraph",
+            "content": {
+                "paragraph_content": [
+                    {
+                        "type": "text",
+                        "content": "则系统在时间t处于状态 "
+                    },
+                    {
+                        "type": "equation_inline",
+                        "content": "\\dot { s } _ { j }"
+                    },
+                    {
+                        "type": "text",
+                        "content": "的概率取决于其在时间1,2,…，t-1的状态"
+                    }
+                ]
+            },
+            "bbox": [
+                195,
+                661,
+                817,
+                711
+            ]
+        },
+        {
+            "type": "equation_interline",
+            "content": {
+                "math_content": "P ( q _ { t } = s _ { j } \\mid q _ { t - 1 } = s _ { i } , q _ { t - 2 } = s _ { k } , \\cdots )",
+                "math_type": "latex",
+                "image_source": {
+                    "path": "images/3faa7cd84fab300ddd0ff8764b741f3049c073f9ab76c13efcf4bfa85bdbb242.jpg"
+                }
+            },
+            "bbox": [
+                214,
+                759,
+                580,
+                822
+            ]
+        },
+        {
+            "type": "page_header",
+            "content": {
+                "page_header_content": [
+                    {
+                        "type": "text",
+                        "content": "3.1 马尔科夫模型"
+                    }
+                ]
+            },
+            "bbox": [
+                28,
+                62,
+                256,
+                112
+            ]
+        },
+        {
+            "type": "page_header",
+            "content": {
+                "page_header_content": []
+            },
+            "bbox": [
+                936,
+                51,
+                996,
+                131
+            ]
+        }
+    ],
+    [
+        {
+            "type": "title",
+            "content": {
+                "title_content": [
+                    {
+                        "type": "text",
+                        "content": "• 一阶马尔可夫过程"
+                    }
+                ],
+                "level": 2
+            },
+            "bbox": [
+                165,
+                240,
+                400,
+                287
+            ]
+        },
+        {
+            "type": "paragraph",
+            "content": {
+                "paragraph_content": [
+                    {
+                        "type": "text",
+                        "content": "如果系统在t时间的状态只与其在时间t-1的状态相关，则该随机过程称为一阶马尔可夫过程"
+                    }
+                ]
+            },
+            "bbox": [
+                202,
+                301,
+                825,
+                387
+            ]
+        },
+        {
+            "type": "equation_interline",
+            "content": {
+                "math_content": "P ( q _ { t } = s _ { j } \\mid q _ { t - 1 } = s _ { i } , q _ { t - 2 } = s _ { k } , \\cdots ) \\approx P ( q _ { t } = s _ { j } \\mid q _ { t - 1 } = s _ { i } )",
+                "math_type": "latex",
+                "image_source": {
+                    "path": "images/83e7a829baef6110865c59fedf987d0be0deef848200d928faf80710bd708350.jpg"
+                }
+            },
+            "bbox": [
+                227,
+                401,
+                781,
+                457
+            ]
+        },
+        {
+            "type": "paragraph",
+            "content": {
+                "paragraph_content": [
+                    {
+                        "type": "text",
+                        "content": "• 马尔可夫模型"
+                    }
+                ]
+            },
+            "bbox": [
+                166,
+                466,
+                347,
+                512
+            ]
+        },
+        {
+            "type": "paragraph",
+            "content": {
+                "paragraph_content": [
+                    {
+                        "type": "text",
+                        "content": "独立于时间t的随机过程"
+                    }
+                ]
+            },
+            "bbox": [
+                202,
+                527,
+                446,
+                568
+            ]
+        },
+        {
+            "type": "equation_interline",
+            "content": {
+                "math_content": "P ( q _ { t } = s _ { j } \\mid q _ { t - 1 } = s _ { i } ) = a _ { i j } , ( 1 \\leq i , j \\leq N )",
+                "math_type": "latex",
+                "image_source": {
+                    "path": "images/3faff5abf7736b3ffe05b707e8a8f9ed957e5879c26aba710066d9a7fffc7ff0.jpg"
+                }
+            },
+            "bbox": [
+                213,
+                590,
+                571,
+                642
+            ]
+        },
+        {
+            "type": "paragraph",
+            "content": {
+                "paragraph_content": [
+                    {
+                        "type": "equation_inline",
+                        "content": "a _ { i j }"
+                    },
+                    {
+                        "type": "text",
+                        "content": "称为状态转移概率"
+                    }
+                ]
+            },
+            "bbox": [
+                211,
+                670,
+                440,
+                731
+            ]
+        },
+        {
+            "type": "paragraph",
+            "content": {
+                "paragraph_content": [
+                    {
+                        "type": "equation_inline",
+                        "content": "a _ { i j }"
+                    },
+                    {
+                        "type": "text",
+                        "content": "须满足以下条件"
+                    }
+                ]
+            },
+            "bbox": [
+                610,
+                668,
+                781,
+                720
+            ]
+        },
+        {
+            "type": "equation_interline",
+            "content": {
+                "math_content": "a _ { i j } \\geq 0",
+                "math_type": "latex",
+                "image_source": {
+                    "path": "images/a318b900654cd7f4da84c78543f3e4fc8eeb90eb63fedc42cbae9a207f890a1e.jpg"
+                }
+            },
+            "bbox": [
+                638,
+                735,
+                696,
+                781
+            ]
+        },
+        {
+            "type": "equation_interline",
+            "content": {
+                "math_content": "\\sum _ { j = 1 } ^ { N } a _ { i j } = 1",
+                "math_type": "latex",
+                "image_source": {
+                    "path": "images/1858806d31d5f9714ce174ec509f552dea2723ecf292459adc1b0aa6c5268078.jpg"
+                }
+            },
+            "bbox": [
+                642,
+                794,
+                722,
+                896
+            ]
+        },
+        {
+            "type": "page_header",
+            "content": {
+                "page_header_content": [
+                    {
+                        "type": "text",
+                        "content": "3.1 马尔科夫模型"
+                    }
+                ]
+            },
+            "bbox": [
+                29,
+                62,
+                256,
+                112
+            ]
+        },
+        {
+            "type": "page_header",
+            "content": {
+                "page_header_content": []
+            },
+            "bbox": [
+                936,
+                51,
+                996,
+                131
+            ]
+        }
+    ],
+    [
+        {
+            "type": "title",
+            "content": {
+                "title_content": [
+                    {
+                        "type": "text",
+                        "content": "天气变化的例子"
+                    }
+                ],
+                "level": 2
+            },
+            "bbox": [
+                339,
+                205,
+                661,
+                287
+            ]
+        },
+        {
+            "type": "image",
+            "content": {
+                "image_source": {
+                    "path": "images/9668ef07acd5b3cf70f2f778384099d0b145aaeece33cc7cd216ade6118d0175.jpg"
+                },
+                "image_caption": [],
+                "image_footnote": []
+            },
+            "bbox": [
+                378,
+                309,
+                620,
+                477
+            ]
+        },
+        {
+            "type": "paragraph",
+            "content": {
+                "paragraph_content": [
+                    {
+                        "type": "text",
+                        "content": "● 状态：晴朗，多云，下雨"
+                    }
+                ]
+            },
+            "bbox": [
+                165,
+                472,
+                407,
+                511
+            ]
+        },
+        {
+            "type": "paragraph",
+            "content": {
+                "paragraph_content": [
+                    {
+                        "type": "text",
+                        "content": "• 状态转移概率矩阵"
+                    }
+                ]
+            },
+            "bbox": [
+                165,
+                512,
+                351,
+                550
+            ]
+        },
+        {
+            "type": "table",
+            "content": {
+                "image_source": {
+                    "path": "images/2ea277a8b1009e121302fc85a79f81eba08fa5648ec445f1c9b4495255da1af4.jpg"
+                },
+                "table_caption": [],
+                "table_footnote": [],
+                "html": "<table><tr><td colspan=\"4\">今天</td></tr><tr><td>晴朗</td><td>晴朗</td><td>多云</td><td>下雨</td></tr><tr><td>昨天多云</td><td>0.50</td><td>0.375</td><td>0.125</td></tr><tr><td></td><td>0.25</td><td>0.125</td><td>0.625</td></tr><tr><td>下雨</td><td>0.25</td><td>0.375</td><td>0.375</td></tr></table>",
+                "table_type": "complex_table",
+                "table_nest_level": 1
+            },
+            "bbox": [
+                192,
+                553,
+                491,
+                777
+            ]
+        },
+        {
+            "type": "paragraph",
+            "content": {
+                "paragraph_content": [
+                    {
+                        "type": "text",
+                        "content": "• 初始概率矩阵"
+                    }
+                ]
+            },
+            "bbox": [
+                166,
+                792,
+                312,
+                829
+            ]
+        },
+        {
+            "type": "table",
+            "content": {
+                "image_source": {
+                    "path": "images/cce5ceb524ec9fc215ae05b6adcad252d71cab99314f81b96183b1ab57ee3574.jpg"
+                },
+                "table_caption": [],
+                "table_footnote": [],
+                "html": "<table><tr><td>晴朗</td><td>多云</td><td>下雨</td></tr><tr><td>（0.63</td><td>0.17</td><td>0.20）</td></tr></table>",
+                "table_type": "simple_table",
+                "table_nest_level": 1
+            },
+            "bbox": [
+                229,
+                842,
+                460,
+                944
+            ]
+        },
+        {
+            "type": "page_header",
+            "content": {
+                "page_header_content": [
+                    {
+                        "type": "text",
+                        "content": "3.1 马尔科夫模型"
+                    }
+                ]
+            },
+            "bbox": [
+                29,
+                62,
+                256,
+                112
+            ]
+        },
+        {
+            "type": "page_header",
+            "content": {
+                "page_header_content": []
+            },
+            "bbox": [
+                936,
+                51,
+                996,
+                131
+            ]
+        }
+    ],
+    [
+        {
+            "type": "title",
+            "content": {
+                "title_content": [
+                    {
+                        "type": "text",
+                        "content": "马尔科夫模型的形式化定义"
+                    }
+                ],
+                "level": 2
+            },
+            "bbox": [
+                226,
+                175,
+                776,
+                262
+            ]
+        },
+        {
+            "type": "equation_interline",
+            "content": {
+                "math_content": "\\mu = ( \\mathrm { S } , \\mathrm { A } , \\pi )",
+                "math_type": "latex",
+                "image_source": {
+                    "path": "images/1f4b21386179fb9c247990d89a3a718f7d2fdd8754406c6a239f4141f71382cb.jpg"
+                }
+            },
+            "bbox": [
+                176,
+                292,
+                341,
+                359
+            ]
+        },
+        {
+            "type": "paragraph",
+            "content": {
+                "paragraph_content": [
+                    {
+                        "type": "text",
+                        "content": "S ={s₁}→状态集合"
+                    }
+                ]
+            },
+            "bbox": [
+                177,
+                375,
+                387,
+                435
+            ]
+        },
+        {
+            "type": "paragraph",
+            "content": {
+                "paragraph_content": [
+                    {
+                        "type": "text",
+                        "content": "A= {aj}→状态转移概率矩阵"
+                    }
+                ]
+            },
+            "bbox": [
+                178,
+                457,
+                471,
+                514
+            ]
+        },
+        {
+            "type": "paragraph",
+            "content": {
+                "paragraph_content": [
+                    {
+                        "type": "equation_inline",
+                        "content": "\\pi = \\left\\{ \\pi _ { \\mathrm { i } } \\right\\}"
+                    },
+                    {
+                        "type": "text",
+                        "content": "→初始概率矩阵"
+                    }
+                ]
+            },
+            "bbox": [
+                179,
+                531,
+                442,
+                590
+            ]
+        },
+        {
+            "type": "paragraph",
+            "content": {
+                "paragraph_content": [
+                    {
+                        "type": "text",
+                        "content": "{晴朗，多云，下雨}"
+                    }
+                ]
+            },
+            "bbox": [
+                580,
+                287,
+                758,
+                333
+            ]
+        },
+        {
+            "type": "equation_interline",
+            "content": {
+                "math_content": "\\begin{array} { r l } & { \\frac { A _ { \\widehat { \\mathbf { A } } } } { B } \\mathbb { A } } \\\\ { \\frac { A _ { \\widehat { \\mathbf { A } } } } { B } \\mathbb { H } } & { \\left( \\begin{array} { l l l } { \\mathbb { H } _ { \\widehat { \\mathbf { B } } } ^ { \\pm } \\mathbb { H } } & { \\widehat { \\mathbf { S } } \\widehat { \\mathbf { z } } } & { \\widehat { \\mathbb { F } } \\overline { { \\mathbb { H } } } } \\\\ { 0 . 5 0 } & { 0 . 3 7 5 } & { 0 . 1 2 5 } \\\\ { 0 . 2 5 } & { 0 . 1 2 5 } & { 0 . 6 2 5 } \\\\ { 0 . 2 5 } & { 0 . 3 7 5 } & { 0 . 3 7 5 } \\end{array} \\right) } \\end{array}",
+                "math_type": "latex",
+                "image_source": {
+                    "path": "images/d994777666b67ebd62969440d5419525569039d4fef3209bfca692aa13dc260c.jpg"
+                }
+            },
+            "bbox": [
+                584,
+                350,
+                841,
+                583
+            ]
+        },
+        {
+            "type": "paragraph",
+            "content": {
+                "paragraph_content": [
+                    {
+                        "type": "text",
+                        "content": "晴朗 多云 下雨（0.63 0.17 0.20）"
+                    }
+                ]
+            },
+            "bbox": [
+                617,
+                600,
+                853,
+                705
+            ]
+        },
+        {
+            "type": "page_header",
+            "content": {
+                "page_header_content": [
+                    {
+                        "type": "text",
+                        "content": "3.1 马尔科夫模型"
+                    }
+                ]
+            },
+            "bbox": [
+                28,
+                62,
+                257,
+                114
+            ]
+        },
+        {
+            "type": "page_header",
+            "content": {
+                "page_header_content": []
+            },
+            "bbox": [
+                935,
+                51,
+                997,
+                129
+            ]
+        }
+    ],
+    [
+        {
+            "type": "paragraph",
+            "content": {
+                "paragraph_content": [
+                    {
+                        "type": "text",
+                        "content": "马尔科夫模型在NLP中的应用举例"
+                    }
+                ]
+            },
+            "bbox": [
+                191,
+                218,
+                811,
+                296
+            ]
+        },
+        {
+            "type": "equation_interline",
+            "content": {
+                "math_content": "S = \\{ \\mathbf { s } _ { 1 } = n , \\mathbf { s } _ { 2 } = \\nu , \\mathbf { s } _ { 3 } = a \\}",
+                "math_type": "latex",
+                "image_source": {
+                    "path": "images/4637d80b7f157642f8dceea781cdbd182050ea01458a0b3c55565d8ac49b511a.jpg"
+                }
+            },
+            "bbox": [
+                369,
+                314,
+                587,
+                361
+            ]
+        },
+        {
+            "type": "equation_interline",
+            "content": {
+                "math_content": "\\overset { n } { \\underset { { A = \\left( \\mathbf { a } _ { i j } \\right) = \\nu } } { \\sum } } \\overset { n } { \\underset { { \\nu } } { \\sum } } \\overset { \\nu } { \\underset { { \\left( \\mathbf { 0 . 3 } \\right. \\begin{array} { l } { { 0 . 5 } } \\end{array} } } { \\sum } } 0 . 2 ",
+                "math_type": "latex",
+                "image_source": {
+                    "path": "images/382ac113a9580e89aeb3f2237314dae4e847517cbfbc71cd790da906480fb174.jpg"
+                }
+            },
+            "bbox": [
+                337,
+                392,
+                565,
+                574
+            ]
+        },
+        {
+            "type": "equation_interline",
+            "content": {
+                "math_content": "\\pi = \\{ \\pi _ { \\mathrm { i } } \\} = { \\begin{array} { c c c } { n } & { \\quad \\nu } & { \\quad a } \\\\ { [ \\phantom { { \\ e q e m e m } } 0 . 6 } & { 0 . 2 } & { \\quad 0 . 2 } \\end{array} ] }",
+                "math_type": "latex",
+                "image_source": {
+                    "path": "images/3a2799a030477b4a002002e4139acb7ff052334ca53756eef2f7451d4fdc1f29.jpg"
+                }
+            },
+            "bbox": [
+                337,
+                611,
+                590,
+                700
+            ]
+        },
+        {
+            "type": "equation_interline",
+            "content": {
+                "math_content": "\\begin{array} { r l } & { P ( q _ { 1 } = n , q _ { 2 } = \\nu , q _ { 3 } = a , q _ { 4 } = n ) } \\\\ & { = P ( q _ { 1 } = n ) \\times P ( q _ { 2 } = \\nu \\mid q _ { 1 } = n ) \\times P ( q _ { 3 } = a \\mid q _ { 2 } = \\nu ) \\times P ( q _ { 4 } = n \\mid q _ { 3 } = a ) } \\\\ & { = 0 . 6 \\times 0 . 5 \\times 0 . 2 \\times 0 . 4 } \\\\ & { = 0 . 0 2 4 } \\end{array}",
+                "math_type": "latex",
+                "image_source": {
+                    "path": "images/af12fef5132134afb05d63723929e4450636f7ad8984932c1c64519869e9091c.jpg"
+                }
+            },
+            "bbox": [
+                311,
+                742,
+                835,
+                942
+            ]
+        },
+        {
+            "type": "page_header",
+            "content": {
+                "page_header_content": [
+                    {
+                        "type": "text",
+                        "content": "3.1 马尔科夫模型"
+                    }
+                ]
+            },
+            "bbox": [
+                28,
+                62,
+                257,
+                112
+            ]
+        },
+        {
+            "type": "page_header",
+            "content": {
+                "page_header_content": []
+            },
+            "bbox": [
+                935,
+                51,
+                997,
+                131
+            ]
+        }
+    ],
+    [
+        {
+            "type": "title",
+            "content": {
+                "title_content": [
+                    {
+                        "type": "text",
+                        "content": "目录 Contents"
+                    }
+                ],
+                "level": 2
+            },
+            "bbox": [
+                44,
+                187,
+                181,
+                305
+            ]
+        },
+        {
+            "type": "index",
+            "content": {
+                "list_type": "text_list",
+                "list_items": [
+                    {
+                        "item_type": "text",
+                        "item_content": [
+                            {
+                                "type": "text",
+                                "content": "3.1 马尔科夫模型"
+                            }
+                        ]
+                    },
+                    {
+                        "item_type": "text",
+                        "item_content": [
+                            {
+                                "type": "text",
+                                "content": "3.2 隐马尔科夫模型"
+                            }
+                        ]
+                    },
+                    {
+                        "item_type": "text",
+                        "item_content": [
+                            {
+                                "type": "text",
+                                "content": "3.3 HMM的三个基本问题"
+                            }
+                        ]
+                    }
+                ]
+            },
+            "bbox": [
+                66,
+                414,
+                500,
+                687
+            ]
+        },
+        {
+            "type": "chart",
+            "content": {
+                "image_source": {
+                    "path": "images/d060817c9f23928126251d50e6ee4a301b29e0f61d66fceb8c38420936cdc19e.jpg"
+                },
+                "content": "",
+                "chart_caption": [],
+                "chart_footnote": []
+            },
+            "bbox": [
+                541,
+                0,
+                1000,
+                1000
+            ]
+        }
+    ],
+    [
+        {
+            "type": "image",
+            "content": {
+                "image_source": {
+                    "path": "images/f199e2f3d0e95e592b2c29a5bd57484d6408c06aec87452aeb39ce5bc79812cf.jpg"
+                },
+                "image_caption": [],
+                "image_footnote": []
+            },
+            "bbox": [
+                255,
+                359,
+                761,
+                905
+            ]
+        },
+        {
+            "type": "page_header",
+            "content": {
+                "page_header_content": [
+                    {
+                        "type": "text",
+                        "content": "3.2 隐马尔科夫模型"
+                    }
+                ]
+            },
+            "bbox": [
+                28,
+                62,
+                281,
+                112
+            ]
+        },
+        {
+            "type": "page_header",
+            "content": {
+                "page_header_content": []
+            },
+            "bbox": [
+                937,
+                51,
+                996,
+                131
+            ]
+        }
+    ],
+    [
+        {
+            "type": "title",
+            "content": {
+                "title_content": [
+                    {
+                        "type": "text",
+                        "content": "HMM的形式化定义"
+                    }
+                ],
+                "level": 2
+            },
+            "bbox": [
+                306,
+                161,
+                703,
+                242
+            ]
+        },
+        {
+            "type": "equation_interline",
+            "content": {
+                "math_content": "\\mu = ( \\mathrm { S } , \\mathrm { V } , \\mathrm { A } , \\mathrm { B } , \\pi )",
+                "math_type": "latex",
+                "image_source": {
+                    "path": "images/ceddd99c774c6d05a28b49c0ee8d0f563c748d8c7c91ec0ca7b71764c333014e.jpg"
+                }
+            },
+            "bbox": [
+                185,
+                288,
+                337,
+                335
+            ]
+        },
+        {
+            "type": "paragraph",
+            "content": {
+                "paragraph_content": [
+                    {
+                        "type": "text",
+                        "content": "S →状态集合(hidden states)"
+                    }
+                ]
+            },
+            "bbox": [
+                189,
+                353,
+                436,
+                401
+            ]
+        },
+        {
+            "type": "paragraph",
+            "content": {
+                "paragraph_content": [
+                    {
+                        "type": "text",
+                        "content": "V→观察值(输出符号)集合"
+                    }
+                ]
+            },
+            "bbox": [
+                185,
+                416,
+                427,
+                462
+            ]
+        },
+        {
+            "type": "paragraph",
+            "content": {
+                "paragraph_content": [
+                    {
+                        "type": "equation_inline",
+                        "content": "\\mathrm { A } = \\{ \\mathfrak { a } _ { \\mathrm { i j } } \\}"
+                    },
+                    {
+                        "type": "text",
+                        "content": "→转移概率矩阵"
+                    }
+                ]
+            },
+            "bbox": [
+                185,
+                479,
+                405,
+                527
+            ]
+        },
+        {
+            "type": "equation_interline",
+            "content": {
+                "math_content": "B = \\left( { b _ { i k } } \\right)",
+                "math_type": "latex",
+                "image_source": {
+                    "path": "images/b82455e706755e75f1c7637020623caea6570efa09b15cce59dcfa0c591335aa.jpg"
+                }
+            },
+            "bbox": [
+                187,
+                544,
+                259,
+                590
+            ]
+        },
+        {
+            "type": "paragraph",
+            "content": {
+                "paragraph_content": [
+                    {
+                        "type": "text",
+                        "content": "发射概率矩阵"
+                    }
+                ]
+            },
+            "bbox": [
+                284,
+                542,
+                410,
+                588
+            ]
+        },
+        {
+            "type": "equation_interline",
+            "content": {
+                "math_content": "\\pi = \\{ \\pi _ { \\mathrm { i } } \\} ",
+                "math_type": "latex",
+                "image_source": {
+                    "path": "images/fa42f6391e7bffaf42f5ba48f2c801d189428f6dedbf4a8e0e7a9ff82b99c3e0.jpg"
+                }
+            },
+            "bbox": [
+                192,
+                607,
+                282,
+                651
+            ]
+        },
+        {
+            "type": "paragraph",
+            "content": {
+                "paragraph_content": [
+                    {
+                        "type": "text",
+                        "content": "初始概率矩阵"
+                    }
+                ]
+            },
+            "bbox": [
+                283,
+                603,
+                405,
+                651
+            ]
+        },
+        {
+            "type": "image",
+            "content": {
+                "image_source": {
+                    "path": "images/df3a61e0c6dc6fc42deda52dabb61d425f1d806928cafc7fb4240d156cb484c0.jpg"
+                },
+                "image_caption": [],
+                "image_footnote": []
+            },
+            "bbox": [
+                290,
+                655,
+                312,
+                750
+            ]
+        },
+        {
+            "type": "paragraph",
+            "content": {
+                "paragraph_content": [
+                    {
+                        "type": "text",
+                        "content": "晴朗（0.63多云0.17下雨0.20）"
+                    }
+                ]
+            },
+            "bbox": [
+                222,
+                750,
+                279,
+                844
+            ]
+        },
+        {
+            "type": "paragraph",
+            "content": {
+                "paragraph_content": []
+            },
+            "bbox": [
+                319,
+                748,
+                359,
+                842
+            ]
+        },
+        {
+            "type": "paragraph",
+            "content": {
+                "paragraph_content": []
+            },
+            "bbox": [
+                398,
+                750,
+                452,
+                846
+            ]
+        },
+        {
+            "type": "paragraph",
+            "content": {
+                "paragraph_content": [
+                    {
+                        "type": "text",
+                        "content": "为了简单，有时也将其记为 "
+                    },
+                    {
+                        "type": "equation_inline",
+                        "content": "\\mu = ( \\mathbf { A } , \\mathbf { B } , \\pi )"
+                    }
+                ]
+            },
+            "bbox": [
+                198,
+                903,
+                522,
+                948
+            ]
+        },
+        {
+            "type": "image",
+            "content": {
+                "image_source": {
+                    "path": "images/a0f9c14072814d9a54530e469b9856ba6a38d4e03f901d6e323519d28161e6f5.jpg"
+                },
+                "image_caption": [],
+                "image_footnote": []
+            },
+            "bbox": [
+                551,
+                262,
+                848,
+                585
+            ]
+        },
+        {
+            "type": "table",
+            "content": {
+                "image_source": {
+                    "path": "images/b8694e0952d2f2bd64da9ccad8f2fd573e2139633b97c8f71ed3003ee43748b9.jpg"
+                },
+                "table_caption": [],
+                "table_footnote": [],
+                "html": "<table><tr><td rowspan=2 colspan=2>转移概率A</td><td rowspan=1 colspan=3>today</td></tr><tr><td rowspan=1 colspan=1>晴</td><td rowspan=1 colspan=1>阴</td><td rowspan=1 colspan=1>雨</td></tr><tr><td rowspan=3 colspan=1>yesterday</td><td rowspan=1 colspan=1>晴</td><td rowspan=1 colspan=1>0.50</td><td rowspan=1 colspan=1>0.375</td><td rowspan=1 colspan=1>0.125</td></tr><tr><td rowspan=1 colspan=1>阴</td><td rowspan=1 colspan=1>0.25</td><td rowspan=1 colspan=1>0.125</td><td rowspan=1 colspan=1>0.625</td></tr><tr><td rowspan=1 colspan=1>雨</td><td rowspan=1 colspan=1>0.25</td><td rowspan=1 colspan=1>0.375</td><td rowspan=1 colspan=1>0.375</td></tr></table>",
+                "table_type": "complex_table",
+                "table_nest_level": 1
+            },
+            "bbox": [
+                552,
+                603,
+                827,
+                777
+            ]
+        },
+        {
+            "type": "table",
+            "content": {
+                "image_source": {
+                    "path": "images/ec410b10ea79c32a3070adfade81c473d9f9273407bf0a4e84a5ef9ac19a9057.jpg"
+                },
+                "table_caption": [],
+                "table_footnote": [],
+                "html": "<table><tr><td rowspan=2 colspan=2>发射概率B</td><td rowspan=1 colspan=4>显式状式</td></tr><tr><td rowspan=1 colspan=1>干透</td><td rowspan=1 colspan=1>较干</td><td rowspan=1 colspan=1>潮湿</td><td rowspan=1 colspan=1>湿透</td></tr><tr><td rowspan=3 colspan=1>隐式状态</td><td rowspan=1 colspan=1>晴</td><td rowspan=1 colspan=1>0.60</td><td rowspan=1 colspan=1>0.20</td><td rowspan=1 colspan=1>0.15</td><td rowspan=1 colspan=1>0.05</td></tr><tr><td rowspan=1 colspan=1>阴</td><td rowspan=1 colspan=1>0.25</td><td rowspan=1 colspan=1>0.25</td><td rowspan=1 colspan=1>0.25</td><td rowspan=1 colspan=1>0.25</td></tr><tr><td rowspan=1 colspan=1>雨</td><td rowspan=1 colspan=1>0.05</td><td rowspan=1 colspan=1>0.10</td><td rowspan=1 colspan=1>0.35</td><td rowspan=1 colspan=1>0.50</td></tr></table>",
+                "table_type": "complex_table",
+                "table_nest_level": 1
+            },
+            "bbox": [
+                553,
+                811,
+                827,
+                992
+            ]
+        },
+        {
+            "type": "page_header",
+            "content": {
+                "page_header_content": [
+                    {
+                        "type": "text",
+                        "content": "3.2 隐马尔科夫模型"
+                    }
+                ]
+            },
+            "bbox": [
+                29,
+                62,
+                281,
+                112
+            ]
+        },
+        {
+            "type": "page_header",
+            "content": {
+                "page_header_content": []
+            },
+            "bbox": [
+                936,
+                53,
+                995,
+                131
+            ]
+        }
+    ],
+    [
+        {
+            "type": "index",
+            "content": {
+                "list_type": "text_list",
+                "list_items": [
+                    {
+                        "item_type": "text",
+                        "item_content": [
+                            {
+                                "type": "text",
+                                "content": "3.1 马尔科夫模型"
+                            }
+                        ]
+                    },
+                    {
+                        "item_type": "text",
+                        "item_content": [
+                            {
+                                "type": "text",
+                                "content": "3.2 隐马尔科夫模型"
+                            }
+                        ]
+                    },
+                    {
+                        "item_type": "text",
+                        "item_content": [
+                            {
+                                "type": "text",
+                                "content": "3.3 HMM的三个基本问题"
+                            }
+                        ]
+                    },
+                    {
+                        "item_type": "text",
+                        "item_content": [
+                            {
+                                "type": "text",
+                                "content": "3.2.1计算观察值序列的概率"
+                            }
+                        ]
+                    },
+                    {
+                        "item_type": "text",
+                        "item_content": [
+                            {
+                                "type": "text",
+                                "content": "3.2.2 确定最优状态序列"
+                            }
+                        ]
+                    },
+                    {
+                        "item_type": "text",
+                        "item_content": [
+                            {
+                                "type": "text",
+                                "content": "3.2.3 HMM的参数估计"
+                            }
+                        ]
+                    }
+                ]
+            },
+            "bbox": [
+                65,
+                414,
+                504,
+                898
+            ]
+        },
+        {
+            "type": "title",
+            "content": {
+                "title_content": [
+                    {
+                        "type": "text",
+                        "content": "目录 Contents"
+                    }
+                ],
+                "level": 2
+            },
+            "bbox": [
+                44,
+                188,
+                181,
+                305
+            ]
+        },
+        {
+            "type": "chart",
+            "content": {
+                "image_source": {
+                    "path": "images/84ca365f65b749d0f7cfee9e8f8f077f3c64769620c35273463d58627be5b866.jpg"
+                },
+                "content": "",
+                "chart_caption": [],
+                "chart_footnote": []
+            },
+            "bbox": [
+                541,
+                0,
+                1000,
+                1000
+            ]
+        }
+    ]
+]
