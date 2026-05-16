@@ -3013,7 +3013,22 @@ async def _save_uploaded_file(f: UploadFile, dest: Path, suffix: str) -> int:
 
 
 @app.post("/api/upload/{course_id}", tags=["ingest"], summary="Upload files to a course (NDJSON-streamed pipeline)")
-async def upload_files(course_id: str, files: Annotated[list[UploadFile], File(...)]):
+async def upload_files(
+    course_id: str,
+    files: Annotated[list[UploadFile], File(...)],
+    engine: str = Query(
+        "pymupdf",
+        pattern="^(pymupdf|mineru)$",
+        description="PDF extraction engine. `pymupdf` (fast default) or `mineru` "
+                    "(slow, ~10s/page on M4 CPU, recovers LaTeX equations + HTML "
+                    "tables + extracted figures). Only affects .pdf files.",
+    ),
+    lang: str = Query(
+        "ch",
+        pattern="^(ch|en)$",
+        description="Language hint for mineru OCR. `ch` or `en`. Ignored for pymupdf.",
+    ),
+):
     """R4-2: NDJSON-streamed upload pipeline.
 
     Saves files synchronously (size + suffix + zip-bomb checks raise
@@ -3024,6 +3039,13 @@ async def upload_files(course_id: str, files: Annotated[list[UploadFile], File(.
       stages are ``chunking | embedding | kg_stage_a | kg_stage_b``
     - ``{type:"done", course_id, files, chunks, documents}`` — terminal success
     - ``{type:"error", error, stage?, partial?}`` — terminal failure
+
+    R5/MinerU: when ``engine=mineru`` the chunking stage routes PDFs through
+    the mineru pipeline backend (formula/table OCR). PPTX/DOCX/MD still
+    use their native extractors. The course's extract engine is recorded
+    in ``artifacts/courses/<id>/.extract_engine``; switching engines on a
+    re-upload invalidates the per-file hash cache so the new extraction
+    actually runs.
 
     Existing v3/v4 hardening (file-cap, zip-bomb, ``asyncio.to_thread``
     off-load) preserved verbatim; the streaming wrapper sits *outside*
@@ -3112,7 +3134,7 @@ async def upload_files(course_id: str, files: Annotated[list[UploadFile], File(.
                                    "pptx_previews_total": len(sidecar_results)},
                     })
                 course_obj = await _asyncio.to_thread(
-                    kb.ingest_course, str(upload_dir), course_id
+                    kb.ingest_course, str(upload_dir), course_id, engine, lang
                 )
                 yield _ndjson({
                     "type": "stage", "stage": "chunking", "progress": 100,

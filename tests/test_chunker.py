@@ -82,3 +82,51 @@ def test_chunker_preserves_metadata():
     assert c.page == 3
     assert "Page 3/10" in c.location
     assert c.chunk_id.startswith("chunk_cs231n_abcdef01_")
+
+
+# ── has_formula heuristic (R5 chunker enrichment) ──────────────────
+
+
+def _chunk_one(text: str):
+    """Helper: chunk a single page of `text` and return the first chunk."""
+    pages = [_make_page(text)]
+    chunks = chunk_pages(
+        pages=pages,
+        source_file="x.pdf",
+        file_type=FileType.PDF,
+        course_id="c",
+        doc_id="d" * 16,
+        chunk_size=1000,
+        overlap=0,
+        min_tokens=5,
+    )
+    return chunks[0] if chunks else None
+
+
+def test_has_formula_detects_block_math():
+    c = _chunk_one("The forward algorithm is:\n$$\nP(O|\\lambda) = \\sum_t \\alpha_t(i)\n$$\nDone.")
+    assert c is not None and c.has_formula is True
+
+
+def test_has_formula_detects_latex_macros():
+    c = _chunk_one("After dropout we compute \\frac{1}{N} \\sum_{i=1}^N x_i for the average. " * 3)
+    assert c is not None and c.has_formula is True
+
+
+def test_has_formula_detects_inline_math():
+    c = _chunk_one("Let $x \\in \\mathbb{R}^d$ be the input vector and apply ReLU. " * 3)
+    assert c is not None and c.has_formula is True
+
+
+def test_has_formula_false_for_plain_prose():
+    c = _chunk_one(
+        "马尔科夫模型最早由 Markov 于 1913 年提出，主要用于语音处理与统计机器翻译领域。" * 4
+    )
+    assert c is not None and c.has_formula is False
+
+
+def test_has_formula_false_for_currency_amount():
+    # `$5` alone should NOT trigger inline-math (need ≥1 non-whitespace
+    # char between the dollars — the heuristic uses [^\s$]).
+    c = _chunk_one("The license costs $5 per month and the support plan is $50 per year. " * 4)
+    assert c is not None and c.has_formula is False

@@ -139,10 +139,29 @@ def extract_markdown(filepath: str) -> list[PageInfo]:
     return sections
 
 
-def extract_file(filepath: str | Path) -> tuple[list[PageInfo], FileType]:
-    """Auto-detect file type and extract text."""
+def extract_file(
+    filepath: str | Path,
+    engine: str = "pymupdf",
+    lang: str = "ch",
+) -> tuple[list[PageInfo], FileType]:
+    """Auto-detect file type and extract text.
+
+    Args:
+      engine: `pymupdf` (default, fast, drops formulae and tables) or
+        `mineru` (slow ~10s/page, preserves LaTeX equations + HTML tables
+        + extracted images). Only honoured for PDFs — other file types
+        always fall back to their native extractor.
+      lang: passed through to mineru when engine='mineru'. `ch` for
+        Chinese, `en` for English.
+    """
     filepath = Path(filepath)
     suffix = filepath.suffix.lower()
+
+    if suffix == ".pdf" and engine == "mineru":
+        # Lazy import to avoid loading torch / mineru deps in default path.
+        from nano_notebooklm.ingest.extractors_mineru import extract_pdf_mineru
+
+        return extract_pdf_mineru(filepath, lang=lang), FileType.PDF
 
     extractors = {
         ".pdf": (extract_pdf, FileType.PDF),

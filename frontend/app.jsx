@@ -172,6 +172,22 @@ function App() {
     try { window.localStorage.setItem("nano-nlm:v1:backend", value); }
     catch (e) {}
   }
+  // ── R5/MinerU: extraction engine preference ─────────────────────
+  // `pymupdf` (default, fast, drops formulae) or `mineru` (slow ~10s/page,
+  // recovers LaTeX equations + HTML tables + figures). Persisted as
+  // `nano-nlm:v1:upload-engine` — global, not per-course, matches the
+  // backend chip convention.
+  const [uploadEngine, setUploadEngine] = useState(() => {
+    try {
+      const v = window.localStorage.getItem("nano-nlm:v1:upload-engine");
+      return v === "mineru" ? "mineru" : "pymupdf";
+    } catch (e) { return "pymupdf"; }
+  });
+  function commitUploadEngine(value) {
+    setUploadEngine(value);
+    try { window.localStorage.setItem("nano-nlm:v1:upload-engine", value); }
+    catch (e) {}
+  }
   // 2026-05-12: user-customisable assistant name. Surfaced via the
   // Settings tab (⚙ icon button in the topbar opens it); flows to
   // /api/chat's `persona` field → qa_skill injects it into every system
@@ -1115,6 +1131,21 @@ function App() {
     );
     if (!courseName) return;
 
+    // R5/MinerU: per-upload engine pick. Stored preference is the default;
+    // confirm() lets the user override for this upload only. The "OK ↔
+    // Cancel" framing is the only native dialog primitive available here,
+    // hence "OK = MinerU".
+    const currentEngine = uploadEngine === "mineru" ? "MinerU" : "PyMuPDF";
+    const wantMineru = window.confirm(
+      `Use MinerU for high-quality PDF extraction?\n\n` +
+      `• OK → MinerU (~10s/page on M4 CPU, recovers LaTeX equations + HTML tables + figures)\n` +
+      `• Cancel → PyMuPDF (ms-level, default, drops formulae)\n\n` +
+      `Current default: ${currentEngine}\n` +
+      `Only PDFs are affected; PPTX/DOCX/MD use their native extractors either way.`
+    );
+    const chosenEngine = wantMineru ? "mineru" : "pymupdf";
+    if (chosenEngine !== uploadEngine) commitUploadEngine(chosenEngine);
+
     // fix-all v1 #A6: capture files in a closure so the retry button can
     // actually re-invoke the upload with the same payload (previously
     // onRetry={setProcessing(null)} only dismissed the modal — user
@@ -1150,7 +1181,7 @@ function App() {
           } else if (ev.type === "error") {
             setProcessing(p => p ? { ...p, errorStage: ev.stage || "unknown", errorMsg: ev.error } : p);
           }
-        });
+        }, { engine: chosenEngine, lang: "ch" });
         clearInterval(iv);
         setUploading(null);
         // fix-all v1 #A7: even on error, refresh courses so the

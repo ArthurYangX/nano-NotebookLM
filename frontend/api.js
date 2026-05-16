@@ -235,12 +235,20 @@ const API = {
   // `{type:"done", course_id, files, chunks, documents, kg_nodes}` /
   // `{type:"error", error, stage?}`. Returns the final event so callers
   // who only care about completion can `await` it like the old endpoint.
-  async uploadFiles(courseId, files, onEvent = null) {
+  // R5/MinerU: pass `{ engine: "mineru" | "pymupdf", lang: "ch" | "en" }`
+  // as the optional `opts` argument to route PDFs through MinerU (slow,
+  // ~10s/page on M4 CPU, recovers LaTeX + tables + figures). Backwards-
+  // compatible: omitting opts keeps the default fast pymupdf path.
+  async uploadFiles(courseId, files, onEvent = null, opts = null) {
     const formData = new FormData();
     for (const file of files) {
       formData.append("files", file);
     }
-    const res = await fetch(`${API_BASE}/upload/${encodeURIComponent(courseId)}`, {
+    const qs = new URLSearchParams();
+    if (opts && opts.engine) qs.set("engine", opts.engine);
+    if (opts && opts.lang) qs.set("lang", opts.lang);
+    const url = `${API_BASE}/upload/${encodeURIComponent(courseId)}` + (qs.toString() ? `?${qs}` : "");
+    const res = await fetch(url, {
       method: "POST",
       body: formData,
     });

@@ -130,8 +130,22 @@ class KBStore:
             self._embed_fn = _get_default_embed_fn()
         return self._embed_fn
 
-    def ingest_course(self, course_dir: str | Path, course_id: str | None = None) -> Course:
-        """Ingest all documents from a course directory."""
+    def ingest_course(
+        self,
+        course_dir: str | Path,
+        course_id: str | None = None,
+        engine: str = "pymupdf",
+        lang: str = "ch",
+    ) -> Course:
+        """Ingest all documents from a course directory.
+
+        Args:
+          engine: `pymupdf` (fast default) or `mineru` (slow, 10s/page on
+            M4 CPU, but recovers LaTeX equations and tables that PyMuPDF
+            destroys). Only affects `.pdf` files; other types use their
+            native extractor either way.
+          lang: passed to mineru when `engine='mineru'`. `ch` or `en`.
+        """
         course_dir = Path(course_dir)
         if course_id is None:
             course_id = course_dir.name
@@ -142,13 +156,21 @@ class KBStore:
         files = collect_files(course_dir)
         logger.info(f"Found {len(files)} files in {course_id}")
 
-        # Check for incremental updates
+        # Check for incremental updates. Engine choice is part of the
+        # cache key — switching from pymupdf to mineru should invalidate
+        # the cache so the user actually gets the better extraction.
         hash_cache = course_artifacts / "file_hashes.json"
         changeset = detect_changes(files, course_dir, hash_cache)
 
-        if not changeset.has_changes and (course_artifacts / "chunks.json").exists():
+        engine_marker = course_artifacts / ".extract_engine"
+        prev_engine = engine_marker.read_text().strip() if engine_marker.exists() else "pymupdf"
+        engine_changed = prev_engine != engine
+
+        if not changeset.has_changes and not engine_changed and (course_artifacts / "chunks.json").exists():
             logger.info(f"No changes detected for {course_id}, loading cached chunks")
             return self._load_course(course_id)
+        if engine_changed:
+            logger.info(f"Extract engine changed: {prev_engine} → {engine}, re-extracting {course_id}")
 
         all_chunks: list[Chunk] = []
         doc_ids: list[str] = []
@@ -157,7 +179,7 @@ class KBStore:
             task = progress.add_task(f"Ingesting {course_id}...", total=len(files))
             for filepath in files:
                 try:
-                    pages, file_type = extract_file(filepath)
+                    pages, file_type = extract_file(filepath, engine=engine, lang=lang)
                     if not pages:
                         progress.advance(task)
                         continue
@@ -187,6 +209,9 @@ class KBStore:
 
         # Save file hashes for future incremental updates
         save_hashes(files, course_dir, hash_cache)
+        # Pin the engine used so a future re-ingest knows whether to bust
+        # the cache when the user switches between pymupdf and mineru.
+        engine_marker.write_text(engine)
 
         course = Course(course_id=course_id, name=course_id, documents=doc_ids)
         meta_path = course_artifacts / "course_meta.json"

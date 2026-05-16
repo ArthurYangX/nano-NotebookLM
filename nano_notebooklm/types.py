@@ -47,6 +47,7 @@ class Chunk(BaseModel):
     page: int | None = None
     slide: int | None = None
     section: str | None = None
+    has_formula: bool = False  # True when chunk contains LaTeX block or inline math
 
 
 class Document(BaseModel):
