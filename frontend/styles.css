@@ -2179,6 +2179,10 @@ mark.hl-flash, .hl-jump.hl-flash { animation: hl-flash 0.9s ease-out; }
 .path-chip.path-filter-empty { border-color: var(--crimson); color: var(--crimson); background: var(--crimson-soft); }
 /* R4-4: GraphRAG path — KG-driven retrieval (concept cosine + BFS hop) */
 .path-chip.path-graphrag { border-color: oklch(0.62 0.15 160); color: oklch(0.32 0.12 160); background: oklch(0.94 0.06 160); }
+/* 2026-05-16: history-rewrite chip — multi-turn follow-up was rewritten
+   into a self-contained retrieval query. Independent of the path chip
+   so it can sit alongside any of rag/translated/cross-course/graphrag. */
+.path-chip.path-rewrite { border-color: oklch(0.68 0.10 280); color: oklch(0.38 0.12 280); background: oklch(0.95 0.04 280); }
 .path-chip-detail {
   margin-left: 4px;
   opacity: 0.75;

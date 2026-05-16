@@ -53,6 +53,19 @@ logger = logging.getLogger(__name__)
 # latency budget. 5s is generous: codex GPT-5.5 typically translates in <1s.
 TRANSLATION_TIMEOUT_SECONDS = 5.0
 
+# 2026-05-16: multi-turn history rewrite — disambiguate follow-up questions
+# ("公式是什么？" after "什么是贝叶斯？") into self-contained retrieval
+# queries before hitting BM25/vector/graphrag. Same shape as translation:
+# bound by wall time so a stalled provider can't double chat latency. 8s
+# (≈ generous translation budget) gives small models headroom; on success
+# the rewrite is typically <1s.
+HISTORY_REWRITE_TIMEOUT_SECONDS = 8.0
+# Cap the per-turn content length we feed into the rewrite prompt — full
+# answers can run thousands of chars, but for disambiguation the lead
+# sentence is enough. Keeps the rewrite prompt under ~1.5k tokens even
+# with 6 round-trips of history.
+_HISTORY_REWRITE_TURN_CHAR_CAP = 400
+
 # fix-all v3 #L4 (R4-4 review-swarm v3): bound graph_search wall time so a
 # stalled embed_fn (e.g. API-mode HTTP hang) doesn't block the chat path
 # indefinitely. Local sentence-transformer batched call on 200 nodes is
@@ -483,6 +496,134 @@ class QASkill(Skill):
     description = "Answer questions using course materials with source citations"
 
     async def execute(self, params: dict) -> SkillResult:
+        """Public entry point. Wraps `_execute_core` with the optional
+        multi-turn history rewrite (2026-05-16): when `params["history"]`
+        is non-empty, an LLM call disambiguates the latest question into a
+        self-contained retrieval query, and the wrapped core sees the
+        rewritten string. Empty / None history short-circuits to a direct
+        `_execute_core(params)` call — single-turn chat pays no extra LLM
+        hop.
+        """
+        question = (params.get("question") or "").strip()
+        history = params.get("history") or []
+
+        # Defensive blank check — _execute_core re-checks, but doing it
+        # here avoids running the rewrite LLM call on empty input.
+        if not question:
+            return await self._execute_core(params)
+
+        rewritten_query: str | None = None
+        if history:
+            rewritten = await self._rewrite_with_history(question, history)
+            if rewritten and rewritten != question:
+                logger.info(
+                    "qa.history_rewrite turns=%d original=%r rewritten=%r",
+                    len(history), question[:80], rewritten[:80],
+                )
+                rewritten_query = rewritten
+                # Mutate a shallow copy so caller's dict is untouched.
+                params = {**params, "question": rewritten_query}
+
+        result = await self._execute_core(params)
+
+        if rewritten_query and result.success and isinstance(result.data, dict):
+            # Surface the rewritten query to the client so the UI can show
+            # "📝 改写: …" — same transparency pattern as
+            # `translated_query` on path="translated". Don't clobber if a
+            # downstream path already set it (defensive).
+            data = dict(result.data)
+            data.setdefault("rewritten_query", rewritten_query)
+            return SkillResult(success=True, data=data)
+        return result
+
+    async def _rewrite_with_history(
+        self, question: str, history: list[dict]
+    ) -> str | None:
+        """Rewrite `question` into a standalone retrieval query using the
+        conversation history. Returns the rewritten string (which MAY
+        equal `question` if the model decides no rewrite is needed), or
+        `None` if the call timed out / failed / produced empty output —
+        the caller treats `None` as "use the original question".
+
+        Defensive: history entries with unexpected roles or non-string
+        content are silently dropped. The prompt itself treats history
+        as data (TRANSLATE_QUERY_SYSTEM-style instruction) but we still
+        truncate per-turn content to `_HISTORY_REWRITE_TURN_CHAR_CAP` so
+        a hostile prior assistant turn can't bloat the prompt.
+        """
+        cleaned: list[tuple[str, str]] = []
+        for turn in history:
+            if not isinstance(turn, dict):
+                continue
+            role = turn.get("role")
+            content = turn.get("content")
+            if role not in ("user", "assistant"):
+                continue
+            if not isinstance(content, str) or not content.strip():
+                continue
+            text = content.strip()
+            if len(text) > _HISTORY_REWRITE_TURN_CHAR_CAP:
+                text = text[:_HISTORY_REWRITE_TURN_CHAR_CAP] + "…"
+            cleaned.append((role, text))
+
+        if not cleaned:
+            return None
+
+        history_block = "\n".join(
+            f"[{role}] {text}" for role, text in cleaned
+        )
+        prompt = prompts.REWRITE_HISTORY_PROMPT.format(
+            history=history_block, question=question,
+        )
+
+        try:
+            resp = await asyncio.wait_for(
+                self.router.complete(
+                    prompt,
+                    task_type="rewrite_history",
+                    system=prompts.REWRITE_HISTORY_SYSTEM,
+                    temperature=0.0,
+                    max_tokens=160,
+                    # Single attempt: outer wait_for is the budget; the
+                    # router's default 3-retry exponential backoff would
+                    # silently exceed HISTORY_REWRITE_TIMEOUT_SECONDS.
+                    max_retries=1,
+                ),
+                timeout=HISTORY_REWRITE_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "history rewrite timed out after %ss; using original question",
+                HISTORY_REWRITE_TIMEOUT_SECONDS,
+            )
+            return None
+        except Exception as exc:  # noqa: BLE001 — graceful fallback
+            logger.warning(
+                "history rewrite LLM call failed (%s); using original question",
+                type(exc).__name__,
+            )
+            return None
+
+        rewritten = (resp.content or "").strip().strip(_QUOTE_STRIP).strip()
+        if not rewritten:
+            return None
+        # Some small models like to prefix with "Rewritten:" or similar —
+        # strip a handful of common labels. Match is conservative: a
+        # case-insensitive bare label followed by `:` or `：` at the
+        # start, single pass.
+        for label in ("rewritten query", "rewritten", "query", "改写", "重写"):
+            lower = rewritten.lower()
+            if lower.startswith(label + ":") or lower.startswith(label + "："):
+                rewritten = rewritten[len(label) + 1:].strip()
+                break
+        # Defensive length cap mirrors ChatRequest.question's max_length
+        # so a runaway rewrite can't smuggle a 100KB string through the
+        # rest of the pipeline.
+        if len(rewritten) > 4000:
+            rewritten = rewritten[:4000]
+        return rewritten or None
+
+    async def _execute_core(self, params: dict) -> SkillResult:
         question = params.get("question", "")
         course_filter = params.get("course_filter")
         top_k = params.get("top_k", 5)

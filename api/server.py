@@ -461,12 +461,43 @@ ReqCourseId = Annotated[
 ]
 
 
+# 2026-05-16: multi-turn conversation context. Frontend sends the recent
+# user/assistant exchanges so qa_skill can rewrite a follow-up like
+# "公式是什么？" into a self-contained retrieval query ("贝叶斯定理的公式
+# 是什么") before hitting BM25/vector/graphrag. Capped at 12 turns (6
+# round-trips) — anything older has little disambiguation value and
+# bloats the rewrite prompt. content length matches the question cap so
+# a long prior question doesn't smuggle past the 4000-char limit.
+_HISTORY_CONTENT_MAX = 4000
+_HISTORY_MAX_TURNS = 12
+
+
+class ChatTurn(BaseModel):
+    model_config = {"extra": "forbid"}
+    role: Literal["user", "assistant"]
+    content: str = Field(..., min_length=1, max_length=_HISTORY_CONTENT_MAX)
+
+    @field_validator("content")
+    @classmethod
+    def content_must_not_be_blank(cls, value: str) -> str:
+        return _strip_nonempty(value, "history.content")
+
+
 class ChatRequest(BaseModel):
     model_config = {"extra": "forbid"}
     question: str = Field(..., min_length=1, max_length=4000)
     course_id: OptCourseId = None
     top_k: int = Field(5, ge=1, le=50)
     checked_files: list[str] | None = None
+    history: list[ChatTurn] | None = Field(
+        default=None,
+        max_length=_HISTORY_MAX_TURNS,
+        description=(
+            "Recent conversation turns (oldest first), used by qa_skill to "
+            "rewrite follow-up questions into self-contained retrieval "
+            "queries. Capped at 12 turns. Omit / null = single-turn chat."
+        ),
+    )
     # Round 3 #R3-2: explicit student language preference. None = legacy
     # behaviour (system prompt's soft "match the user's language" rule
     # applies). zh / en append a strict binding addendum. Anything else is
@@ -607,6 +638,19 @@ class ChatResponse(BaseModel):
     filter_empty: bool | None = None
     filter_low_quality: bool | None = None
     cross_course_origin: str | None = None
+    # 2026-05-16: when qa_skill rewrote the user's question using
+    # `history` (e.g. "公式是什么" → "贝叶斯定理的公式是什么"), this
+    # carries the rewritten retrieval query so the frontend can show
+    # "📝 改写: …" for transparency. None when no rewrite happened
+    # (history empty / single-turn / model returned the original verbatim).
+    rewritten_query: str | None = Field(
+        default=None,
+        description=(
+            "The history-disambiguated retrieval query, when qa_skill "
+            "rewrote a follow-up question. None for single-turn / no-op "
+            "rewrites."
+        ),
+    )
     # R4-5 part 2 + fix-all v1 #V8: True when an explicit
     # backend="qwen_raft" request silently degraded to the default
     # routing backend inside qa_skill (qwen timeout / upstream error).
@@ -1303,6 +1347,13 @@ async def chat(req: ChatRequest):
         raise HTTPException(422, detail="qwen_raft backend not configured")
     if req.backend == "qwen_base" and not config.QWEN_BASE_URL:
         raise HTTPException(422, detail="qwen_base backend not configured")
+    # 2026-05-16: multi-turn — serialise ChatTurn[] to plain dicts so the
+    # skill layer stays Pydantic-free. Empty / None history threads through
+    # as None (qa_skill short-circuits the rewrite step).
+    history_payload = (
+        [{"role": t.role, "content": t.content} for t in req.history]
+        if req.history else None
+    )
     result = await orchestrator.skills["qa"].execute({
         "question": req.question,
         "course_filter": req.course_id,
@@ -1312,6 +1363,7 @@ async def chat(req: ChatRequest):
         "backend": req.backend,
         "persona": req.persona,
         "active_source_file": req.active_source_file,
+        "history": history_payload,
     })
     if not result.success:
         raise HTTPException(status_code=502, detail=result.error or "qa skill failed")

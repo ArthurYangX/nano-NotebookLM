@@ -148,6 +148,12 @@ TASK_ROUTES: dict[str, str] = {
     "qa_answer": "claude",
     "qa_general": "claude",
     "translate_query": "openai",
+    # 2026-05-16: multi-turn history rewrite — small disambiguation task,
+    # codex/openai handles it fast and reliably. Pin here so it doesn't
+    # default-route to a heavier / less-available backend (qwen_raft on
+    # dev hosts) where 502s would silently fall back to the original
+    # question every time.
+    "rewrite_history": "openai",
     "exam_analysis": "openai",
     "report_writing": "claude",
     "cross_review": "alternate",

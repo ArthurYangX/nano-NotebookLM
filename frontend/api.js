@@ -55,7 +55,7 @@ const API = {
     return res.json();
   },
 
-  async chat(question, courseId = null, topK = 5, checkedFiles = null, { signal } = {}, { userLang = null, backend = null, persona = null, activeSourceFile = null } = {}) {
+  async chat(question, courseId = null, topK = 5, checkedFiles = null, { signal } = {}, { userLang = null, backend = null, persona = null, activeSourceFile = null, history = null } = {}) {
     const body = {
       question, course_id: courseId, top_k: topK, checked_files: checkedFiles,
     };
@@ -72,6 +72,22 @@ const API = {
     // hits from this file). null when on All Courses / no focused file.
     if (activeSourceFile && typeof activeSourceFile === "string") {
       body.active_source_file = activeSourceFile;
+    }
+    // 2026-05-16: multi-turn history. Each entry must be {role: "user"|
+    // "assistant", content: string}. Server caps at 12 turns + 4000 chars/
+    // turn; do client-side trimming defensively so a malformed local
+    // state can't 422 the whole chat. Empty array → omit so it threads
+    // through as None on the backend (single-turn short-circuit).
+    if (Array.isArray(history) && history.length > 0) {
+      const trimmed = history
+        .filter(t => t && (t.role === "user" || t.role === "assistant"))
+        .map(t => ({
+          role: t.role,
+          content: String(t.content || "").slice(0, 4000),
+        }))
+        .filter(t => t.content.trim().length > 0)
+        .slice(-12);
+      if (trimmed.length > 0) body.history = trimmed;
     }
     return _post("/chat", body, { signal });
   },
