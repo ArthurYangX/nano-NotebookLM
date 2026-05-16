@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import subprocess
 import textwrap
+from pathlib import Path
 
 
 def run_node(script: str) -> str:
@@ -1444,3 +1445,142 @@ def test_latex_cite_chip_inside_env_populates():
         """
     )
     assert run_node(script).strip() == "ok"
+
+
+# ── Background-task upload (2026-05-16) ──────────────────────────────────
+
+
+def test_api_js_has_start_upload_and_get_status():
+    """The synchronous-streaming `uploadFiles` was replaced with a fire-and-poll
+    pair: `startUpload` (returns {task_id}) + `getUploadStatus` (polls).
+    Pin the surface so the old streaming helper can't sneak back in."""
+    src = Path("frontend/api.js").read_text(encoding="utf-8")
+    assert "async startUpload(" in src, "startUpload missing"
+    assert "async getUploadStatus(" in src, "getUploadStatus missing"
+    # Legacy `async uploadFiles(...)` definition must be gone (a passing
+    # mention in a comment is fine; an actual function or call is not).
+    assert "async uploadFiles(" not in src, "legacy uploadFiles definition must be removed"
+    assert "API.uploadFiles(" not in src, "legacy uploadFiles call must be removed"
+    assert "/upload/status/" in src, "polling endpoint path missing"
+
+
+def test_api_js_start_upload_returns_json_no_streaming():
+    """startUpload must return the JSON {task_id, course_id} body directly,
+    not consume an NDJSON stream."""
+    src = Path("frontend/api.js").read_text(encoding="utf-8")
+    # Slice the startUpload body
+    idx = src.index("async startUpload(")
+    end = src.index("\n  },", idx)
+    body = src[idx:end]
+    assert "res.json()" in body, "must return JSON body"
+    assert "getReader" not in body, "must not stream"
+    assert "TextDecoder" not in body, "must not stream"
+
+
+def test_api_js_get_upload_status_handles_404():
+    """A 404 from the polling endpoint means the server forgot the task —
+    the helper must return `null` (caller sentinel) instead of throwing."""
+    src = Path("frontend/api.js").read_text(encoding="utf-8")
+    idx = src.index("async getUploadStatus(")
+    end = src.index("\n  },", idx)
+    body = src[idx:end]
+    assert "res.status === 404" in body
+    assert "return null" in body
+
+
+def test_app_jsx_uses_localstorage_upload_task_key():
+    """app.jsx must persist the active task_id under the agreed key
+    `nano-nlm:v1:upload-task:<courseId>` so resume-on-mount works."""
+    src = Path("frontend/app.jsx").read_text(encoding="utf-8")
+    assert "nano-nlm:v1:upload-task:" in src
+    # Verify the polling helper is wired in.
+    assert "API.getUploadStatus(" in src
+    assert "API.startUpload(" in src
+    # And the legacy NDJSON helper is fully gone from app.jsx.
+    assert "API.uploadFiles(" not in src
+
+
+def test_app_jsx_localstorage_upload_task_lifecycle():
+    """review-swarm M4 (2026-05-16): pin the full localStorage lifecycle —
+    write on upload start, remove on terminal status, read on resume.
+    The previous grep-only assertion let a future refactor that deletes
+    any one of the three points pass silently.
+    """
+    src = Path("frontend/app.jsx").read_text(encoding="utf-8")
+    prefix = "nano-nlm:v1:upload-task:"
+    occurrences = src.count(prefix)
+    # 1 write (setItem in runUpload), ≥ 3 removeItem (done branch +
+    # 404 branch + inactive-cleanup branch + parse-fail branches), 1
+    # read (getItem in resume) ⇒ ≥ 5 references. We use ≥ 4 as a
+    # robustness floor; the actual count will fluctuate slightly as
+    # the file evolves.
+    assert occurrences >= 4, (
+        f"upload-task key referenced only {occurrences}x — "
+        f"expected write + remove(s) + read. A refactor likely broke "
+        f"the lifecycle."
+    )
+    # Specific anchors that MUST exist.
+    assert ".setItem(" in src and prefix in src, "missing setItem(upload-task:…)"
+    assert ".removeItem(" in src, "missing removeItem(upload-task:…)"
+    assert ".getItem(" in src, "missing getItem(upload-task:…)"
+    # Resume-on-mount helper is the read site.
+    assert "_resumePendingUploads" in src
+    # Inactive-cleanup helper (H3) must exist for the non-active branch.
+    assert "_scheduleInactiveUploadCleanup" in src, (
+        "review-swarm H3: non-active in-flight candidates need a "
+        "cleanup recheck so their localStorage hint doesn't leak"
+    )
+
+
+def test_app_jsx_pollref_app_unmount_cleanup():
+    """review-swarm H2 (2026-05-16): the App-level useEffect that clears
+    pollRef on unmount must exist; otherwise StrictMode / HMR / Vite
+    migrations leak the 1.5s poll interval. Pin by source so a refactor
+    that drops the cleanup tears the build.
+    """
+    src = Path("frontend/app.jsx").read_text(encoding="utf-8")
+    # Look for the empty-deps cleanup that grabs pollRef.
+    # The exact pattern: `useEffect(() => () => { if (pollRef.current)`.
+    assert "if (pollRef.current)" in src
+    # The empty deps array marker `}, []);` near the cleanup is the
+    # contract — fires on real unmount only, not on every render.
+    # We check that the cleanup expression for pollRef is followed
+    # somewhere by an empty deps tuple (multiple useEffects in the
+    # file use `}, []);` so this is a soft pin — the previous source
+    # presence check above already pins the cleanup body itself.
+    assert "review-swarm H2" in src, (
+        "H2 fix-marker missing — pollRef App-unmount cleanup should "
+        "carry the review-swarm H2 comment so a future grep finds it"
+    )
+
+
+def test_app_jsx_double_click_upload_guard():
+    """review-swarm M1 (2026-05-16): onStartUpload must early-return when
+    a non-terminal upload is already in flight, so a double-click can't
+    overwrite the localStorage key with a second task_id (orphaning the
+    first task server-side).
+    """
+    src = Path("frontend/app.jsx").read_text(encoding="utf-8")
+    assert "review-swarm M1" in src
+    # The guard body must check both processing presence + non-terminal.
+    assert "!processing.done" in src
+    assert "!processing.errorStage" in src
+
+
+def test_app_jsx_poll_failure_cutoff():
+    """review-swarm M2 (2026-05-16): the 1.5s poll must not hammer the
+    endpoint forever on a sustained 5xx outage. After MAX_FAILURES
+    consecutive transient errors, clearInterval + surface a transport
+    error to the user.
+    """
+    src = Path("frontend/app.jsx").read_text(encoding="utf-8")
+    assert "review-swarm M2" in src
+    assert "MAX_FAILURES" in src
+    assert "failures >= MAX_FAILURES" in src
+
+
+def test_processing_jsx_handles_nested_progress_shape():
+    """Background-task status returns `stages.chunking.progress` (object),
+    not a flat number. Processing component must tolerate both."""
+    src = Path("frontend/processing.jsx").read_text(encoding="utf-8")
+    assert "v.progress" in src, "Processing must read nested {progress, detail} shape"

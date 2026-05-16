@@ -90,8 +90,12 @@ def upload_client(monkeypatch, tmp_path, fake_embed_fn):
     monkeypatch.setattr(kb_store, "_get_default_embed_fn", lambda: fake_embed_fn)
     import api.server as server_mod
     importlib.reload(server_mod)
+    # TestClient as context manager so ASGI lifespan starts and the
+    # event loop keeps running between requests — required for
+    # `asyncio.create_task` to actually progress in the upload pipeline.
     from fastapi.testclient import TestClient
-    return TestClient(server_mod.app)
+    with TestClient(server_mod.app) as client:
+        yield client
 
 
 def _md_file(name: str = "doc.md") -> tuple[str, bytes, str]:
@@ -113,18 +117,30 @@ def _md_file(name: str = "doc.md") -> tuple[str, bytes, str]:
     return (name, body, "text/markdown")
 
 
-def _consume_ndjson(resp) -> list[dict]:
-    body = "".join(chunk for chunk in resp.iter_text())
-    return [json.loads(line) for line in body.splitlines() if line.strip()]
+def _poll_state(client, task_id, *, timeout=15.0, sleep=0.05):
+    """Poll /api/upload/status/{task_id} until terminal (done|error)."""
+    import time as _time
+    deadline = _time.monotonic() + timeout
+    last = None
+    while _time.monotonic() < deadline:
+        r = client.get(f"/api/upload/status/{task_id}")
+        if r.status_code == 200:
+            last = r.json()
+            if last["status"] in ("done", "error"):
+                return last
+        _time.sleep(sleep)
+    raise AssertionError(f"polling timed out; last={last}")
 
 
 def test_error_event_carries_current_stage(monkeypatch, upload_client):
-    """When the extractor raises in Stage B, the error event must report
-    stage='kg_stage_b' (not None / not 'unknown')."""
+    """R5 background-task migration of A3: when the extractor raises in
+    Stage B, the TaskState must record `error_stage='kg_stage_b'` (not
+    None / not 'unknown'). The old NDJSON stream payload became a state
+    snapshot field; same invariant, new shape."""
     from nano_notebooklm.kg import extractor as extractor_mod
 
     async def _boom(chunks, course_name, router, max_chunks=30,
-                    progress_callback=None, embed_fn=None):  # R4-4 fix-all v1 #C9
+                    progress_callback=None, embed_fn=None):
         if progress_callback is not None:
             progress_callback("kg_stage_a", 0)
             progress_callback("kg_stage_a", 100)
@@ -135,19 +151,22 @@ def test_error_event_carries_current_stage(monkeypatch, upload_client):
     monkeypatch.setattr(extractor_mod, "extract_from_chunks", _boom)
 
     files = [("files", _md_file())]
-    with upload_client.stream("POST", "/api/upload/StageAttrCourse", files=files) as resp:
-        events = _consume_ndjson(resp)
-    err = next((e for e in events if e.get("type") == "error"), None)
-    assert err is not None
-    assert err["stage"] == "kg_stage_b", err
+    r = upload_client.post("/api/upload/StageAttrCourse", files=files)
+    assert r.status_code == 200, r.text
+    task_id = r.json()["task_id"]
+    state = _poll_state(upload_client, task_id)
+    assert state["status"] == "error", state
+    assert state["error_stage"] == "kg_stage_b", state
 
 
 def test_done_event_carries_duration_ms(monkeypatch, upload_client):
-    """fix-all v1 #A11: done event must include duration_ms for ops triage."""
+    """R5 background-task migration of A11: terminal success snapshot must
+    include `result.duration_ms`. Replaces the old `done event duration_ms`
+    NDJSON contract with the equivalent state-field assertion."""
     from nano_notebooklm.kg import extractor as extractor_mod
 
     async def _fake(chunks, course_name, router, max_chunks=30,
-                    progress_callback=None, embed_fn=None):  # R4-4 fix-all v1 #C9
+                    progress_callback=None, embed_fn=None):
         if progress_callback is not None:
             progress_callback("kg_stage_a", 100)
             progress_callback("kg_stage_b", 100)
@@ -156,13 +175,14 @@ def test_done_event_carries_duration_ms(monkeypatch, upload_client):
     monkeypatch.setattr(extractor_mod, "extract_from_chunks", _fake)
 
     files = [("files", _md_file())]
-    with upload_client.stream("POST", "/api/upload/DurationCourse", files=files) as resp:
-        events = _consume_ndjson(resp)
-    done = events[-1]
-    assert done["type"] == "done"
-    assert "duration_ms" in done
-    assert isinstance(done["duration_ms"], int)
-    assert done["duration_ms"] >= 0
+    r = upload_client.post("/api/upload/DurationCourse", files=files)
+    assert r.status_code == 200, r.text
+    task_id = r.json()["task_id"]
+    state = _poll_state(upload_client, task_id)
+    assert state["status"] == "done", state
+    assert "duration_ms" in state["result"]
+    assert isinstance(state["result"]["duration_ms"], int)
+    assert state["result"]["duration_ms"] >= 0
 
 
 # ── A5: drain remaining queue events BEFORE re-raising ───────────────
@@ -170,12 +190,17 @@ def test_done_event_carries_duration_ms(monkeypatch, upload_client):
 
 def test_drain_queue_before_reraise_source_order():
     """Source pin: the empty-queue drain must run BEFORE `await extract_task`
-    so events queued in the same tick as the exception aren't lost."""
+    so events queued in the same tick as the exception aren't lost.
+
+    R5 background-task rename: the generator `async def _events()` was
+    inlined into module-level `async def _run_upload_pipeline(...)`. The
+    drain-before-await invariant is preserved; the slice anchor moves.
+    """
     src = Path("api/server.py").read_text(encoding="utf-8")
-    # Locate the upload generator. Find positions of the drain loop and
-    # `await extract_task`. Slice generously — R4-4 grew the _extract_task
-    # closure (embed_fn kwarg + comment) past the original 6000-char window.
-    upload = src[src.index("async def _events"):src.index("async def _events") + 8000]
+    upload = src[
+        src.index("async def _run_upload_pipeline"):
+        src.index("async def _run_upload_pipeline") + 8000
+    ]
     drain_pos = upload.index("while not kg_queue.empty()")
     await_pos = upload.index("concepts, relations = await extract_task")
     assert drain_pos < await_pos, "queue drain must precede `await extract_task`"
@@ -249,9 +274,11 @@ def test_app_jsx_retry_button_reinvokes_upload():
     assert "retryRef" in src
     # Retry handler must reference both the ref and the captured payload.
     assert "retryRef.current(processing.retryPayload)" in src
-    # The naive setProcessing(null)-only handler must be gone.
-    m = re.search(r"onRetry=\{[\s\S]+?\}\}\s*/>", src)
-    assert m
+    # The Processing modal's onRetry handler (specifically) must use retryRef
+    # — anchor on the Processing component to avoid matching unrelated
+    # onRetry props (e.g. notes retry).
+    m = re.search(r"<Processing[\s\S]+?onRetry=\{[\s\S]+?\}\}", src)
+    assert m, "Processing onRetry block not found"
     block = m.group(0)
     assert "retryRef.current" in block
 
@@ -259,23 +286,27 @@ def test_app_jsx_retry_button_reinvokes_upload():
 def test_app_jsx_error_path_refreshes_courses():
     """fix-all v1 #A7: on KG extractor crash, chunks already landed —
     the UI must call getCourses(mode) so the partially-ingested course
-    appears in the dropdown."""
+    appears in the dropdown. 2026-05-16: upload is now background-task
+    + poll, so the refresh lives inside the poll's done/error branch
+    (the `_startUploadPolling` helper)."""
     src = Path("frontend/app.jsx").read_text(encoding="utf-8")
-    m = re.search(r"const final = await API\.uploadFiles\([\s\S]+?\}\;[\s\S]+?\}\;", src)
-    assert m
+    m = re.search(r"function _startUploadPolling\([\s\S]+?\n  \}\n", src)
+    assert m, "_startUploadPolling helper not found"
     body = m.group(0)
-    # getCourses must run unconditionally (was previously guarded by
-    # `if (final.type === "error") return;`).
+    # getCourses must run when the task terminates (done OR error).
     assert "API.getCourses" in body
     # setActiveCourse on the other hand IS conditional (only on success).
     assert "setActiveCourse(courseName)" in body
+    # Done + error branches both clear interval and localStorage.
+    assert "status === \"done\"" in body
+    assert "status === \"error\"" in body
 
 
 def test_api_js_upload_error_carries_detail():
-    """fix-all v1 #A8: uploadFiles must parse server's {detail, error}
-    envelope into err.message so the UI shows the real reason."""
+    """fix-all v1 #A8: startUpload (formerly uploadFiles) must parse server's
+    {detail, error} envelope into err.message so the UI shows the real reason."""
     src = Path("frontend/api.js").read_text(encoding="utf-8")
-    m = re.search(r"async uploadFiles\([\s\S]+?\n  \},", src)
+    m = re.search(r"async startUpload\([\s\S]+?\n  \},", src)
     assert m
     body = m.group(0)
     # The error branch must reach for body.detail (with body.error as

@@ -230,32 +230,33 @@ const API = {
     return _post("/ingest", { course_dir: courseDir, course_id: courseId });
   },
 
-  // R4-2: /api/upload/{cid} now streams NDJSON (4 stages → done|error).
-  // ``onEvent`` receives `{type:"stage", stage, progress, detail?}` /
-  // `{type:"done", course_id, files, chunks, documents, kg_nodes}` /
-  // `{type:"error", error, stage?}`. Returns the final event so callers
-  // who only care about completion can `await` it like the old endpoint.
+  // Upload background-task pattern (2026-05-16): /api/upload/{cid} now
+  // returns {task_id, course_id} immediately after files are saved. The
+  // ingest pipeline (chunking → embedding → kg_stage_a → kg_stage_b) runs
+  // in a background task; the caller polls GET /api/upload/status/{task_id}
+  // for progress. Replaces the old NDJSON-streaming `uploadFiles` so a
+  // tab close / network blip doesn't kill the upload.
+  //
   // R5/MinerU: pass `{ engine: "mineru" | "pymupdf", lang: "ch" | "en" }`
-  // as the optional `opts` argument to route PDFs through MinerU (slow,
-  // ~10s/page on M4 CPU, recovers LaTeX + tables + figures). Backwards-
-  // compatible: omitting opts keeps the default fast pymupdf path.
-  async uploadFiles(courseId, files, onEvent = null, opts = null) {
+  // to route PDFs through MinerU. Omitting opts keeps the default
+  // fast pymupdf path.
+  async startUpload(courseId, files, { engine, lang } = {}) {
     const formData = new FormData();
     for (const file of files) {
       formData.append("files", file);
     }
     const qs = new URLSearchParams();
-    if (opts && opts.engine) qs.set("engine", opts.engine);
-    if (opts && opts.lang) qs.set("lang", opts.lang);
+    if (engine) qs.set("engine", engine);
+    if (lang) qs.set("lang", lang);
     const url = `${API_BASE}/upload/${encodeURIComponent(courseId)}` + (qs.toString() ? `?${qs}` : "");
     const res = await fetch(url, {
       method: "POST",
       body: formData,
     });
     if (!res.ok) {
-      // fix-all v1 #A8: parity with _request — surface server's
-      // {error, detail} envelope into err.message so the UI shows
-      // "File 'foo.exe' exceeds 50MB limit" not bare "HTTP 413".
+      // Parity with _request — surface server's {error, detail} envelope
+      // into err.message so the UI shows the real reason
+      // (e.g. "File 'foo.exe' exceeds 50MB limit") not bare "HTTP 413".
       let detail = null;
       let body = null;
       try {
@@ -268,50 +269,33 @@ const API = {
       err.requestId = res.headers.get("x-request-id") || null;
       throw err;
     }
-    if (!res.body || !window.TextDecoder) {
-      // Fallback: consume the entire response as text and parse line-by-line.
-      const text = await res.text();
-      let last = null;
-      for (const line of text.split("\n")) {
-        if (!line.trim()) continue;
-        try {
-          const ev = JSON.parse(line);
-          last = ev;
-          if (onEvent) onEvent(ev);
-        } catch { /* skip */ }
-      }
-      return last;
-    }
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder();
-    const MAX_LINE_BYTES = 1024 * 1024;
-    let buffer = "";
-    let finalEvent = null;
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      if (buffer.length > MAX_LINE_BYTES) {
-        buffer = "";
-      }
-      const lines = buffer.split("\n");
-      buffer = lines.pop() || "";
-      for (const line of lines) {
-        if (!line.trim()) continue;
-        let ev;
-        try { ev = JSON.parse(line); } catch { continue; }
-        finalEvent = ev;
-        if (onEvent) onEvent(ev);
-      }
-    }
-    if (buffer.trim()) {
+    return res.json(); // { task_id, course_id }
+  },
+
+  // Poll endpoint for the background upload task. Returns:
+  //   - null when the server reports 404 (task evicted / unknown id) —
+  //     caller should stop polling and treat as "task gone".
+  //   - state object otherwise: { task_id, course_id, status,
+  //     stages: { chunking, embedding, kg_stage_a, kg_stage_b },
+  //     result | null, error | null, error_stage | null, file_names }.
+  // Throws on transport errors so the caller's retry loop can decide to
+  // keep polling vs. surface the failure.
+  async getUploadStatus(taskId) {
+    const res = await fetch(`${API_BASE}/upload/status/${encodeURIComponent(taskId)}`);
+    if (res.status === 404) return null;
+    if (!res.ok) {
+      let detail = null;
+      let body = null;
       try {
-        const ev = JSON.parse(buffer);
-        finalEvent = ev;
-        if (onEvent) onEvent(ev);
-      } catch { /* skip */ }
+        body = await res.json();
+        detail = body.detail || body.error || null;
+      } catch { /* non-JSON body */ }
+      const err = new Error(detail || `HTTP ${res.status}`);
+      err.status = res.status;
+      err.body = body;
+      throw err;
     }
-    return finalEvent;
+    return res.json();
   },
 
   async getMastery(courseId) {

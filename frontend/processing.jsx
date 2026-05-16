@@ -27,10 +27,23 @@ const STAGE_DEFS = [
 function Processing({ fileName, activeStep, stages, errorStage, errorMsg, done, onRetry }) {
   const useStream = stages && typeof stages === "object";
 
+  // 2026-05-16: stage shape is now `{progress, detail}` (background-task
+  // status endpoint) instead of a flat percent number. Tolerate both
+  // shapes so a stale serialized state from before the refactor doesn't
+  // throw.
+  function pctOf(key) {
+    if (!useStream) return 0;
+    const v = stages[key];
+    if (v == null) return 0;
+    if (typeof v === "number") return v;
+    if (typeof v === "object" && typeof v.progress === "number") return v.progress;
+    return 0;
+  }
+
   function stageCls(idx, key) {
     if (errorStage === key) return "pstep error";
     if (useStream) {
-      const pct = stages[key] || 0;
+      const pct = pctOf(key);
       if (pct >= 100) return "pstep done";
       if (pct > 0) return "pstep active";
       return "pstep";
@@ -44,7 +57,7 @@ function Processing({ fileName, activeStep, stages, errorStage, errorMsg, done, 
 
   function stagePct(key) {
     if (!useStream) return null;
-    return stages[key] || 0;
+    return pctOf(key);
   }
 
   return (

@@ -48,6 +48,7 @@ from nano_notebooklm.skills.latex_sanitizer import (
     MAX_LATEX_BYTES,
 )
 from nano_notebooklm.skills import notes_full_course
+from nano_notebooklm.kg.extractor import UPLOAD_STAGES
 from nano_notebooklm import config
 
 logging.basicConfig(
@@ -166,6 +167,22 @@ async def _probe_soffice() -> None:
         logger.info("soffice detected at %s — pptx upload will generate pdf sidecar", binary)
     else:
         logger.info("soffice not found — pptx will fall back to text-mode Reader (install LibreOffice to enable)")
+
+
+# review-swarm M6 (2026-05-16): the upload background-task registry
+# (`_UPLOAD_TASKS`) is per-process. Multi-worker uvicorn would silently
+# 404 status polls that land on a different worker than the originating
+# POST. Warn loudly at startup so a deploy mis-config surfaces.
+@app.on_event("startup")
+async def _warn_multi_worker_unsafe() -> None:
+    workers = int(os.environ.get("WEB_CONCURRENCY", "1") or "1")
+    if workers > 1:
+        logger.warning(
+            "WEB_CONCURRENCY=%d > 1: upload background-task registry is "
+            "per-process; status polls will 404 unpredictably. Run with "
+            "--workers 1 for the upload pipeline to work correctly.",
+            workers,
+        )
 
 # ── Upload limits ────────────────────────────────────────────────────
 MAX_UPLOAD_SIZE_MB = 50
@@ -2934,6 +2951,76 @@ async def ingest_course(req: IngestRequest):
 _UPLOAD_LOCKS: dict[str, "_asyncio.Lock"] = {}
 _UPLOAD_LOCKS_MAX = 512
 
+# R4-2 background-task: in-memory upload TaskState registry. Mirrors
+# `_UPLOAD_LOCKS` semantics — bounded LRU with opportunistic eviction.
+# Each entry is a plain dict (no TypedDict — keep diff small) with shape:
+#   {
+#     "task_id": str, "course_id": str,
+#     "started_at": float, "ended_at": float | None,
+#     "status": "waiting" | "running" | "done" | "error",
+#     "stages": {<stage_name>: {"progress": int, "detail": dict | None}},
+#     "result": {course_id, files, chunks, documents, kg_nodes, duration_ms} | None,
+#     "error": str | None, "error_stage": str | None,
+#     "file_names": list[str],
+#   }
+# Server restart drops everything (in-memory by design — listed as a
+# known caveat); the frontend's localStorage upload-task hint resolves
+# to a 404 → user re-uploads.
+_UPLOAD_TASKS: dict[str, dict[str, Any]] = {}
+_UPLOAD_TASKS_MAX = 512
+_UPLOAD_TASKS_TTL_S = 3600
+
+# Strong refs for the in-flight asyncio.Task objects. `asyncio.create_task`
+# returns a Task that Python is free to GC if nobody holds it (Python docs
+# explicitly warn about this footgun) — losing the ref silently cancels
+# the pipeline. We add to this set on schedule and discard via the task's
+# done-callback. Bounded by `_UPLOAD_TASKS_MAX` indirectly: one entry per
+# active task, evicted by Python on completion.
+_UPLOAD_TASK_OBJECTS: "set[_asyncio.Task]" = set()
+
+# Eagerly wire onto `app.state` so TestClient setups (which don't fire
+# lifespan events by default) and direct module callers see the same
+# dict ref. Production startup keeps the same binding — there's no
+# second initialiser. The endpoint still falls back via `getattr(...)`
+# as a belt-and-suspenders guard.
+app.state.upload_tasks = _UPLOAD_TASKS
+
+
+def _maybe_evict_upload_tasks() -> None:
+    """Bound `_UPLOAD_TASKS` growth.
+
+    Two-pass policy mirroring `_maybe_evict_upload_lock`:
+      1. Drop any entry whose `ended_at` is more than `_UPLOAD_TASKS_TTL_S`
+         seconds in the past — fully expired snapshots are free to go.
+      2. If the dict is still over `_UPLOAD_TASKS_MAX`, drop the oldest
+         *ended* entries (sorted by `ended_at`) until we're back under
+         cap. Running tasks are never evicted — a poller would 404 on a
+         still-active job otherwise.
+    """
+    now = time.time()
+    # Pass 1: TTL drop.
+    expired: list[str] = []
+    for task_id, state in _UPLOAD_TASKS.items():
+        ended_at = state.get("ended_at")
+        if ended_at is None:
+            continue
+        if (now - ended_at) > _UPLOAD_TASKS_TTL_S:
+            expired.append(task_id)
+    for task_id in expired:
+        _UPLOAD_TASKS.pop(task_id, None)
+
+    # Pass 2: cap-based drop of oldest ended entries (never running ones).
+    if len(_UPLOAD_TASKS) > _UPLOAD_TASKS_MAX:
+        ended = [
+            (state.get("ended_at") or 0.0, task_id)
+            for task_id, state in _UPLOAD_TASKS.items()
+            if state.get("ended_at") is not None
+        ]
+        ended.sort()
+        over = len(_UPLOAD_TASKS) - _UPLOAD_TASKS_MAX
+        for _, task_id in ended[:over]:
+            _UPLOAD_TASKS.pop(task_id, None)
+
 
 def _upload_lock_for(course_id: str) -> "_asyncio.Lock":
     """fix-all v1 #A1: ``setdefault`` is the atomic read-or-create —
@@ -2966,10 +3053,6 @@ def _maybe_evict_upload_lock(course_id: str) -> None:
     # and we're at a quiescent point, drop this one to keep growth bounded.
     if len(_UPLOAD_LOCKS) > _UPLOAD_LOCKS_MAX:
         _UPLOAD_LOCKS.pop(course_id, None)
-
-
-def _ndjson(event: dict) -> str:
-    return json.dumps(event, ensure_ascii=False) + "\n"
 
 
 async def _save_uploaded_file(f: UploadFile, dest: Path, suffix: str) -> int:
@@ -3012,7 +3095,52 @@ async def _save_uploaded_file(f: UploadFile, dest: Path, suffix: str) -> int:
     return written
 
 
-@app.post("/api/upload/{course_id}", tags=["ingest"], summary="Upload files to a course (NDJSON-streamed pipeline)")
+# review-swarm M3 + M5 (2026-05-16): pin the wire contract via Pydantic
+# response_model. Mirrors the codebase convention (ChatResponse,
+# ChunkResponse). Status `Literal[...]` rejects typos at the response
+# serializer. `model_config = {"extra": "forbid"}` blocks accidental
+# leakage of new internal state fields.
+class UploadStartResponse(BaseModel):
+    task_id: str
+    course_id: str
+    model_config = {"extra": "forbid"}
+
+
+class UploadStageStatus(BaseModel):
+    progress: int = 0
+    detail: dict[str, Any] | None = None
+    model_config = {"extra": "forbid"}
+
+
+class UploadResultPayload(BaseModel):
+    course_id: str
+    files: int
+    chunks: int
+    documents: int
+    kg_nodes: int
+    duration_ms: int
+    model_config = {"extra": "forbid"}
+
+
+class UploadTaskStateResponse(BaseModel):
+    task_id: str
+    course_id: str
+    started_at: float
+    ended_at: float | None = None
+    status: Literal["waiting", "running", "done", "error"]
+    stages: dict[str, UploadStageStatus]
+    result: UploadResultPayload | None = None
+    error: str | None = None
+    error_stage: str | None = None
+    file_names: list[str]
+    # NOTE: internal field `saved_count` from TaskState is intentionally
+    # not part of the public response (review-swarm M5).
+    model_config = {"extra": "forbid"}
+
+
+@app.post("/api/upload/{course_id}", tags=["ingest"],
+          summary="Upload files to a course (background-task pipeline)",
+          response_model=UploadStartResponse)
 async def upload_files(
     course_id: str,
     files: Annotated[list[UploadFile], File(...)],
@@ -3029,30 +3157,30 @@ async def upload_files(
         description="Language hint for mineru OCR. `ch` or `en`. Ignored for pymupdf.",
     ),
 ):
-    """R4-2: NDJSON-streamed upload pipeline.
+    """R4-2 background-task upload pipeline (tab-close survives).
 
-    Saves files synchronously (size + suffix + zip-bomb checks raise
-    HTTPException straight to the caller — no half-streamed errors), then
-    returns ``application/x-ndjson`` with one event per stage:
+    Pre-stream validation (filename / suffix / size / zip-bomb) and file
+    save run synchronously and raise HTTP 4xx on failure — no half-tracked
+    tasks. After all files are on disk we register a TaskState dict,
+    schedule `_run_upload_pipeline` as a background `asyncio.create_task`,
+    and return ``{task_id, course_id}`` immediately. The 4 ingest stages
+    (chunking → embedding → kg_stage_a → kg_stage_b) progress mutates the
+    TaskState; the frontend polls ``GET /api/upload/status/{task_id}``.
 
-    - ``{type:"stage", stage, progress, detail?}`` — one or more per stage,
-      stages are ``chunking | embedding | kg_stage_a | kg_stage_b``
-    - ``{type:"done", course_id, files, chunks, documents}`` — terminal success
-    - ``{type:"error", error, stage?, partial?}`` — terminal failure
+    Per-course `_upload_lock_for` is acquired *inside* the background task
+    so two concurrent POSTs for the same course id both return their own
+    task_id immediately; the second stays `status="waiting"` until the
+    first finishes.
 
-    R5/MinerU: when ``engine=mineru`` the chunking stage routes PDFs through
-    the mineru pipeline backend (formula/table OCR). PPTX/DOCX/MD still
-    use their native extractors. The course's extract engine is recorded
-    in ``artifacts/courses/<id>/.extract_engine``; switching engines on a
-    re-upload invalidates the per-file hash cache so the new extraction
-    actually runs.
+    R5/MinerU: ``engine=mineru`` routes PDFs through the mineru pipeline
+    backend (formula/table OCR). PPTX/DOCX/MD still use native extractors.
+    The chosen engine is recorded in ``artifacts/courses/<id>/.extract_engine``;
+    switching engines on a re-upload invalidates the per-file hash cache.
 
     Existing v3/v4 hardening (file-cap, zip-bomb, ``asyncio.to_thread``
-    off-load) preserved verbatim; the streaming wrapper sits *outside*
-    those guards.
+    off-load) preserved verbatim; only the response shape changed from
+    NDJSON streaming to ``{task_id, course_id}`` with polled status.
     """
-    import asyncio as _asyncio
-
     course_id = _validate_course_id_path(course_id)
     if not files:
         raise HTTPException(400, "No files provided")
@@ -3062,6 +3190,7 @@ async def upload_files(
 
     # ── Pre-stream: save files (errors short-circuit with HTTP 4xx) ──
     saved = 0
+    saved_names: list[str] = []
     for f in files:
         if not f.filename:
             continue
@@ -3073,12 +3202,17 @@ async def upload_files(
             )
         # fix-all v1 #6: reject control / bidi chars; defense vs filename
         # injection into LaTeX \section{} and Content-Disposition headers.
+        # review-swarm H1 (2026-05-16): `state["file_names"]` must mirror
+        # the on-disk name so a status poller can't observe a
+        # pre-sanitization variant (RTL bidi / control chars / >255B
+        # length). Reuse `safe_name` for both disk + state.
         safe_name = _safe_upload_name(f.filename)
         dest = upload_dir / safe_name
         written = await _save_uploaded_file(f, dest, suffix)
         if suffix in (".pptx", ".docx"):
             _check_zip_safety(dest, written)
         saved += 1
+        saved_names.append(safe_name)
 
     if saved == 0:
         raise HTTPException(400, "No valid files saved")
@@ -3091,22 +3225,91 @@ async def upload_files(
     # to the same course can't race on the rename.
     pptx_to_render = sorted(p for p in upload_dir.glob("*.pptx") if p.is_file())
 
-    # ── Stream: 4 ingest stages, NDJSON one event per line ──
-    async def _events():
-        # fix-all v1 #A3: track which stage is current so the error event
-        # surfaces the failing stage to the frontend (previously
-        # `getattr(e, "stage", None)` was always None).
-        current_stage: str | None = None
-        chunks = []
-        course_obj = None
-        concepts: list = []
-        t_start = time.monotonic()
-        # Per-course pipeline lock prevents two concurrent uploads from
-        # racing on chunks.json / FAISS index. Acquire inside the
-        # generator so the wait time itself is observable as a delay
-        # before any stage event fires (the client just sees a slow
-        # connection — fine).
+    # ── Schedule background task; return task_id immediately ──
+    import asyncio as _asyncio
+
+    task_id = uuid.uuid4().hex
+    state: dict[str, Any] = {
+        "task_id": task_id,
+        "course_id": course_id,
+        "started_at": time.time(),
+        "ended_at": None,
+        "status": "waiting",
+        "stages": {s: {"progress": 0, "detail": None} for s in UPLOAD_STAGES},
+        "result": None,
+        "error": None,
+        "error_stage": None,
+        "file_names": saved_names,
+        "saved_count": saved,
+    }
+    # `app.state.upload_tasks` is wired in `_probe_soffice` startup. Fall
+    # back to the module-level dict for TestClient setups that import the
+    # module without the startup hook firing — same dict, equivalent ref.
+    tasks_dict = getattr(app.state, "upload_tasks", None) or _UPLOAD_TASKS
+    tasks_dict[task_id] = state
+    _maybe_evict_upload_tasks()
+
+    # Strong-ref the Task object so Python can't GC it mid-pipeline.
+    # `add_done_callback(discard)` cleans up after completion.
+    _bg_task = _asyncio.create_task(_run_upload_pipeline(
+        task_id, course_id, upload_dir, pptx_to_render, engine, lang,
+    ))
+    _UPLOAD_TASK_OBJECTS.add(_bg_task)
+    _bg_task.add_done_callback(_UPLOAD_TASK_OBJECTS.discard)
+
+    return {"task_id": task_id, "course_id": course_id}
+
+
+def _set_stage(state: dict[str, Any], stage: str, progress: int,
+               detail: dict | None = None) -> None:
+    """Centralised TaskState mutation — replaces the old `yield _ndjson(...)`
+    points in the streaming pipeline. Each call overwrites the stage's
+    current progress / detail snapshot; the poller surfaces whatever the
+    latest write was.
+    """
+    state["stages"][stage] = {"progress": progress, "detail": detail}
+
+
+async def _run_upload_pipeline(
+    task_id: str,
+    course_id: str,
+    upload_dir: Path,
+    pptx_to_render: list[Path],
+    engine: str,
+    lang: str,
+) -> None:
+    """Background coroutine driving the 4-stage upload pipeline.
+
+    Body is the verbatim former `_events()` generator with two changes:
+      1. NDJSON `yield _ndjson(...)` → `_set_stage(state, ...)` (state
+         mutation; the poller reads it).
+      2. Terminal `done` / `error` events become terminal state writes
+         on the TaskState (`status`, `result` / `error` / `error_stage`,
+         `ended_at`).
+
+    All other semantics — per-course lock acquisition order, kg_queue
+    drain timing, extract_task error propagation, PII-scrub log line —
+    are preserved exactly so the operational behaviour (lock contention,
+    log shape, fault recovery on disk) doesn't change.
+    """
+    import asyncio as _asyncio
+
+    tasks_dict = getattr(app.state, "upload_tasks", None) or _UPLOAD_TASKS
+    state = tasks_dict.get(task_id)
+    if state is None:
+        # Evicted before we even started — nothing to drive.
+        return
+
+    current_stage: str | None = None
+    chunks: list = []
+    course_obj = None
+    concepts: list = []
+    saved = int(state.get("saved_count") or 0)
+    t_start = time.monotonic()
+
+    try:
         async with _upload_lock_for(course_id):
+            state["status"] = "running"
             try:
                 # Stage 1: chunking (synchronous; off-loaded to worker).
                 # PPTX → PDF sidecar conversion runs inside this stage too
@@ -3116,11 +3319,10 @@ async def upload_files(
                 # warning, never aborts the upload (Reader text-mode is
                 # the fallback).
                 current_stage = "chunking"
-                yield _ndjson({"type": "stage", "stage": "chunking", "progress": 0})
+                _set_stage(state, "chunking", 0)
                 if pptx_to_render and getattr(app.state, "pptx_pdf_available", False):
-                    yield _ndjson({
-                        "type": "stage", "stage": "chunking", "progress": 25,
-                        "detail": {"sub": f"rendering {len(pptx_to_render)} pptx preview(s)"},
+                    _set_stage(state, "chunking", 25, detail={
+                        "sub": f"rendering {len(pptx_to_render)} pptx preview(s)",
                     })
                     from nano_notebooklm.ingest.pptx_pdf import convert_directory
                     preview_dir = _preview_dir_for(course_id)
@@ -3128,34 +3330,28 @@ async def upload_files(
                         convert_directory, upload_dir, preview_dir,
                     )
                     rendered = sum(1 for v in sidecar_results.values() if v is not None)
-                    yield _ndjson({
-                        "type": "stage", "stage": "chunking", "progress": 50,
-                        "detail": {"pptx_previews_rendered": rendered,
-                                   "pptx_previews_total": len(sidecar_results)},
+                    _set_stage(state, "chunking", 50, detail={
+                        "pptx_previews_rendered": rendered,
+                        "pptx_previews_total": len(sidecar_results),
                     })
                 course_obj = await _asyncio.to_thread(
-                    kb.ingest_course, str(upload_dir), course_id, engine, lang
+                    kb.ingest_course, str(upload_dir), course_id, engine, lang,
                 )
-                yield _ndjson({
-                    "type": "stage", "stage": "chunking", "progress": 100,
-                    "detail": {"documents": len(course_obj.documents)},
+                _set_stage(state, "chunking", 100, detail={
+                    "documents": len(course_obj.documents),
                 })
 
                 # Stage 2: embedding (FAISS + BM25 rebuild for the course).
                 current_stage = "embedding"
-                yield _ndjson({"type": "stage", "stage": "embedding", "progress": 0})
+                _set_stage(state, "embedding", 0)
                 await _asyncio.to_thread(kb.build_index, course_id)
                 router_intent.clear_lang_cache(course_id)
                 chunks = kb.get_chunks(course_id)
-                yield _ndjson({
-                    "type": "stage", "stage": "embedding", "progress": 100,
-                    "detail": {"chunks": len(chunks)},
-                })
+                _set_stage(state, "embedding", 100, detail={"chunks": len(chunks)})
 
                 # Stages 3 + 4: KG extraction. The extractor's
                 # progress_callback is invoked from the same loop, so a
-                # plain queue + drain is enough to interleave with our
-                # async generator.
+                # plain queue + drain interleaves cleanly with our await.
                 current_stage = "kg_stage_a"
                 kg_queue: _asyncio.Queue = _asyncio.Queue(maxsize=64)
 
@@ -3165,16 +3361,9 @@ async def upload_files(
                     except _asyncio.QueueFull:
                         # fix-all v1 #A4: intermediate frames can be
                         # dropped under backpressure, but `100%` markers
-                        # mark the end of a stage and MUST land. Block on
-                        # them via a synchronous put attempt with a long
-                        # wait — only intermediates ever get dropped.
+                        # mark the end of a stage and MUST land. Drain
+                        # the head once and retry. Same guard as before.
                         if pct == 100:
-                            # We're inside a sync callback in an async
-                            # coroutine; can't await. Best-effort: drain
-                            # the queue head and retry once. Drain is safe
-                            # because the consumer is the same task that
-                            # invoked us (we are synchronous within their
-                            # `await`), so consumer cannot be racing.
                             try:
                                 kg_queue.get_nowait()
                                 kg_queue.put_nowait({"type": "stage", "stage": stage, "progress": pct})
@@ -3187,43 +3376,33 @@ async def upload_files(
 
                 async def _extract_task():
                     if not chunks:
-                        # Empty corpus — emit zero-length stage events so
-                        # the client sees the 4-stage contract regardless.
                         _progress("kg_stage_a", 100)
                         _progress("kg_stage_b", 100)
                         return [], []
                     return await extract_from_chunks(
                         chunks, course_id, router, max_chunks=30,
                         progress_callback=_progress,
-                        # R4-4: pass kb.embed_fn so concept_embedding is
-                        # cached during upload, eliminating the lazy-compute
-                        # cost on the first GraphRAG /api/chat call.
                         embed_fn=kb.embed_fn,
                     )
 
                 extract_task = _asyncio.create_task(_extract_task())
-                # Drain the queue until extraction completes. Use wait()
-                # so we can flush any final events after the task ends.
                 while not extract_task.done():
                     try:
                         ev = await _asyncio.wait_for(kg_queue.get(), timeout=0.5)
-                        # Update current_stage from the event so the error
-                        # event reports the actual stage the extractor
-                        # was inside when it threw.
                         if isinstance(ev, dict) and ev.get("stage"):
                             current_stage = ev["stage"]
-                        yield _ndjson(ev)
+                            _set_stage(state, ev["stage"], int(ev.get("progress") or 0))
                     except _asyncio.TimeoutError:
                         continue
-                # fix-all v1 #A5: drain remaining events BEFORE awaiting
-                # the task (which re-raises on failure). Previously the
-                # exception path lost any final-event-just-queued frames.
+                # Drain any remaining frames BEFORE awaiting the task
+                # (which re-raises on failure) — same #A5 invariant as
+                # the streaming path.
                 while not kg_queue.empty():
                     try:
                         ev = kg_queue.get_nowait()
                         if isinstance(ev, dict) and ev.get("stage"):
                             current_stage = ev["stage"]
-                        yield _ndjson(ev)
+                            _set_stage(state, ev["stage"], int(ev.get("progress") or 0))
                     except _asyncio.QueueEmpty:
                         break
 
@@ -3236,10 +3415,9 @@ async def upload_files(
                 kg_path = config.ARTIFACTS_DIR / "courses" / course_id / "knowledge_graph.json"
                 await _asyncio.to_thread(kg.save, kg_path)
 
-                # review-swarm v2 MED-5 (2026-05-13): now that this course
-                # has a fresh knowledge_graph.json, bust the graphrag
+                # review-swarm v2 MED-5 (2026-05-13): bust the graphrag
                 # courses-with-KG cache so the next All Courses chat sees
-                # it immediately instead of waiting up to TTL=60s.
+                # the new course immediately.
                 try:
                     from nano_notebooklm.skills.qa_skill import (
                         _invalidate_courses_kg_cache,
@@ -3253,49 +3431,72 @@ async def upload_files(
                         type(exc).__name__,
                     )
 
-                # Done.
+                # Terminal success.
                 current_stage = None
                 duration_ms = int((time.monotonic() - t_start) * 1000)
-                # fix-all v1 #A11: one-line structured log for ops triage.
-                # Matches the `qa.path=` / `chunks.fetch course=` patterns
-                # elsewhere in this file.
                 logger.info(
                     "upload.done course=%s files=%d chunks=%d documents=%d kg_nodes=%d duration_ms=%d",
                     course_id, saved, len(chunks),
                     len(course_obj.documents) if course_obj else 0,
                     len(concepts), duration_ms,
                 )
-                yield _ndjson({
-                    "type": "done",
+                state["result"] = {
                     "course_id": course_id,
                     "files": saved,
                     "chunks": len(chunks),
                     "documents": len(course_obj.documents) if course_obj else 0,
                     "kg_nodes": len(concepts),
                     "duration_ms": duration_ms,
-                })
+                }
+                state["status"] = "done"
+                state["ended_at"] = time.time()
             except Exception:
                 # fix-all v4 #A3: stable error code, no vendor leakage.
-                # fix-all v1 #A3: attach actual failing stage so the
-                # frontend can mark the right row with ✕.
+                # fix-all v1 #A3: surface the actual failing stage.
                 duration_ms = int((time.monotonic() - t_start) * 1000)
                 logger.exception(
                     "upload.error course=%s stage=%s duration_ms=%d",
                     course_id, current_stage, duration_ms,
                 )
-                yield _ndjson({
-                    "type": "error",
-                    "error": "upload_pipeline_failed",
-                    "stage": current_stage,
-                })
+                state["error"] = "upload_pipeline_failed"
+                state["error_stage"] = current_stage
+                state["status"] = "error"
+                state["ended_at"] = time.time()
             finally:
-                # fix-all v1 #A1: opportunistic eviction when the dict
-                # exceeds the soft cap. Only runs at a quiescent point
-                # (we're about to release the lock), so this can't race
-                # with another acquirer.
                 _maybe_evict_upload_lock(course_id)
+    finally:
+        _maybe_evict_upload_tasks()
 
-    return StreamingResponse(_events(), media_type="application/x-ndjson")
+
+# Matches uuid.uuid4().hex — exactly 32 lowercase hex chars.
+_UUID_HEX_RE = re.compile(r"^[a-f0-9]{32}$")
+
+
+@app.get("/api/upload/status/{task_id}", tags=["ingest"],
+         summary="Poll the status of a background upload task",
+         response_model=UploadTaskStateResponse,
+         response_model_exclude_none=False)
+async def upload_status(task_id: str):
+    """Return the current TaskState snapshot for `task_id`.
+
+    Returns 400 for a malformed id (not 32 hex chars) and 404 for an
+    unknown or evicted task — same error envelope shape as the rest of
+    the API (via the FastAPI exception handler).
+
+    review-swarm M5 (2026-05-16): the response is filtered through
+    ``UploadTaskStateResponse`` (forbid-extra Pydantic model), so the
+    internal `saved_count` field is stripped before serialization.
+    """
+    if not _UUID_HEX_RE.fullmatch(task_id):
+        raise HTTPException(400, "Bad task_id")
+    tasks_dict = getattr(app.state, "upload_tasks", None) or _UPLOAD_TASKS
+    state = tasks_dict.get(task_id)
+    if state is None:
+        raise HTTPException(404, "Unknown or evicted task")
+    _maybe_evict_upload_tasks()
+    # Allow-list response shape via Pydantic; `saved_count` (internal
+    # progress counter) is intentionally not in the model.
+    return {k: v for k, v in state.items() if k != "saved_count"}
 
 
 # ── Chunks (Reader content) ──────────────────────────────────────────

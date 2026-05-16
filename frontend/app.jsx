@@ -261,6 +261,23 @@ function App() {
   // can't pass a closure through processing state (function identity
   // breaks; React DevTools complains; gc'd on rerender). Use a ref.
   const retryRef = useRef(null);
+  // Background-upload poll state: { iv, task_id, courseName } — the
+  // interval handle lives here so resume-on-mount + the runUpload caller
+  // can both clear it. Cleared on done / error / unmount.
+  const pollRef = useRef(null);
+  // review-swarm H2 (2026-05-16): App unmount cleanup. The root <App/>
+  // rarely unmounts in production, but React.StrictMode double-mount
+  // (dev), HMR reloads, and a future Vite migration would otherwise
+  // leak the 1.5s setInterval — the orphaned closure keeps calling
+  // setProcessing on a defunct tree and hammering /api/upload/status
+  // indefinitely. Empty dep array so the cleanup fires only on real
+  // unmount, not on every render.
+  useEffect(() => () => {
+    if (pollRef.current) {
+      try { clearInterval(pollRef.current.iv); } catch { /* nop */ }
+      pollRef.current = null;
+    }
+  }, []);
   // review-swarm v2 fix-now #2: the sources-load effect now lists
   // hiddenCourseIds in its dep array (for the All-Courses recompute).
   // In specific-course mode, hiddenCourseIds-only changes were also
@@ -413,9 +430,102 @@ function App() {
       const hidden = new Set(StudyState.loadHiddenCourses(localStorage));
       const firstVisible = merged.find(c => !hidden.has(c.id));
       if (firstVisible) setActiveCourse(firstVisible.id);
+      // Resume-on-mount: a pending upload-task entry in localStorage
+      // means a previous page-load started an upload that the
+      // background task may still be processing. Probe each course's
+      // pending task; mount the processing modal for the (single)
+      // course we activate, evict completed/dead entries for others.
+      _resumePendingUploads(merged, firstVisible ? firstVisible.id : null);
     }).catch(() => {});
     API.getStatus().then(setBackendStatus).catch(() => {});
   }, []);
+
+  // Mount-time resume of background uploads. Single modal at a time:
+  // only the active course's pending task triggers the processing UI.
+  // Other courses' pending tasks are polled once and pruned if the
+  // server has forgotten / finished them, but no modal is mounted.
+  async function _resumePendingUploads(courseList, activeId) {
+    const candidates = [];
+    for (const c of courseList) {
+      const key = `nano-nlm:v1:upload-task:${c.id}`;
+      let raw;
+      try { raw = localStorage.getItem(key); } catch { continue; }
+      if (!raw) continue;
+      let parsed;
+      try { parsed = JSON.parse(raw); } catch { try { localStorage.removeItem(key); } catch {} continue; }
+      if (!parsed || !parsed.task_id) {
+        try { localStorage.removeItem(key); } catch {}
+        continue;
+      }
+      candidates.push({ courseId: c.id, ...parsed });
+    }
+    if (!candidates.length) return;
+    for (const cand of candidates) {
+      const isActive = cand.courseId === activeId;
+      let s;
+      try { s = await API.getUploadStatus(cand.task_id); }
+      catch { continue; /* transient — try again on next mount */ }
+      if (!s) {
+        try { localStorage.removeItem(`nano-nlm:v1:upload-task:${cand.courseId}`); } catch {}
+        continue;
+      }
+      if (s.status === "done" || s.status === "error") {
+        try { localStorage.removeItem(`nano-nlm:v1:upload-task:${cand.courseId}`); } catch {}
+        continue;
+      }
+      if (!isActive) {
+        // review-swarm H3 (2026-05-16): non-active in-flight candidate.
+        // Don't mount a modal (single-modal invariant), but schedule a
+        // lightweight one-shot recheck so the localStorage key gets
+        // cleaned up when the server-side task eventually terminates.
+        // 90s strikes a balance for MinerU's ~10-30 min pipelines —
+        // most uploads complete within 1-2 rechecks; in the worst case
+        // the user just sees a slightly stale key until their next
+        // visit to that course (resume runs again on mount).
+        _scheduleInactiveUploadCleanup(cand.courseId, cand.task_id);
+        continue;
+      }
+      // Active course has an in-flight task — mount the processing modal
+      // and start polling. retryPayload is null because original File
+      // objects are gone from JS memory after reload.
+      setProcessing({
+        file: (cand.file_names && cand.file_names[0]) || "uploading...",
+        step: 0,
+        stages: s.stages,
+        errorStage: s.error_stage,
+        errorMsg: s.error,
+        done: false,
+        retryPayload: null,
+      });
+      _startUploadPolling(cand.task_id, cand.courseId);
+    }
+  }
+
+  // review-swarm H3 (2026-05-16): for in-flight uploads on non-active
+  // courses, poll once every 90s with no UI side effects. On terminal
+  // status (done / error / 404), drop the localStorage hint so future
+  // mounts don't show a stale entry. Self-clears on terminal or after
+  // ~15 min ceiling (10 attempts × 90s). Cap protects against an
+  // accidentally-stuck task pinning the timer forever.
+  function _scheduleInactiveUploadCleanup(courseId, task_id) {
+    const key = `nano-nlm:v1:upload-task:${courseId}`;
+    let attempts = 0;
+    const MAX_ATTEMPTS = 10;
+    const tick = async () => {
+      attempts += 1;
+      let s = null;
+      try { s = await API.getUploadStatus(task_id); }
+      catch { /* transient — try again */ }
+      // 404 (s === null) or terminal → cleanup.
+      if (s === null || (s && (s.status === "done" || s.status === "error"))) {
+        try { localStorage.removeItem(key); } catch { /* nop */ }
+        return;
+      }
+      if (attempts >= MAX_ATTEMPTS) return; // ceiling — give up silently
+      setTimeout(tick, 90000);
+    };
+    setTimeout(tick, 90000);
+  }
 
   useEffect(() => {
     // fix-all v1 #V6 (R4-5 review v1): ±20% jitter so concurrent tabs
@@ -1120,8 +1230,101 @@ function App() {
     await handleGenerateNotes();
   }
 
+  // Background-upload polling helper. Used by both onStartUpload (fresh
+  // upload) and the mount-time resume effect (page reload mid-upload).
+  // Polls /api/upload/status/{task_id} every 1.5s; on done | error,
+  // clears the interval + localStorage entry. Transient network errors
+  // are swallowed so a brief blip doesn't kill the modal.
+  function _startUploadPolling(task_id, courseName) {
+    if (pollRef.current) {
+      try { clearInterval(pollRef.current.iv); } catch { /* nop */ }
+      pollRef.current = null;
+    }
+    // review-swarm M2 (2026-05-16): track consecutive failures so a
+    // sustained 5xx outage doesn't spam the endpoint at 40 req/min
+    // forever. After MAX consecutive transient errors, surface a
+    // transport error and stop polling — the user can retry manually.
+    let warned = false;
+    let failures = 0;
+    const MAX_FAILURES = 10;
+    const iv = setInterval(async () => {
+      let s;
+      try {
+        s = await API.getUploadStatus(task_id);
+      } catch (e) {
+        failures += 1;
+        if (!warned) {
+          warned = true;
+          if (typeof console !== "undefined") {
+            console.warn("upload status poll transient error:", e && e.message);
+          }
+        }
+        if (failures >= MAX_FAILURES) {
+          clearInterval(iv);
+          pollRef.current = null;
+          setProcessing(p => p ? { ...p, errorStage: "transport", errorMsg: "状态轮询连续失败，请稍后重试" } : null);
+        }
+        return;
+      }
+      failures = 0;
+      if (!s) {
+        // 404 — server lost the task (eviction / restart). Drop the
+        // localStorage trace and surface an error.
+        clearInterval(iv);
+        pollRef.current = null;
+        try { localStorage.removeItem(`nano-nlm:v1:upload-task:${courseName}`); } catch { /* nop */ }
+        setProcessing(p => p ? { ...p, errorStage: "transport", errorMsg: "上传任务已不可恢复，请重试" } : null);
+        return;
+      }
+      warned = false;
+      setProcessing(p => p ? {
+        ...p,
+        stages: s.stages || p.stages,
+        done: s.status === "done",
+        errorStage: s.error_stage || (s.status === "error" ? "unknown" : null),
+        errorMsg: s.error || null,
+      } : p);
+      if (s.status === "done" || s.status === "error") {
+        clearInterval(iv);
+        pollRef.current = null;
+        try { localStorage.removeItem(`nano-nlm:v1:upload-task:${courseName}`); } catch { /* nop */ }
+        // Refresh course list (chunks may have landed even on KG-stage
+        // error) and activate the new course on success.
+        try {
+          const data = await API.getCourses(courseModeRef.current);
+          const crs = data.courses || [];
+          let merged = crs;
+          if (courseModeRef.current !== "all") {
+            try {
+              const cachedIds = StudyState.findCoursesWithCache(localStorage);
+              const known = new Set(crs.map(c => c.id));
+              const extras = cachedIds
+                .filter(cid => !known.has(cid))
+                .map(cid => ({ id: cid, name: cid, auto_resurfaced: true }));
+              if (extras.length) merged = crs.concat(extras);
+            } catch { /* nop */ }
+          }
+          setCourses(merged);
+          if (s.status === "done") {
+            setActiveCourse(courseName);
+          }
+        } catch { /* best-effort refresh */ }
+      }
+    }, 1500);
+    pollRef.current = { iv, task_id, courseName };
+  }
+
   function onStartUpload() {
     if (uploading) return;
+    // review-swarm M1 (2026-05-16): a double-click on the upload button
+    // would otherwise post a second upload immediately, overwrite the
+    // localStorage key with the new task_id, and leave the first task
+    // orphaned (still running server-side, never visible to the user).
+    // Block while a modal is mounted and not yet terminal.
+    if (processing && !processing.done && !processing.errorStage) {
+      try { console.warn("upload already in flight — ignoring duplicate trigger"); } catch {}
+      return;
+    }
     // Ask for course name first
     const existingNames = courses.map(c => c.name).join(", ");
     const defaultName = activeCourse || "";
@@ -1146,16 +1349,18 @@ function App() {
     const chosenEngine = wantMineru ? "mineru" : "pymupdf";
     if (chosenEngine !== uploadEngine) commitUploadEngine(chosenEngine);
 
-    // fix-all v1 #A6: capture files in a closure so the retry button can
-    // actually re-invoke the upload with the same payload (previously
-    // onRetry={setProcessing(null)} only dismissed the modal — user
-    // had to re-pick files manually).
+    // Background-task upload (2026-05-16): POST returns {task_id} immediately,
+    // then a 1.5s setInterval polls /api/upload/status/{task_id} until
+    // status === "done" | "error". localStorage tracks the active task so a
+    // tab reload can resume the polling without losing the modal.
     const runUpload = async (files) => {
       setUploading({ name: files[0].name + (files.length > 1 ? ` (+${files.length - 1})` : ""), pct: 0 });
+      // Old-style fake progress for the topbar chip — done in ~3s so the
+      // chip dismisses even though the background task may still run.
       let pct = 0;
-      const iv = setInterval(() => {
+      const fakeIv = setInterval(() => {
         pct += 6;
-        if (pct >= 90) { clearInterval(iv); setUploading(prev => prev ? { ...prev, pct: 90 } : null); }
+        if (pct >= 90) { clearInterval(fakeIv); setUploading(prev => prev ? { ...prev, pct: 90 } : null); }
         else { setUploading(prev => prev ? { ...prev, pct } : null); }
       }, 200);
 
@@ -1163,58 +1368,26 @@ function App() {
         setProcessing({
           file: files[0].name,
           step: 0,
-          stages: { chunking: 0, embedding: 0, kg_stage_a: 0, kg_stage_b: 0 },
+          stages: { chunking: { progress: 0 }, embedding: { progress: 0 }, kg_stage_a: { progress: 0 }, kg_stage_b: { progress: 0 } },
           errorStage: null,
           errorMsg: null,
           done: false,
           retryPayload: files,
         });
-        const final = await API.uploadFiles(courseName, files, (ev) => {
-          if (!ev) return;
-          if (ev.type === "stage") {
-            setProcessing(p => p ? {
-              ...p,
-              stages: { ...(p.stages || {}), [ev.stage]: ev.progress },
-            } : p);
-          } else if (ev.type === "done") {
-            setProcessing(p => p ? { ...p, done: true } : p);
-          } else if (ev.type === "error") {
-            setProcessing(p => p ? { ...p, errorStage: ev.stage || "unknown", errorMsg: ev.error } : p);
-          }
-        }, { engine: chosenEngine, lang: "ch" });
-        clearInterval(iv);
-        setUploading(null);
-        // fix-all v1 #A7: even on error, refresh courses so the
-        // partially-ingested course (chunks landed before KG failed) is
-        // visible in the dropdown — the test
-        // `test_upload_stream_extractor_failure_emits_error_event` proves
-        // chunks survive the extractor crash, but without this refresh
-        // the user could never reach them.
+        const { task_id } = await API.startUpload(courseName, files, { engine: chosenEngine, lang: "ch" });
         try {
-          const data = await API.getCourses(courseModeRef.current);
-          // Apply the same resurfacing as the mount-time courses load so
-          // the post-upload refresh keeps any cached-preset entries
-          // visible. Without this, an upload would re-fetch courses and
-          // drop the resurfaced rows from the dropdown.
-          const crs = data.courses || [];
-          let merged = crs;
-          if (courseModeRef.current !== "all") {
-            try {
-              const cachedIds = StudyState.findCoursesWithCache(localStorage);
-              const known = new Set(crs.map(c => c.id));
-              const extras = cachedIds
-                .filter(cid => !known.has(cid))
-                .map(cid => ({ id: cid, name: cid, auto_resurfaced: true }));
-              if (extras.length) merged = crs.concat(extras);
-            } catch { /* same fallback as mount */ }
-          }
-          setCourses(merged);
-          if (!final || final.type !== "error") {
-            setActiveCourse(courseName);
-          }
-        } catch { /* best-effort refresh */ }
+          localStorage.setItem(
+            `nano-nlm:v1:upload-task:${courseName}`,
+            JSON.stringify({ task_id, started_at: Date.now(), file_names: Array.from(files).map(f => f.name) })
+          );
+        } catch { /* localStorage flaky / quota; in-memory state still drives the UI */ }
+
+        clearInterval(fakeIv);
+        setUploading(null);
+
+        _startUploadPolling(task_id, courseName);
       } catch (err) {
-        clearInterval(iv);
+        clearInterval(fakeIv);
         setUploading(null);
         setProcessing(p => p ? { ...p, errorStage: "transport", errorMsg: err.message } : null);
       }
@@ -1613,13 +1786,18 @@ function App() {
               done={processing.done}
               onRetry={() => {
                 // fix-all v1 #A6: re-invoke upload with the SAME files
-                // captured at onStartUpload time. Falls back to closing
-                // the modal if the retry handler isn't wired (e.g. page
-                // reload between original click and retry).
+                // captured at onStartUpload time. After a tab reload
+                // (resume-on-mount path) retryPayload is null because
+                // File objects don't survive JSON serialization — fall
+                // through to a dismiss + user-facing toast so the user
+                // knows they need to re-pick files.
                 if (retryRef.current && processing.retryPayload) {
                   retryRef.current(processing.retryPayload);
                 } else {
                   setProcessing(null);
+                  try {
+                    alert("原始文件已不在内存中（页面已刷新）。请重新选择文件并上传。");
+                  } catch { /* nop */ }
                 }
               }}
             />

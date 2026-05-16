@@ -31,7 +31,8 @@ api/server.py      FastAPI backend — REST API + static file serving
   ├── /api/report         Course report generation
   ├── /api/mindmap/{id}        Two-stage KG extraction + user-edit overlay
   ├── /api/mindmap/{id}/edit   Apply student ops (add/update/delete/connect)
-  ├── /api/upload/{id}    File upload + 4-stage NDJSON-streamed ingest (50MB cap, whitelisted suffixes)
+  ├── /api/upload/{id}    File upload — background-task pipeline: validates + saves files, returns {task_id, course_id} immediately; 4-stage ingest (chunking → embedding → kg_stage_a → kg_stage_b) runs as asyncio.create_task. 50MB cap, whitelisted suffixes.
+  ├── /api/upload/status/{task_id}  Poll TaskState snapshot (status, per-stage progress, result|error). 400 on malformed id, 404 on unknown/evicted.
   ├── /api/memory         User memory persistence
   ├── /api/courses        Course listing (mode=user|all; user hides preset courses by default)
   ├── /api/status         Backends + usage + embedding mode
@@ -84,6 +85,14 @@ nano_notebooklm/   Python backend modules
   Any future global-pref key should follow the same flat shape and be
   listed here.
 
+  **Per-course upload resume**: `nano-nlm:v1:upload-task:<courseId>` →
+  `{task_id, started_at, file_names}` written on `API.startUpload` and
+  removed on terminal (done/error) or unknown-task 404. On `app.jsx`
+  mount, the resume helper polls each pending course's `task_id` via
+  `getUploadStatus`; for the active course it remounts `<Processing/>`
+  and restarts polling at 1.5s. Files themselves are NOT persisted —
+  retry-after-reload prompts to re-pick files.
+
 ## Course Data
 
 8 courses ingested from `/Users/arthuryang/Desktop/大三学习/NLPProject/`:
@@ -92,6 +101,88 @@ nano_notebooklm/   Python backend modules
   `GET /api/status` (returns `total_chunks`).
 
 ## Maturity Notes
+
+- **Upload background-task pipeline (2026-05-16)**: `POST /api/upload/{cid}`
+  no longer streams NDJSON — it validates files + saves to disk
+  synchronously (HTTPException 4xx on failure, identical pre-stream
+  guards), then registers a TaskState dict + spawns
+  `asyncio.create_task(_run_upload_pipeline(...))` and returns
+  `{task_id, course_id}` immediately. The 4-stage pipeline (chunking →
+  embedding → kg_stage_a → kg_stage_b) mutates the state in place;
+  client polls `GET /api/upload/status/{task_id}` at ~1.5s for the
+  snapshot. Per-course `_upload_lock_for` is acquired INSIDE the
+  background task so two POSTs for the same course id both return their
+  task_id immediately; the second stays `status="waiting"` until the
+  first completes. TaskState shape: `{task_id, course_id, started_at,
+  ended_at, status: "waiting"|"running"|"done"|"error", stages: {<name>:
+  {progress, detail}}, result, error, error_stage, file_names,
+  saved_count}`. Registry `_UPLOAD_TASKS` is in-memory only with 1h TTL
+  + 512-entry cap, evicted via `_maybe_evict_upload_tasks()` (oldest
+  ended drops first, running tasks never evicted). Strong-ref set
+  `_UPLOAD_TASK_OBJECTS` holds the Task object so Python can't GC the
+  coroutine mid-pipeline.
+  **Server restart drops in-flight tasks** — polling a recycled
+  task_id returns 404, frontend surfaces "上传任务已不可恢复" and
+  prompts re-upload. No disk persistence by design (single-user,
+  rare restart; complexity vs benefit didn't pencil out). Tab close
+  does NOT cancel; on tab reopen, `app.jsx`'s resume-on-mount reads
+  `localStorage["nano-nlm:v1:upload-task:<courseId>"]` and re-polls
+  for active courses. Tests: 17 in `tests/test_upload_task.py` + 13
+  in `tests/test_r4_2_fix_all_v1.py` migrated from NDJSON to snapshot
+  contract; pytest uses `TestClient(app) as client` (context manager)
+  so ASGI lifespan fires and `asyncio.create_task` actually runs
+  between requests. Without the context-manager form the bg task
+  hangs at the first await — a sharp footgun pinned by the
+  fixture's docstring.
+
+- **Upload background-task review-swarm fix-all v1 (2026-05-16)**:
+  4-route review on the initial commit found 3 HIGH + 6 MED + 6 LOW;
+  all 3 HIGH + 6 MED + the safety LOW landed. Highlights:
+  - **H1** `state["file_names"]` now reuses `_safe_upload_name(...)`
+    instead of raw `Path(f.filename).name` — closes a divergence
+    where RTL bidi / control chars / oversized client filenames could
+    land in the status response (React JSX escape blocked XSS but not
+    visual spoofing). Pinned by `test_upload_file_names_are_sanitized`.
+  - **H2** `pollRef` App-unmount cleanup via `useEffect(() => () =>
+    clearInterval(...), [])` — protects against StrictMode double-
+    mount, HMR, and the planned Vite migration leaking 1.5s polls.
+    Pinned by `test_app_jsx_pollref_app_unmount_cleanup`.
+  - **H3** non-active in-flight upload candidates now get
+    `_scheduleInactiveUploadCleanup(course, task_id)` (90s × 10
+    attempts ceiling, fire-and-forget, removes the localStorage key
+    on terminal status). Previously the key persisted forever for
+    courses the user didn't switch back to. Pinned in lifecycle test.
+  - **M1** `onStartUpload` double-click guard: `if (processing &&
+    !processing.done && !processing.errorStage) return`. Prevents
+    a 2nd POST from orphaning the 1st task's localStorage key.
+  - **M2** poll cutoff at `MAX_FAILURES=10` consecutive transient
+    errors → surface `errorStage: "transport"` and stop. Single-user
+    scale never hit retry storms, but pins the contract for future
+    multi-user / fragile-network deploys.
+  - **M3** new Pydantic `UploadStartResponse` + `UploadTaskStateResponse`
+    + `UploadStageStatus` + `UploadResultPayload` with `Literal[
+    "waiting","running","done","error"]` + `extra="forbid"`. The two
+    new endpoints carry `response_model=...` consistent with the rest
+    of the file. OpenAPI / `/docs` now shows a real schema.
+  - **M5** status endpoint allow-list strips internal `saved_count`
+    field before returning. Pinned by
+    `test_upload_status_response_excludes_saved_count`.
+  - **M6** new `@app.on_event("startup") _warn_multi_worker_unsafe`
+    hook checks `WEB_CONCURRENCY` env. Multi-worker uvicorn deploys
+    surface a loud `logger.warning` instead of silently 404'ing
+    cross-worker status polls.
+  - **M4** test coverage gaps:
+    `test_upload_task_eviction_cap_drops_oldest_ended_first` (Pass 2
+    of `_maybe_evict_upload_tasks`), `test_upload_task_strong_ref_set
+    _keeps_pipeline_alive` (real `gc.collect()` + completion poll +
+    source grep so a future refactor that drops the `.add(...)` line
+    breaks loudly), `test_app_jsx_localstorage_upload_task_lifecycle`
+    (write + remove + read all pinned, not just key-string presence).
+  - Test counts: **8 new** (4 backend + 4 frontend);
+    `tests/test_upload_task.py` 17 → 21, `tests/test_frontend_helpers.py`
+    62 → 66, sweep total 1138 → **1146 passed**, same 3 pre-existing
+    fails (mineru sample / qwen fallback / mindmap alphaTarget — all
+    documented).
 
 - API: input validation via Pydantic with strip-then-validate (whitespace-only
   → 422), 422 errors return `{error: "validation_error", request_id, detail}`.
