@@ -246,3 +246,88 @@ def test_extract_pdf_mineru_raises_when_cli_missing(monkeypatch, tmp_path):
 def test_extract_pdf_mineru_raises_when_pdf_missing(tmp_path):
     with pytest.raises(FileNotFoundError):
         extract_pdf_mineru(tmp_path / "does_not_exist.pdf")
+
+
+
+# ── review-swarm fix-all v1: H3 env scrub, H6 caption escape ────────
+
+
+def test_render_image_caption_with_link_break_is_escaped():
+    """H6 fix: an adversarial caption like `](javascript:...)` must not
+    be able to close the markdown link and inject content. We don't
+    drop the literal "javascript:" text (it's still part of the caption
+    *content*), but the `]` and `[` MUST be escaped so a markdown parser
+    sees a single link, not two."""
+    from nano_notebooklm.ingest.extractors_mineru import _render_block
+    out = _render_block({
+        "type": "image",
+        "img_path": "images/x.jpg",
+        "image_caption": ["alt](javascript:alert(1))"],
+    })
+    # The closing `]` in the adversarial caption must be backslash-escaped.
+    assert "\\]" in out, f"caption ']' not escaped: {out!r}"
+    # No fully-formed second `](` link-syntax close (i.e. the link must
+    # end at the real, unescaped `](`).
+    real_link_closes = sum(
+        1 for i in range(len(out) - 1)
+        if out[i] == "]" and out[i + 1] == "(" and (i == 0 or out[i - 1] != "\\")
+    )
+    assert real_link_closes == 1, f"caption broke out of markdown link: {out!r}"
+
+
+def test_render_image_dangerous_scheme_dropped():
+    """H6 fix: img_path with javascript:/data:/vbscript:/file: schemes
+    drops the link entirely, retaining only the caption text."""
+    from nano_notebooklm.ingest.extractors_mineru import _render_block
+    for scheme in ("javascript:alert(1)", "data:text/html,<script>", "vbscript:msg",
+                   "file:///etc/passwd"):
+        out = _render_block({
+            "type": "image",
+            "img_path": scheme,
+            "image_caption": ["caption"],
+        })
+        assert scheme not in out, f"dangerous scheme {scheme!r} leaked: {out!r}"
+
+
+def test_render_image_relative_path_preserved():
+    """H6 fix: legitimate relative `images/<sha>.jpg` paths stay as-is."""
+    from nano_notebooklm.ingest.extractors_mineru import _safe_markdown_image
+    out = _safe_markdown_image("Figure 1", "images/abc.jpg")
+    assert out == "![Figure 1](images/abc.jpg)"
+
+
+def test_build_mineru_env_scrubs_credentials():
+    """H3 fix: subprocess env must NOT include OPENAI/ANTHROPIC/AWS keys."""
+    import os
+    from nano_notebooklm.ingest.extractors_mineru import _build_mineru_env
+    # Inject fake creds into our env
+    os.environ["OPENAI_API_KEY"] = "sk-secret-12345"
+    os.environ["ANTHROPIC_API_KEY"] = "sk-ant-secret"
+    os.environ["AWS_SECRET_ACCESS_KEY"] = "AWS-deadbeef"
+    try:
+        env = _build_mineru_env(device="cpu")
+        assert "OPENAI_API_KEY" not in env
+        assert "ANTHROPIC_API_KEY" not in env
+        assert "AWS_SECRET_ACCESS_KEY" not in env
+        # but functional env should be there
+        assert "PATH" in env
+        assert env["MINERU_DEVICE_MODE"] == "cpu"
+    finally:
+        for k in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "AWS_SECRET_ACCESS_KEY"):
+            os.environ.pop(k, None)
+
+
+def test_build_mineru_env_keeps_proxy_and_hf_cache():
+    """H3 fix: proxy + huggingface cache env vars are on the allowlist
+    (mineru needs them to download models)."""
+    import os
+    from nano_notebooklm.ingest.extractors_mineru import _build_mineru_env
+    os.environ["HTTPS_PROXY"] = "http://127.0.0.1:7890"
+    os.environ["HF_HOME"] = "/tmp/hf"
+    try:
+        env = _build_mineru_env(device="cpu")
+        assert env.get("HTTPS_PROXY") == "http://127.0.0.1:7890"
+        assert env.get("HF_HOME") == "/tmp/hf"
+    finally:
+        for k in ("HTTPS_PROXY", "HF_HOME"):
+            os.environ.pop(k, None)

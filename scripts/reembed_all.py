@@ -30,6 +30,80 @@ def log(msg: str) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
+def _embed_parallel_api(texts: list[str], config) -> "np.ndarray":
+    """Parallel API embedding driver (R5 step C; M1+M3 fixes).
+
+    Bypasses kb/store.py's serial `_build_api_embed_fn`: drives the
+    OpenAI client directly with ThreadPoolExecutor for ~10x speedup
+    on text-embedding-3-large via codex proxy. Only called when
+    EMBEDDING_MODE=api (M1 guard in main()).
+
+    M3 fix (review-swarm fix-all v1): when codex proxy throws 429 on
+    one of the 8 concurrent requests, the openai client's default
+    `max_retries=2` triggers near-simultaneous retries on all stalled
+    threads, hammering the proxy harder. We disable client-internal
+    retry (`max_retries=0`) and wrap each call in a tenacity-style
+    decorrelated exponential backoff (2-60s + ±20% jitter), so
+    retries spread out across threads instead of synchronising.
+    """
+    import random
+    import numpy as np
+    import openai
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    client = openai.OpenAI(
+        api_key=config.OPENAI_API_KEY,
+        base_url=config.OPENAI_BASE_URL,
+        max_retries=0,           # M3: don't let the SDK retry; we do it ourselves with jitter
+    )
+    batch_size = 256
+    concurrency = 8
+    n_batches = (len(texts) + batch_size - 1) // batch_size
+    log(f"Embedding {len(texts)} chunks in {n_batches} batches of {batch_size} "
+        f"(concurrency={concurrency}, max_retries via app-level jittered backoff)")
+
+    def _embed_one(idx_and_batch):
+        idx, batch = idx_and_batch
+        t_start = time.time()
+        # M3: decorrelated exponential backoff with ±20% jitter on 429/5xx.
+        # Max 4 attempts → up to 2+4+8 = 14s worst-case before failing.
+        last_exc: Exception | None = None
+        for attempt in range(4):
+            try:
+                resp = client.embeddings.create(model=config.EMBEDDING_MODEL, input=batch)
+                break
+            except (openai.RateLimitError, openai.APIStatusError, openai.APITimeoutError) as exc:
+                last_exc = exc
+                if attempt == 3:
+                    raise
+                base = 2 ** attempt   # 1, 2, 4, 8
+                wait = base * (1 + (random.random() - 0.5) * 0.4)  # ±20% jitter
+                log(f"  ! batch {idx+1} attempt {attempt+1} hit "
+                    f"{type(exc).__name__}; sleeping {wait:.1f}s")
+                time.sleep(wait)
+        arr = np.asarray([d.embedding for d in resp.data], dtype=np.float32)
+        norms = np.linalg.norm(arr, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        return idx, arr / norms, time.time() - t_start
+
+    batches = [(i // batch_size, texts[i : i + batch_size])
+               for i in range(0, len(texts), batch_size)]
+    results: dict[int, np.ndarray] = {}
+    t0 = time.time()
+    completed = 0
+    with ThreadPoolExecutor(max_workers=concurrency) as ex:
+        for idx, arr, dur in (
+            f.result() for f in as_completed(ex.submit(_embed_one, b) for b in batches)
+        ):
+            results[idx] = arr
+            completed += 1
+            chunks_done = completed * batch_size
+            elapsed = time.time() - t0
+            log(f"  · batch {idx+1}/{n_batches} ({dur:.1f}s req) · "
+                f"elapsed {elapsed:.1f}s · {chunks_done/elapsed:.0f} chunks/s")
+    return np.vstack([results[i] for i in range(n_batches)])
+
+
 def main() -> None:
     from nano_notebooklm import config
     log(f"EMBEDDING_MODE={config.EMBEDDING_MODE} EMBEDDING_MODEL={config.EMBEDDING_MODEL}")
@@ -73,54 +147,22 @@ def main() -> None:
 
     embed_fn = kb.embed_fn
     texts = [c.text for c in chunks]
-    # R5 step C (2026-05-16): the default _build_api_embed_fn in
-    # kb/store.py is fully serial — one HTTP request after another, no
-    # concurrency. With text-embedding-3-large on the codex proxy each
-    # 64-input request takes 60-120s, so 10k chunks at inner batch=64
-    # serial = 3.3 hours. We bypass it here and drive the OpenAI client
-    # directly with a ThreadPoolExecutor + larger inner batches. The
-    # main code path is untouched (ingest still goes through embed_fn
-    # the normal way; only this one-shot rebuild uses the parallel path).
-    import openai
-    from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    client = openai.OpenAI(api_key=config.OPENAI_API_KEY, base_url=config.OPENAI_BASE_URL)
-    batch_size = 256          # OpenAI limit: 2048 inputs per call. 256 keeps
-                              # per-call body small enough that codex proxy
-                              # rarely OOMs / times out.
-    concurrency = 8           # 8 parallel inflight requests. codex proxy
-                              # has been tested up to 8 without 429s.
-    n_batches = (len(texts) + batch_size - 1) // batch_size
-    log(f"Embedding {len(texts)} chunks in {n_batches} batches of {batch_size} "
-        f"(concurrency={concurrency})…")
-
-    def _embed_one(idx_and_batch):
-        idx, batch = idx_and_batch
-        t_start = time.time()
-        resp = client.embeddings.create(model=config.EMBEDDING_MODEL, input=batch)
-        arr = np.asarray([d.embedding for d in resp.data], dtype=np.float32)
-        # L2-normalize so FAISS inner-product == cosine
-        norms = np.linalg.norm(arr, axis=1, keepdims=True)
-        norms[norms == 0] = 1.0
-        return idx, arr / norms, time.time() - t_start
-
-    batches = [(i // batch_size, texts[i : i + batch_size])
-               for i in range(0, len(texts), batch_size)]
-    results: dict[int, np.ndarray] = {}
-    t0 = time.time()
-    completed = 0
-    with ThreadPoolExecutor(max_workers=concurrency) as ex:
-        for idx, arr, dur in (
-            f.result() for f in as_completed(ex.submit(_embed_one, b) for b in batches)
-        ):
-            results[idx] = arr
-            completed += 1
-            chunks_done = completed * batch_size
-            elapsed = time.time() - t0
-            log(f"  · batch {idx+1}/{n_batches} ({dur:.1f}s req) · "
-                f"elapsed {elapsed:.1f}s · {chunks_done/elapsed:.0f} chunks/s")
-    embeddings = np.vstack([results[i] for i in range(n_batches)])
-    log(f"Embeddings ready: {embeddings.shape} in {time.time()-t0:.1f}s")
+    # M1 fix (review-swarm fix-all v1): only the API path supports
+    # parallel HTTP. In local mode `kb.embed_fn` runs a sentence-
+    # transformer that ignores OPENAI_API_KEY; bypassing it via
+    # ThreadPoolExecutor + openai.OpenAI would silently switch the
+    # script to codex proxy, produce dim-mismatched vectors, and
+    # corrupt FAISS. Guard explicitly: parallel only when API mode.
+    if config.EMBEDDING_MODE != "api":
+        log(f"EMBEDDING_MODE={config.EMBEDDING_MODE} — using serial embed_fn (no parallel path)")
+        import numpy as np
+        embeddings = embed_fn(texts)
+        embeddings = np.asarray(embeddings, dtype=np.float32)
+        log(f"Embeddings ready: {embeddings.shape}")
+    else:
+        embeddings = _embed_parallel_api(texts, config)
+        log(f"Embeddings ready: {embeddings.shape}")
 
     vector = VectorIndex(embed_fn)
     vector.chunks = list(chunks)

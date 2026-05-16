@@ -18,7 +18,7 @@ from nano_notebooklm.ingest.incremental import ChangeSet, detect_changes, save_h
 from nano_notebooklm.kb.bm25_index import BM25Index
 from nano_notebooklm.kb.hybrid_search import HybridSearch
 from nano_notebooklm.kb.vector_index import VectorIndex
-from nano_notebooklm.types import Chunk, Course, Document, SearchResult
+from nano_notebooklm.types import Chunk, Course, Document, FileType, PageInfo, SearchResult
 from nano_notebooklm.utils.file_hash import sha256_file
 
 logger = logging.getLogger(__name__)
@@ -163,7 +163,18 @@ class KBStore:
         changeset = detect_changes(files, course_dir, hash_cache)
 
         engine_marker = course_artifacts / ".extract_engine"
-        prev_engine = engine_marker.read_text().strip() if engine_marker.exists() else "pymupdf"
+        # R5 fix (review-swarm fix-all v1): a corrupted (non-utf-8 / partial
+        # write) marker shouldn't abort the whole ingest. Fall through to
+        # default and re-extract; the marker will be overwritten cleanly.
+        try:
+            prev_engine = (
+                engine_marker.read_text().strip() if engine_marker.exists() else "pymupdf"
+            )
+        except (OSError, UnicodeDecodeError):
+            logger.warning(
+                "engine marker at %s is corrupted; treating as pymupdf", engine_marker
+            )
+            prev_engine = "pymupdf"
         engine_changed = prev_engine != engine
 
         if not changeset.has_changes and not engine_changed and (course_artifacts / "chunks.json").exists():
@@ -175,11 +186,46 @@ class KBStore:
         all_chunks: list[Chunk] = []
         doc_ids: list[str] = []
 
+        # H5 fix (review-swarm fix-all v1): if engine=mineru, batch ALL
+        # PDFs through a single mineru subprocess instead of per-file.
+        # Saves the ~50s model-load overhead for every extra PDF beyond
+        # the first. Non-PDF files (pptx/docx/md/txt) still go through
+        # extract_file individually since they don't use mineru anyway.
+        mineru_batch_results: dict[str, list[PageInfo]] = {}
+        if engine == "mineru":
+            pdf_files = [f for f in files if f.suffix.lower() == ".pdf"]
+            if pdf_files:
+                from nano_notebooklm.ingest.extractors_mineru import (
+                    extract_pdfs_mineru_batch,
+                    MinerUExtractionError,
+                )
+                logger.info(
+                    "mineru engine: batch-extracting %d PDFs in one subprocess",
+                    len(pdf_files),
+                )
+                try:
+                    mineru_batch_results = extract_pdfs_mineru_batch(
+                        [str(p) for p in pdf_files], lang=lang,
+                    )
+                except (MinerUExtractionError, FileNotFoundError) as exc:
+                    # Batch failed wholesale → fall back to per-file
+                    # extraction below (which may itself crash per-file,
+                    # but at least one bad PDF won't take the others down).
+                    logger.warning(
+                        "mineru batch failed (%s); falling back to per-file extraction",
+                        type(exc).__name__,
+                    )
+
         with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}")) as progress:
             task = progress.add_task(f"Ingesting {course_id}...", total=len(files))
             for filepath in files:
                 try:
-                    pages, file_type = extract_file(filepath, engine=engine, lang=lang)
+                    pages: list[PageInfo] | None = None
+                    if engine == "mineru" and filepath.suffix.lower() == ".pdf":
+                        pages = mineru_batch_results.get(str(filepath.resolve()))
+                        file_type = FileType.PDF
+                    if pages is None:
+                        pages, file_type = extract_file(filepath, engine=engine, lang=lang)
                     if not pages:
                         progress.advance(task)
                         continue
@@ -207,11 +253,19 @@ class KBStore:
         with open(chunks_path, "w", encoding="utf-8") as f:
             json.dump([c.model_dump() for c in all_chunks], f, ensure_ascii=False, default=str)
 
+        # M4 fix (review-swarm fix-all v1): write the engine marker BEFORE
+        # save_hashes, not after. The marker is the cache-bust signal — if
+        # we crash between save_hashes and engine_marker.write_text, next
+        # ingest reads the old engine and skips re-extraction even though
+        # the chunks already reflect the new engine. Writing marker first
+        # means a crash here leaves marker=new + hashes=old → next ingest
+        # sees engine_changed=False but also sees changes via hash_cache,
+        # so it re-extracts. Either order can leave a tiny inconsistency,
+        # but marker-first plus the hash-cache safety net converges to
+        # "re-extract on any doubt", which is the safe behavior.
+        engine_marker.write_text(engine)
         # Save file hashes for future incremental updates
         save_hashes(files, course_dir, hash_cache)
-        # Pin the engine used so a future re-ingest knows whether to bust
-        # the cache when the user switches between pymupdf and mineru.
-        engine_marker.write_text(engine)
 
         course = Course(course_id=course_id, name=course_id, documents=doc_ids)
         meta_path = course_artifacts / "course_meta.json"

@@ -65,7 +65,21 @@ def _stash_block_formulas(text: str) -> tuple[str, list[str]]:
 
     Returns the modified text plus the ordered list of original block
     bodies. The Nth placeholder maps to ``formulas[N]``.
+
+    **H2 fix (review-swarm fix-all v1)**: If ``text`` already contains
+    ``_PLACEHOLDER_OPEN`` or ``_PLACEHOLDER_CLOSE``, return the text
+    untouched with empty formulas. Those BMP Private Use Area chars are
+    legitimately used by some CJK custom-glyph fonts, IPA, and Apple
+    emoji private encoding. Without this guard, ``_restore_block_formulas``
+    would silently delete the user's own PUA bytes via the dangling-marker
+    scrub. Trade-off: a PDF mixing legitimate PUA with formulae loses
+    formula atomicity (the splitter may slice ``$$...$$``) — but never
+    deletes user content. Atomicity is best-effort; content preservation
+    is hard.
     """
+    if _PLACEHOLDER_OPEN in text or _PLACEHOLDER_CLOSE in text:
+        return text, []
+
     formulas: list[str] = []
 
     def _capture(match: re.Match) -> str:
@@ -80,21 +94,31 @@ def _stash_block_formulas(text: str) -> tuple[str, list[str]]:
 def _restore_block_formulas(chunk_text: str, formulas: list[str]) -> str:
     """Swap placeholders back to original LaTeX.
 
-    Also scrubs any unmatched / half-placeholder bytes that survived a
-    chunk-edge cut, so the user never sees `\\ue0001\\ue0` garbage. In
-    the (rare) case a placeholder is split across two chunks, the caller
-    is responsible for ensuring the formula appears intact in at least
-    one chunk — see `chunk_pages` for the post-split repair pass.
+    H2 fix (review-swarm fix-all v1): when ``formulas`` is empty (the
+    stash refused because the page already contained PUA chars), this
+    is an identity transform — we do NOT strip PUA bytes from the
+    output, because they're the user's own content.
+
+    Otherwise: scrub any dangling half-placeholder (an OPEN/CLOSE marker
+    adjacent to a digit but unmatched — the signature of a placeholder
+    cut at a chunk boundary that wasn't repaired by the post-split
+    pass). We only strip those tightly-anchored fragments, never bare
+    PUA characters on their own.
     """
+    if not formulas:
+        return chunk_text
+
     def _restore(match: re.Match) -> str:
         idx = int(match.group(1))
         return formulas[idx] if 0 <= idx < len(formulas) else ""
 
     out = _PLACEHOLDER_FULL_RE.sub(_restore, chunk_text)
-    # Strip any dangling half-placeholder (open without close, or vice
-    # versa, or open with non-numeric tail). Without this the user sees
-    # raw  bytes — visually invisible but tokenizes weirdly.
-    out = out.replace(_PLACEHOLDER_OPEN, "").replace(_PLACEHOLDER_CLOSE, "")
+    # Tightly-anchored half-placeholder scrub: only `<OPEN><digits>`
+    # (close stripped) or `<digits><CLOSE>` (open stripped). Bare PUA
+    # not adjacent to digits stays — that's user content (e.g. CJK
+    # custom-glyph fonts), not our scaffolding.
+    out = _PLACEHOLDER_OPEN_RE.sub("", out)
+    out = re.sub(r"\d+" + re.escape(_PLACEHOLDER_CLOSE), "", out)
     return out
 
 
@@ -105,6 +129,32 @@ def _placeholder_indices_in(text: str) -> set[int]:
     captured intact.
     """
     return {int(m.group(1)) for m in _PLACEHOLDER_FULL_RE.finditer(text)}
+
+
+# Match `<OPEN><digits>` even when `<CLOSE>` is missing — this is the
+# signature of a placeholder whose CLOSE got sliced off into the next
+# chunk. Used by `_unfinished_open_indices` to attribute each missing
+# formula to the piece where its placeholder *started*.
+_PLACEHOLDER_OPEN_RE = re.compile(re.escape(_PLACEHOLDER_OPEN) + r"(\d+)")
+
+
+def _unfinished_open_indices(piece: str) -> list[int]:
+    """Indices whose OPEN marker appears in this piece but CLOSE doesn't follow.
+
+    Used by the post-split repair pass — these are the formulas whose
+    `$$...$$` block started in this chunk but got cut at the boundary,
+    so the original LaTeX needs to be re-injected here. Distinguishes
+    "open + digits + close" (= fully captured, ignored here) from
+    "open + digits + (anything else / end-of-string)" (= started here).
+    """
+    out: list[int] = []
+    for m in _PLACEHOLDER_OPEN_RE.finditer(piece):
+        idx = int(m.group(1))
+        after = m.end()
+        if after < len(piece) and piece[after] == _PLACEHOLDER_CLOSE:
+            continue  # full placeholder, already captured
+        out.append(idx)
+    return out
 
 
 def chunk_pages(
@@ -134,11 +184,15 @@ def chunk_pages(
     seq = 0
 
     for page in pages:
+        # M2 fix (review-swarm fix-all v1): the min_tokens gate measures
+        # the *raw* text, not the stashed text. A slide that is nothing
+        # but one big formula collapses to a ~5-token placeholder after
+        # stashing and would have been dropped here pre-fix.
+        if len(enc.encode(page.text)) < min_tokens:
+            continue
+
         stashed_text, formulas = _stash_block_formulas(page.text)
         tokens = enc.encode(stashed_text)
-
-        if len(tokens) < min_tokens:
-            continue
 
         if len(tokens) <= chunk_size:
             # Whole page fits — single chunk, restore formulas in place.
@@ -168,24 +222,30 @@ def chunk_pages(
                 raw_pieces.append((piece, captured))
             start += chunk_size - overlap
 
-        # Post-split repair: any formula that disappeared (no chunk
-        # captured it intact) is appended in full to the chunk where its
-        # placeholder *started*. We detect "started here" by looking for
-        # a dangling `` without its closing `` near the end
-        # of a chunk (or a closing without opening near the start of the
-        # next chunk).
+        # Post-split repair (H1 fix, review-swarm fix-all v1): any
+        # formula that disappeared (no chunk captured it intact) is
+        # appended in full to the chunk where its placeholder *started*.
+        # Pre-fix the repair picked the first chunk whose text contained
+        # any OPEN marker; with two cross-boundary formulae A and B, both
+        # got appended to chunk 0 and the chunk where B actually started
+        # silently lost the formula. Post-fix we attribute by index via
+        # `_unfinished_open_indices` so each missing formula lands in the
+        # chunk where its OPEN was actually cut.
         all_captured: set[int] = set().union(*(c for _, c in raw_pieces)) if raw_pieces else set()
         missing = [i for i in range(len(formulas)) if i not in all_captured]
         for missing_idx in missing:
-            # Find first chunk that contains the open marker without a
-            # full match — that's where the formula started.
-            for j, (piece, _) in enumerate(raw_pieces):
-                if _PLACEHOLDER_OPEN in piece:
-                    # Append the original formula to this chunk's text
-                    # so the answer LLM still has it. Newline before so
-                    # it visually separates from the truncated context.
-                    raw_pieces[j] = (piece + "\n\n" + formulas[missing_idx], raw_pieces[j][1])
+            placed = False
+            for j, (piece, captured) in enumerate(raw_pieces):
+                if missing_idx in _unfinished_open_indices(piece):
+                    raw_pieces[j] = (piece + "\n\n" + formulas[missing_idx], captured)
+                    placed = True
                     break
+            if not placed and raw_pieces:
+                # Fallback: placeholder somehow not in any piece. Append
+                # to the first chunk so the formula at least lives
+                # somewhere (better than silently dropping).
+                p0, c0 = raw_pieces[0]
+                raw_pieces[0] = (p0 + "\n\n" + formulas[missing_idx], c0)
 
         sub_idx = 0
         for piece, _ in raw_pieces:
