@@ -113,13 +113,24 @@ def main() -> None:
 
     # ── 1. Strip stale KG concept_embeddings (dim may have changed) ──
     artifacts = Path("artifacts")
-    log("Stripping stale KG concept_embeddings…")
+    active_preset = config.active_preset_id()
+    # review-swarm H4 (2026-05-20): also strip the per-preset bucket entry
+    # for the active preset, not just the legacy `concept_embedding` field.
+    # graph_search prefers `concept_embeddings[active]`, so a stale entry
+    # there would silently shadow our rebaked vector.
+    log(f"Stripping stale KG concept_embeddings (preset={active_preset})…")
     for kg_path in artifacts.glob("courses/*/knowledge_graph.json"):
         kg = json.loads(kg_path.read_text())
         stripped = 0
         for n in kg.get("nodes") or []:
             if "concept_embedding" in n:
                 del n["concept_embedding"]
+                stripped += 1
+            bucket = n.get("concept_embeddings")
+            if isinstance(bucket, dict) and active_preset in bucket:
+                del bucket[active_preset]
+                # Don't strip other presets' entries — switching back to
+                # them should remain instant per the namespacing contract.
                 stripped += 1
         if stripped:
             tmp = kg_path.with_suffix(".json.tmp")
@@ -175,12 +186,20 @@ def main() -> None:
     bm25.build(chunks)
     log("BM25 built")
 
+    # Per-preset FAISS namespace (2026-05-20): write under the active
+    # preset id so reembed-all under preset A doesn't clobber preset B's
+    # cached global index.
     index_dir = artifacts / "indices"
-    vector.save(index_dir / "faiss" / "global")
+    faiss_target = index_dir / "faiss" / config.active_preset_id() / "global"
+    vector.save(faiss_target)
     bm25.save(index_dir / "bm25" / "global.json")
-    log(f"Saved global indices under {index_dir}/")
+    log(f"Saved global FAISS at {faiss_target} (preset={config.active_preset_id()})")
 
     # ── 3. Re-bake KG concept_embeddings via enriched text ──
+    # review-swarm H4 (2026-05-20): write the fresh vector into BOTH the
+    # active preset's bucket entry (`concept_embeddings[active]`) and the
+    # legacy single field. graph_search reads the bucket first; old code
+    # paths and downstream tooling still see the legacy mirror.
     log("Re-baking KG concept_embeddings…")
     for kg_path in artifacts.glob("courses/*/knowledge_graph.json"):
         course = kg_path.parent.name
@@ -188,7 +207,14 @@ def main() -> None:
         chunks_idx = _load_chunks_index(course, artifacts)
         chunk_text_lookup = {cid: row.get("text", "") for cid, row in chunks_idx.items()}
         non_root = [n for n in kg["nodes"] if (n.get("concept_type") or "").lower() != "root"]
-        targets = [n for n in non_root if not n.get("concept_embedding")]
+        # A node is "uncached for the active preset" if neither the legacy
+        # field NOR the active preset's bucket entry is populated.
+        def _has_active_embedding(n: dict) -> bool:
+            if n.get("concept_embedding"):
+                return True
+            bucket = n.get("concept_embeddings")
+            return isinstance(bucket, dict) and bool(bucket.get(active_preset))
+        targets = [n for n in non_root if not _has_active_embedding(n)]
         if not targets:
             log(f"  · {course}: skip (all cached)")
             continue
@@ -196,7 +222,13 @@ def main() -> None:
         t1 = time.time()
         out = embed_fn(node_texts)
         for n, e in zip(targets, out):
-            n["concept_embedding"] = [float(x) for x in e]
+            vec = [float(x) for x in e]
+            n["concept_embedding"] = vec
+            bucket = n.get("concept_embeddings")
+            if not isinstance(bucket, dict):
+                bucket = {}
+            bucket[active_preset] = vec
+            n["concept_embeddings"] = bucket
         tmp = kg_path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(kg, ensure_ascii=False, indent=2))
         tmp.rename(kg_path)

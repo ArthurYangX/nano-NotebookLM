@@ -34,7 +34,7 @@ from nano_notebooklm.ai import prompt_templates as prompts
 from nano_notebooklm.ai.prompt_templates import NOTE_LATEX_PREAMBLE, NOTE_LATEX_POSTAMBLE
 from nano_notebooklm.agents import run_subagent
 from nano_notebooklm.agents.formatter import format_response
-from nano_notebooklm.kb.store import KBStore
+from nano_notebooklm.kb.store import KBStore, migrate_legacy_faiss_layout
 from nano_notebooklm.orchestrator import agent_loop
 from nano_notebooklm.orchestrator.engine import Orchestrator
 from nano_notebooklm.orchestrator.session_log import SessionLog
@@ -169,10 +169,74 @@ async def _probe_soffice() -> None:
         logger.info("soffice not found — pptx will fall back to text-mode Reader (install LibreOffice to enable)")
 
 
+# Warm the persistent mineru-api server in the background so the first
+# upload doesn't pay the 30-45s model load on the request hot path. Same
+# fire-and-forget pattern as `_warm_embed_fn` — startup returns
+# immediately, liveness probes stay green during load. Skip when
+# NANO_NLM_DISABLE_MINERU_WARMUP=1 (test suites, deploys that don't use
+# the mineru engine), or when MINERU_SERVER_DISABLED=1. The warm-up
+# does NOT call extract — it just kicks the singleton so the server
+# subprocess is up and ready. app.state.mineru_warm_ok mirrors the
+# embed warm-up flag pattern (None=in-flight / True=ok / False=failed).
+@app.on_event("startup")
+async def _warm_mineru_server() -> None:
+    app.state.mineru_warm_ok = None
+    if os.environ.get("NANO_NLM_DISABLE_MINERU_WARMUP"):
+        app.state.mineru_warm_ok = True
+        return
+    if os.environ.get("MINERU_SERVER_DISABLED", "").strip().lower() in {"1", "true", "yes", "on"}:
+        app.state.mineru_warm_ok = True
+        return
+    import asyncio as _aio
+
+    async def _do_warmup() -> None:
+        try:
+            from nano_notebooklm.ingest.extractors_mineru import _get_or_start_mineru_server
+            state = await _aio.to_thread(_get_or_start_mineru_server)
+            app.state.mineru_warm_ok = state is not None
+            if state is not None:
+                logger.info("mineru-api server warmed at startup on %s", state.get("url", "<unknown>"))
+            else:
+                logger.info("mineru-api server warm-up skipped (CLI missing or startup failed)")
+        except Exception:  # noqa: BLE001 — never block boot on a warm-up failure
+            app.state.mineru_warm_ok = False
+            logger.warning("mineru-api warm-up raised", exc_info=False)
+
+    # fix-all v1 H2: hold a strong reference on app.state so CPython
+    # can't GC the task mid-startup. Mirrors the `_UPLOAD_TASK_OBJECTS`
+    # pattern in CLAUDE.md upload-pipeline notes. Without this strong-ref
+    # the only reference is asyncio's weak task set and the warm-up can
+    # vanish silently — first upload would then pay the 30-45s cold start.
+    app.state._mineru_warm_task = _aio.create_task(_do_warmup())
+
+
 # review-swarm M6 (2026-05-16): the upload background-task registry
 # (`_UPLOAD_TASKS`) is per-process. Multi-worker uvicorn would silently
 # 404 status polls that land on a different worker than the originating
 # POST. Warn loudly at startup so a deploy mis-config surfaces.
+# One-shot migration: legacy bare `indices/faiss/{global,course_id}/` →
+# `indices/faiss/<active_preset>/...`. Runs before any /api/upload or
+# /api/chat handler can touch the index dir so a fresh server boot under
+# the new code never reads from an unmigrated layout. Idempotent +
+# defensive (custom-preset env config or already-migrated dirs are no-ops).
+#
+# review-swarm M4: dispatched via asyncio.to_thread so a slow rename
+# (e.g. cross-mount fallback to shutil.move = copy+delete) doesn't block
+# the event loop during boot. Liveness probes stay green.
+@app.on_event("startup")
+async def _migrate_legacy_faiss() -> None:
+    try:
+        result = await asyncio.to_thread(migrate_legacy_faiss_layout, config.ARTIFACTS_DIR)
+        moved = result.get("moved") or []
+        if moved:
+            logger.info(
+                "embedding preset migration: moved %d legacy dir(s) under faiss/%s/",
+                len(moved), result.get("target_preset"),
+            )
+    except Exception:  # noqa: BLE001 — never block boot on migration
+        logger.warning("legacy faiss migration raised; continuing", exc_info=True)
+
+
 @app.on_event("startup")
 async def _warn_multi_worker_unsafe() -> None:
     workers = int(os.environ.get("WEB_CONCURRENCY", "1") or "1")
@@ -188,11 +252,6 @@ async def _warn_multi_worker_unsafe() -> None:
 MAX_UPLOAD_SIZE_MB = 50
 MAX_UPLOAD_SIZE_BYTES = MAX_UPLOAD_SIZE_MB * 1024 * 1024
 
-# fix-all v1 #V2 (R4-5 review v1): TTL for the qwen_raft health probe
-# cached on app.state.qwen_health_cache. 15s > 10s frontend poll → cache
-# hit rate ~100% for steady-state polling; cold pulse on operator config
-# change still surfaces within one cycle.
-QWEN_HEALTH_TTL_SECONDS = float(os.environ.get("QWEN_HEALTH_TTL_SECONDS", "15.0"))
 ALLOWED_UPLOAD_SUFFIXES = {".pdf", ".pptx", ".docx", ".md", ".txt"}
 
 # review-swarm fix-all v1 #6: reject any uploaded filename that contains
@@ -211,6 +270,29 @@ _FILENAME_FORBIDDEN_RE = re.compile(
     "⁦-⁩"           # isolate block
     "]"
 )
+
+
+def _redact_url(raw: str | None) -> str | None:
+    """Strip userinfo (and query string) from a URL before surfacing it
+    via /api/status. OpenAI-compatible SDKs accept embedded credentials
+    in the form ``https://user:token@host/v1`` — the OpenAI SDK passes
+    the token in the Authorization header automatically. We don't want
+    /api/status (unauthenticated) returning that string verbatim.
+    """
+    if not raw:
+        return None
+    try:
+        parsed = urllib_parse.urlparse(raw)
+    except Exception:
+        return None
+    if not parsed.scheme or not parsed.hostname:
+        return raw
+    host = parsed.hostname
+    if parsed.port:
+        host = f"{host}:{parsed.port}"
+    # Drop userinfo and query string; preserve path (some providers' base
+    # URLs include a `/v1beta/openai/` style suffix users want to see).
+    return f"{parsed.scheme}://{host}{parsed.path}"
 
 
 def _safe_upload_name(raw: str | None) -> str:
@@ -422,15 +504,15 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
 # (artifacts/courses/<id>/, artifacts/uploads/<id>/). Without a character
 # constraint a value like `"x\n\nIgnore previous instructions"` would land
 # verbatim in the system message, and `/api/upload/{course_id}` would create
-# a directory with arbitrary path bytes. Real courses are slug-shaped:
-# 15-213, CSE 234, 机器人导论, 模式识别 — restrict to alnum + space + dash +
-# underscore + dot + CJK. No slashes, no control chars, no `..`.
+# a directory with arbitrary path bytes. Real course ids are slug-shaped
+# (e.g. `cs101`, `intro-to-x`, `机器学习`) — restrict to alnum + space +
+# dash + underscore + dot + CJK. No slashes, no control chars, no `..`.
 COURSE_ID_PATTERN = r"^[A-Za-z0-9_\-. 一-鿿]{1,128}$"
 
 
 def _ensure_safe_course_id(value):
     """review-swarm fix-all v3 #H1: COURSE_ID_PATTERN allows `.` because
-    real course names contain it (`15-213`); but pydantic-core's Rust regex
+    real course names contain it (e.g. version-like ids); but pydantic's Rust regex
     engine can't express "no `..` substring" with negative lookahead. So
     the pattern stays permissive and this validator catches the dangerous
     cases — `..`, leading `.`, trailing `.` — that would otherwise let a
@@ -521,24 +603,15 @@ class ChatRequest(BaseModel):
     # rejected at the Pydantic layer so a stale localStorage value can't
     # smuggle a bogus instruction into the prompt.
     user_lang: Literal["zh", "en"] | None = None
-    # R4-5 part 2 + fix-all v1 #V8: optional backend override surfaced
-    # via the topbar chip. "codex" = default task routing (the chip's
-    # user-facing label for "use the configured main backend"; v1
-    # treated this as a hard openai pin but that 500s in claude-only
-    # deployments — fix-all v1 #V1 reverted to "default routing" so
-    # codex never forces openai). "qwen_raft" = explicit pin on the
-    # AutoDL Qwen2.5-7B-RAFT HTTP backend. None = same as "codex".
-    # The chat endpoint 422s when backend="qwen_raft" but
-    # QWEN_RAFT_URL is unset, so a stale localStorage chip selection
-    # doesn't silently fall through.
-    backend: Literal["codex", "qwen_raft", "qwen_base"] | None = Field(
+    # Optional backend override surfaced via the topbar chip. One of the
+    # configured backend keys ("openai" / "claude" / "local"). None falls
+    # back to task-type routing. Unknown / unconfigured target 422s.
+    backend: Literal["openai", "claude", "local"] | None = Field(
         default=None,
         description=(
-            'Optional backend override surfaced via the topbar chip + Settings.'
-            '"codex" = default task routing; "qwen_raft" = AutoDL Qwen2.5-7B-RAFT '
-            '(requires QWEN_RAFT_URL); "qwen_base" = parallel base Qwen2.5-7B-Instruct '
-            '(requires QWEN_BASE_URL). Users typically pick codex vs qwen via the '
-            'topbar chip, and pick raft vs base via a Settings sub-radio.'
+            "Optional backend override surfaced via the topbar chip. "
+            "One of 'openai', 'claude', 'local'. None uses the default "
+            "task-type routing."
         ),
     )
     # 2026-05-12: user-customisable assistant name surfaced via the
@@ -666,20 +739,6 @@ class ChatResponse(BaseModel):
             "The history-disambiguated retrieval query, when qa_skill "
             "rewrote a follow-up question. None for single-turn / no-op "
             "rewrites."
-        ),
-    )
-    # R4-5 part 2 + fix-all v1 #V8: True when an explicit
-    # backend="qwen_raft" request silently degraded to the default
-    # routing backend inside qa_skill (qwen timeout / upstream error).
-    # `QWEN_RAFT_URL` unset would have 422'd at the endpoint earlier, so
-    # this flag specifically signals a runtime degradation, not a config
-    # miss. None when no fallback occurred.
-    backend_fallback: bool | None = Field(
-        default=None,
-        description=(
-            "True when the response degraded from the requested backend "
-            '(typically qwen_raft) to the default routing backend due to '
-            "timeout or upstream failure. None when no fallback occurred."
         ),
     )
     model_config = {"extra": "forbid"}
@@ -939,15 +998,8 @@ def _strip_nonempty(value: str, field_name: str) -> str:
 
 # ── Course endpoints ─────────────────────────────────────────────────
 @app.get("/api/courses", tags=["courses"], summary="List courses with chunk counts")
-async def list_courses(
-    mode: Annotated[
-        Literal["all", "user"],
-        Query(description="'user' (default) hides preset courses; 'all' returns everything."),
-    ] = "user",
-):
+async def list_courses():
     courses = orchestrator.list_courses()
-    if mode == "user":
-        courses = [c for c in courses if c not in config.PRESET_COURSE_IDS]
     result = []
     for cid in courses:
         chunks = kb.get_chunks(cid)
@@ -985,10 +1037,7 @@ async def delete_course(course_id: str):
 
     This is **destructive and irreversible**: notes, quizzes, KG, exam
     bank, ingested chunks, source files — all gone. The frontend "管理"
-    modal must show a `window.confirm` dialog before invoking. Preset
-    courses (config.PRESET_COURSE_IDS) are still deletable here — they
-    were physically kept as a Round-4 rollback hatch, but if the user
-    explicitly chooses to delete one we honor that.
+    modal must show a `window.confirm` dialog before invoking.
 
     R5-2 review-swarm v2 follow-up F1:
     - Acquires `_upload_lock_for(course_id)` for the destructive window
@@ -1038,11 +1087,21 @@ async def delete_course(course_id: str):
 
         # 2. Drop the per-course index files. The global indices are
         #    rebuilt below from disk so they'll exclude this course.
+        #    Per-preset namespaces (2026-05-20): a course's FAISS lives at
+        #    indices/faiss/<preset>/<course_id> for each preset it was
+        #    indexed under. Sweep every existing preset namespace so a
+        #    later switch-back to an old preset doesn't resurrect this
+        #    course's stale vectors.
         idx_dir = config.ARTIFACTS_DIR / "indices"
-        faiss_dir = idx_dir / "faiss" / course_id
-        if faiss_dir.exists():
-            _shutil.rmtree(faiss_dir)
-            removed.append(f"indices/faiss/{course_id}/")
+        faiss_root = idx_dir / "faiss"
+        if faiss_root.exists():
+            for preset_dir in faiss_root.iterdir():
+                if not preset_dir.is_dir():
+                    continue
+                target = preset_dir / course_id
+                if target.exists():
+                    _shutil.rmtree(target)
+                    removed.append(f"indices/faiss/{preset_dir.name}/{course_id}/")
         for suffix in (".json", ".pkl"):
             bm25_path = idx_dir / "bm25" / f"{course_id}{suffix}"
             if bm25_path.exists():
@@ -1119,28 +1178,18 @@ _DOC_ID_RE = __import__("re").compile(r"^[A-Za-z0-9]{1,64}$")
 
 
 def _resolve_source_path(course_id: str, source_file: str) -> Path | None:
-    """Resolve a chunk's `source_file` to an on-disk path.
-
-    Search order: uploads dir (R4-2 upload-only courses) → COURSE_DATA_DIR
-    (preset courses ingested via scripts/ingest_all.py). Returns None when
-    neither resolves to a real file inside its expected root (path-traversal
-    guard via `Path.resolve()` + `relative_to`).
+    """Resolve a chunk's `source_file` to the uploaded file on disk.
+    Returns None when the path doesn't resolve inside the uploads root
+    (path-traversal guard via `Path.resolve()` + `relative_to`).
     """
-    candidates: list[tuple[Path, Path]] = []
     uploads_root = (config.ARTIFACTS_DIR / "uploads" / course_id).resolve()
-    candidates.append((uploads_root, uploads_root / source_file))
-    if config.COURSE_DATA_DIR and str(config.COURSE_DATA_DIR):
-        preset_root = (Path(config.COURSE_DATA_DIR) / course_id).resolve()
-        candidates.append((preset_root, preset_root / source_file))
-    for root, candidate in candidates:
-        try:
-            resolved = candidate.resolve()
-            resolved.relative_to(root)
-        except (OSError, ValueError):
-            continue
-        if resolved.is_file():
-            return resolved
-    return None
+    candidate = uploads_root / source_file
+    try:
+        resolved = candidate.resolve()
+        resolved.relative_to(uploads_root)
+    except (OSError, ValueError):
+        return None
+    return resolved if resolved.is_file() else None
 
 
 def _preview_dir_for(course_id: str) -> Path:
@@ -1253,12 +1302,12 @@ async def get_source_chunks(course_id: str, doc_id: str):
     # `viewable_as_pdf=True` flips that switch on the frontend; the file
     # endpoint will then transparently serve the sidecar with mime=pdf.
     sidecar = _resolve_pptx_pdf_sidecar(course_id, same_doc[0].source_file)
-    # Preset-course migration: existing courses (CS231N etc.) were ingested
-    # before sidecar generation existed. Kick off a background conversion
-    # the FIRST time a pptx doc is opened in Reader so the next visit gets
-    # the better viewer. Fire-and-forget — this request still returns
-    # viewable_as_pdf=False, frontend renders text mode, and the user's
-    # second click into the same doc picks up the cached sidecar.
+    # Lazy sidecar: courses ingested before sidecar generation existed
+    # (or before LibreOffice was installed) get a background conversion
+    # the FIRST time a pptx doc is opened in Reader. Fire-and-forget —
+    # this request still returns viewable_as_pdf=False so the frontend
+    # renders text mode, and the user's second click picks up the cached
+    # sidecar.
     if (
         sidecar is None
         and same_doc[0].file_type.value == "pptx"
@@ -1356,15 +1405,15 @@ async def get_source_file(course_id: str, doc_id: str):
           summary="RAG chat with source citations",
           response_model=ChatResponse, response_model_exclude_none=True)
 async def chat(req: ChatRequest):
-    # R4-5 part 2: guard the qwen_raft path behind explicit env config.
-    # Without this, a stale frontend chip selection (or a curl with the
-    # backend kwarg) would surface deep inside ModelRouter as a generic
-    # RuntimeError. 422 mirrors the rest of the input-validation surface.
-    if req.backend == "qwen_raft" and not config.QWEN_RAFT_URL:
-        raise HTTPException(422, detail="qwen_raft backend not configured")
-    if req.backend == "qwen_base" and not config.QWEN_BASE_URL:
-        raise HTTPException(422, detail="qwen_base backend not configured")
-    # 2026-05-16: multi-turn — serialise ChatTurn[] to plain dicts so the
+    # Validate the chip selection against the actually-configured
+    # backends (router-level) before queueing the skill so a stale
+    # localStorage chip value surfaces as 422 instead of 502.
+    if req.backend and req.backend not in orchestrator.router.backends:
+        raise HTTPException(
+            422,
+            detail=f"backend {req.backend!r} is not configured on this server",
+        )
+    # multi-turn — serialise ChatTurn[] to plain dicts so the
     # skill layer stays Pydantic-free. Empty / None history threads through
     # as None (qa_skill short-circuits the rewrite step).
     history_payload = (
@@ -2523,9 +2572,17 @@ def apply_edit_ops_with_results(
                 # concept in graph_search. Drop it; graph_search lazy-
                 # recomputes on next chat (single-node addition to the
                 # batch — cost is negligible).
-                if ("name" in patch or "definition" in patch) and \
-                        merged.get("concept_embedding") is not None:
-                    merged["concept_embedding"] = None
+                #
+                # 2026-05-20 (review-swarm H3): the embedding cache is now
+                # also kept under ``concept_embeddings: {preset: vec}``.
+                # Clearing only the legacy field leaves the per-preset
+                # bucket populated, which graph_search prefers — so the
+                # rename would still rank against the old text. Drop both.
+                if "name" in patch or "definition" in patch:
+                    if merged.get("concept_embedding") is not None:
+                        merged["concept_embedding"] = None
+                    if merged.get("concept_embeddings"):
+                        merged["concept_embeddings"] = {}
                 nodes_by_id[nid] = merged
                 _record(op, "applied")
             else:
@@ -3294,10 +3351,23 @@ async def upload_files(
 def _set_stage(state: dict[str, Any], stage: str, progress: int,
                detail: dict | None = None) -> None:
     """Centralised TaskState mutation — replaces the old `yield _ndjson(...)`
-    points in the streaming pipeline. Each call overwrites the stage's
-    current progress / detail snapshot; the poller surfaces whatever the
-    latest write was.
+    points in the streaming pipeline. ``progress`` always overwrites;
+    ``detail=None`` preserves the previously-written detail so that a
+    progress-only emit (e.g. the per-file/per-batch callbacks fired
+    during chunking/embedding) doesn't wipe metadata set by earlier
+    milestone writes (pptx preview counts, file totals, etc.).
+
+    Concurrency: the polling loop reads ``state["stages"][stage]`` from
+    the event-loop thread while these mutations land from the worker
+    thread (`_asyncio.to_thread`). Replacing the inner dict by reference
+    is GIL-atomic on CPython 3.12, so the poller sees either the prior
+    snapshot or the new one — never a partially-built dict. (If we ever
+    move to free-threaded CPython the nested mutation pattern needs a
+    lock.)
     """
+    if detail is None:
+        prev = state["stages"].get(stage) or {}
+        detail = prev.get("detail")
     state["stages"][stage] = {"progress": progress, "detail": detail}
 
 
@@ -3355,6 +3425,10 @@ async def _run_upload_pipeline(
                 # the fallback).
                 current_stage = "chunking"
                 _set_stage(state, "chunking", 0)
+                # Carve out a sub-range for ingest_course's per-file
+                # callback. With pptx sidecar gen, 0-50% is already spent on
+                # rendering; without, the whole 0-99 belongs to ingest.
+                chunking_lo = 50 if (pptx_to_render and getattr(app.state, "pptx_pdf_available", False)) else 0
                 if pptx_to_render and getattr(app.state, "pptx_pdf_available", False):
                     _set_stage(state, "chunking", 25, detail={
                         "sub": f"rendering {len(pptx_to_render)} pptx preview(s)",
@@ -3369,8 +3443,18 @@ async def _run_upload_pipeline(
                         "pptx_previews_rendered": rendered,
                         "pptx_previews_total": len(sidecar_results),
                     })
+
+                # Per-file progress callback. Maps to [chunking_lo, 99] so
+                # the final 100% write below carries the `documents` detail.
+                # Runs on the worker thread; dict writes are GIL-atomic and
+                # the poller tolerates ms-level lag, so no lock needed.
+                def _on_chunk_progress(done: int, total: int) -> None:
+                    pct = chunking_lo + int((99 - chunking_lo) * done / max(total, 1))
+                    _set_stage(state, "chunking", min(99, max(chunking_lo, pct)))
+
                 course_obj = await _asyncio.to_thread(
                     kb.ingest_course, str(upload_dir), course_id, engine, lang,
+                    on_progress=_on_chunk_progress,
                 )
                 _set_stage(state, "chunking", 100, detail={
                     "documents": len(course_obj.documents),
@@ -3379,7 +3463,18 @@ async def _run_upload_pipeline(
                 # Stage 2: embedding (FAISS + BM25 rebuild for the course).
                 current_stage = "embedding"
                 _set_stage(state, "embedding", 0)
-                await _asyncio.to_thread(kb.build_index, course_id)
+
+                # Per-batch embedding progress callback. `done`/`total` are
+                # cache-MISS chunks across both per-course + global builds
+                # (see store.build_index for the shared denominator). Full
+                # cache hit reports (1, 1) → instant 99% then 100% below.
+                def _on_embed_progress(done: int, total: int) -> None:
+                    pct = int(99 * done / max(total, 1))
+                    _set_stage(state, "embedding", min(99, max(0, pct)))
+
+                await _asyncio.to_thread(
+                    kb.build_index, course_id, on_embed_progress=_on_embed_progress,
+                )
                 router_intent.clear_lang_cache(course_id)
                 chunks = kb.get_chunks(course_id)
                 _set_stage(state, "embedding", 100, detail={"chunks": len(chunks)})
@@ -3646,117 +3741,370 @@ async def get_mastery(course_id: str):
     return {"mastery": data, "weak_areas": weak}
 
 
+# ── Embedding preset switching ───────────────────────────────────────
+# The active embedding model is part of /api/status (read) and switchable
+# via POST /api/settings/embedding (write). FAISS indices live in per-
+# preset namespaces so a switch is a path-route, not a destructive
+# rebuild. First switch to a never-used preset triggers a background
+# rebuild of every course's index against the new model so /api/chat
+# stays fully functional. While rebuilding, retrieval for courses not
+# yet rebuilt degrades to BM25-only (the global BM25 index is preset-
+# independent and stays warm throughout).
+#
+# review-swarm fix-all (2026-05-20):
+#   H1+H2: a single ``_EMBEDDING_SWITCH_LOCK`` serialises the switch
+#     handler AND the rebuild loop captures ``preset_id`` to route
+#     writes deterministically even if the active preset is mutated
+#     mid-rebuild. The rebuild loop also acquires the per-course
+#     upload lock to interleave safely with /api/upload.
+#   H5: per-course rebuild errors are tracked in ``failed_courses``;
+#     terminal status becomes ``partial`` when any failed.
+#   M1: ``embedding_rebuild_view`` translates a stale ``done`` /
+#     ``partial`` / ``error`` whose ``ended_at`` is older than
+#     ``_EMBEDDING_REBUILD_VIEW_TTL_S`` back to ``idle`` so the
+#     frontend banner doesn't stick across page loads forever.
+#   M3: build_index now takes ``skip_bm25`` / ``skip_global`` so the
+#     loop avoids N+1 global rebuilds and the (preset-independent)
+#     BM25 work.
+#   M7: switch handler commits preference LAST so any earlier failure
+#     leaves the on-disk state pointing at the previous preset.
+_EMBEDDING_REBUILD_STATE: dict[str, Any] = {
+    "task_id": None,
+    "preset_id": None,
+    "status": "idle",          # idle | running | done | partial | error
+    "total_courses": 0,
+    "done_courses": 0,
+    "failed_courses": [],      # list[str] — H5: per-course errors surface here
+    "current_course": None,
+    "error": None,
+    "started_at": None,
+    "ended_at": None,
+}
+_EMBEDDING_REBUILD_TASK: "set[asyncio.Task]" = set()
+# Serialises switch_embedding_preset against itself + against the rebuild
+# loop's preset_id capture. Plain asyncio.Lock is enough because there's
+# one event loop per process and uvicorn is single-worker for this app.
+_EMBEDDING_SWITCH_LOCK = asyncio.Lock()
+# How long a finished rebuild's terminal state remains visible on
+# /api/status before being translated to idle (M1). Keeps the green
+# "done" banner up just long enough for the user who clicked switch to
+# see it, then goes idle on subsequent page loads.
+_EMBEDDING_REBUILD_VIEW_TTL_S = 60.0
+
+
+class EmbeddingSwitchRequest(BaseModel):
+    preset_id: str = Field(
+        ..., min_length=1,
+        description="One of config.EMBEDDING_PRESETS keys",
+    )
+    model_config = {"extra": "forbid"}
+
+
+async def _embedding_rebuild_loop(task_id: str, preset_id: str) -> None:
+    """Background task: rebuild every course's FAISS index against the
+    newly-active preset. BM25 is preset-independent and skipped per
+    course; one final global FAISS pass after the per-course loop
+    refreshes the in-memory hybrid index.
+
+    review-swarm H1: ``preset_id`` is the preset CAPTURED at switch time
+    and is passed explicitly to ``kb.build_index`` so an intervening
+    switch (which would mutate ``config.active_preset_id()``) cannot
+    redirect this loop's writes into another namespace.
+
+    review-swarm H2: each per-course iteration acquires
+    ``_upload_lock_for(cid)`` so it interleaves safely with a concurrent
+    /api/upload to the same course (both touch the same on-disk FAISS
+    dir).
+    """
+    state = _EMBEDDING_REBUILD_STATE
+    state.update({
+        "task_id": task_id,
+        "preset_id": preset_id,
+        "status": "running",
+        "started_at": time.time(),
+        "ended_at": None,
+        "error": None,
+        "done_courses": 0,
+        "failed_courses": [],
+        "current_course": None,
+    })
+    try:
+        course_ids = orchestrator.list_courses()
+        state["total_courses"] = len(course_ids)
+        for i, cid in enumerate(course_ids):
+            state["current_course"] = cid
+            lock = _upload_lock_for(cid)
+            try:
+                async with lock:
+                    await asyncio.to_thread(
+                        kb.build_index, cid,
+                        preset_id=preset_id,
+                        skip_bm25=True,
+                        skip_global=True,
+                    )
+            except Exception as exc:  # noqa: BLE001 — log + continue
+                state["failed_courses"].append(cid)
+                logger.warning(
+                    "embedding rebuild for course %s failed: %s",
+                    cid, type(exc).__name__,
+                    exc_info=True,
+                )
+            state["done_courses"] = i + 1
+
+        # Final pass: one global FAISS rebuild merging every course's
+        # freshly cached vectors. BM25 still skipped (preset-independent).
+        if course_ids:
+            try:
+                await asyncio.to_thread(
+                    kb.build_index,
+                    None,
+                    preset_id=preset_id,
+                    skip_bm25=True,
+                    skip_global=False,
+                )
+            except Exception as exc:  # noqa: BLE001
+                state["failed_courses"].append("__global__")
+                logger.warning(
+                    "embedding rebuild: final global pass failed (%s)",
+                    type(exc).__name__, exc_info=True,
+                )
+
+        terminal = "partial" if state["failed_courses"] else "done"
+        state.update({"status": terminal, "current_course": None, "ended_at": time.time()})
+        logger.info(
+            "embedding rebuild %s: %d course(s) under preset %s, %d failed",
+            terminal, len(course_ids), preset_id, len(state["failed_courses"]),
+        )
+    except Exception as exc:  # noqa: BLE001
+        # Swallow the message body — third-party libs (openai SDK, ST) can
+        # echo prompts/paths in __str__; type name + a separate logger
+        # (with full traceback locally) is the right surface for the UI.
+        state.update({
+            "status": "error",
+            "error": type(exc).__name__,
+            "ended_at": time.time(),
+        })
+        logger.warning("embedding rebuild loop raised", exc_info=True)
+
+
+def _kick_embedding_rebuild(preset_id: str) -> str:
+    """Schedule the rebuild task with a strong ref so the asyncio loop
+    doesn't GC it. Returns the task_id the frontend can poll on.
+
+    Caller (switch_embedding_preset) is responsible for ensuring no other
+    rebuild is in flight — the switch handler holds ``_EMBEDDING_SWITCH_LOCK``
+    around the 409 check + kick so two POSTs can't both schedule.
+    """
+    task_id = f"embed-rebuild-{uuid.uuid4().hex[:8]}"
+    t = asyncio.create_task(_embedding_rebuild_loop(task_id, preset_id))
+    _EMBEDDING_REBUILD_TASK.add(t)
+    t.add_done_callback(_EMBEDDING_REBUILD_TASK.discard)
+    return task_id
+
+
+def _embedding_presets_payload() -> list[dict]:
+    """Shape EMBEDDING_PRESETS for /api/status / settings UI consumption."""
+    return [
+        {
+            "id": pid,
+            "label": p["label"],
+            "description": p["description"],
+            "mode": p["mode"],
+            "model": p["model"],
+            "dim": p["dim"],
+            "requires_api_key": p["requires_api_key"],
+            "download_size_mb": p["download_size_mb"],
+        }
+        for pid, p in config.EMBEDDING_PRESETS.items()
+    ]
+
+
+def _embedding_rebuild_view() -> dict:
+    """Project ``_EMBEDDING_REBUILD_STATE`` for /api/status with a
+    stale-state translation (M1): a terminal status (``done`` / ``partial``
+    / ``error``) older than ``_EMBEDDING_REBUILD_VIEW_TTL_S`` is reported
+    as ``idle`` so the frontend banner doesn't stick across page loads.
+    Underlying state isn't mutated — the next switch resets it cleanly.
+    """
+    view = dict(_EMBEDDING_REBUILD_STATE)
+    status = view.get("status")
+    ended_at = view.get("ended_at")
+    if status in ("done", "partial", "error") and ended_at is not None:
+        if (time.time() - ended_at) > _EMBEDDING_REBUILD_VIEW_TTL_S:
+            view["status"] = "idle"
+    return view
+
+
+@app.post("/api/settings/embedding", tags=["system"],
+          summary="Switch active embedding preset")
+async def switch_embedding_preset(req: EmbeddingSwitchRequest):
+    if req.preset_id not in config.EMBEDDING_PRESETS:
+        raise HTTPException(400, f"unknown preset: {req.preset_id!r}")
+    preset = config.EMBEDDING_PRESETS[req.preset_id]
+    if preset["requires_api_key"] and not config.EMBEDDING_API_KEY:
+        raise HTTPException(
+            400,
+            f"preset {req.preset_id!r} requires EMBEDDING_API_KEY "
+            f"(or OPENAI_API_KEY as fallback). Set it in .env first.",
+        )
+
+    # H1: serialise the entire switch — preference write, kb reset, rebuild
+    # kick — so two concurrent POSTs can't interleave a rebuild's preset
+    # capture against a half-mutated config. Also lets us 409 cleanly when
+    # a rebuild is already running rather than spawning a racing second.
+    async with _EMBEDDING_SWITCH_LOCK:
+        # 409 if a rebuild is in flight for the same preset (idempotent
+        # no-op for the user) OR for any other preset (the operator should
+        # wait or explicitly cancel). We don't auto-cancel because the
+        # in-flight rebuild may already have re-embedded thousands of
+        # chunks — discarding that work silently is a worse UX than
+        # surfacing the conflict.
+        if _EMBEDDING_REBUILD_STATE.get("status") == "running":
+            active_preset = _EMBEDDING_REBUILD_STATE.get("preset_id")
+            raise HTTPException(
+                409,
+                f"embedding rebuild already in progress for preset "
+                f"{active_preset!r}; wait for it to finish before switching",
+            )
+
+        # Compute the previous preset BEFORE mutating config so we can
+        # roll back cleanly if a later step (kb reset / rewarm / rebuild
+        # kick) blows up (M7).
+        previous_preset = config.active_preset_id()
+        if previous_preset == "custom":
+            previous_preset = None  # no preset file to restore to
+
+        # Persist preference + mutate module-level EMBEDDING_MODE/MODEL.
+        try:
+            config.save_embedding_preference(req.preset_id)
+        except OSError as exc:
+            raise HTTPException(500, f"failed to persist preference: {exc}") from exc
+
+        # From here on, any failure must roll back the preference file so
+        # a restart doesn't load a preset whose rebuild never happened.
+        try:
+            # Drop cached embed_fn + indices. Next /api/chat or /api/search
+            # lazy-loads the new model and routes to the new preset's FAISS
+            # namespace.
+            kb.reset_embed_fn()
+
+            # Warm-up state: local-mode preset → re-warm in background;
+            # api-mode → no local model to load, mark warm immediately.
+            # Capture the target preset id in the closure so a later switch
+            # (blocked by our lock, but defensive) can't redirect _rewarm.
+            if preset["mode"] == "local":
+                app.state.embed_warm_ok = None
+                target_preset_id = req.preset_id
+
+                async def _rewarm():
+                    try:
+                        await asyncio.to_thread(lambda: kb.embed_fn(["__warmup__"]))
+                        # Only flip the badge to ok if the active preset
+                        # is still the one we warmed — a later switch
+                        # may have moved the goalposts.
+                        if config.active_preset_id() == target_preset_id:
+                            app.state.embed_warm_ok = True
+                    except Exception:  # noqa: BLE001
+                        if config.active_preset_id() == target_preset_id:
+                            app.state.embed_warm_ok = False
+                        logger.warning(
+                            "embed_fn re-warm after switch failed", exc_info=True,
+                        )
+
+                asyncio.create_task(_rewarm())
+            else:
+                app.state.embed_warm_ok = True
+
+            # Kick off background rebuild of every course's index. The
+            # endpoint returns immediately; UI polls /api/status →
+            # embedding_rebuild for progress.
+            task_id = _kick_embedding_rebuild(req.preset_id)
+        except Exception as exc:
+            # Roll back the preference file so on-disk state still points
+            # at the previous preset. We don't restore the in-process
+            # config.EMBEDDING_MODE/MODEL — they'll be re-read from the
+            # preference file (or env) on next restart.
+            if previous_preset is not None:
+                try:
+                    config.save_embedding_preference(previous_preset)
+                except OSError:
+                    logger.warning(
+                        "rollback of embedding preference to %s failed after switch error",
+                        previous_preset, exc_info=True,
+                    )
+            else:
+                # Operator was on a custom env config; drop the preference
+                # file so config reverts to env defaults next reload.
+                try:
+                    config.EMBEDDING_PREFERENCE_FILE.unlink(missing_ok=True)
+                except OSError:
+                    logger.warning(
+                        "rollback: failed to remove preference file",
+                        exc_info=True,
+                    )
+            raise HTTPException(
+                500, f"switch failed during {type(exc).__name__}; preference rolled back",
+            ) from exc
+
+    return {
+        "ok": True,
+        "preset_id": req.preset_id,
+        "embedding_mode": config.EMBEDDING_MODE,
+        "embedding_model": config.EMBEDDING_MODEL,
+        "rebuild_task_id": task_id,
+    }
+
+
 # ── Status / health ──────────────────────────────────────────────────
 @app.get("/api/status", tags=["system"], summary="System status and model usage")
 async def status_endpoint():
     courses = orchestrator.list_courses()
     total_chunks = sum(len(kb.get_chunks(c)) for c in courses)
     usage = router.get_usage_summary()
-    total_cost = usage.get("total_cost_usd", usage.get("total_cost", 0.0))
+    # 2026-05-20: `total_cost` removed from the payload. Router only tracks
+    # token counts; no backend has a $/token price table wired, so the
+    # field was always 0.0 — a misleading "$0.0000" in the UI. Re-introduce
+    # alongside an actual price-table lookup in `_track_usage` if needed.
 
-    # R4-5 part 2: surface qwen_raft health to the frontend so the backend
-    # chip can grey out when the AutoDL host is unreachable. Two facts:
-    #   - qwen_raft_configured = env var is set (operator opted in)
-    #   - qwen_raft_available  = health_check returned ok within 2s
-    # The health probe is wrapped in wait_for + broad except so this
-    # endpoint never 500s on a flaky AutoDL backend.
-    # fix-all v1 #V2 (R4-5 review v1): cache the qwen health probe so
-    # the frontend's 10s status poll across N tabs doesn't pin AutoDL
-    # with 6N outbound requests/min. TTL=15s means worst-case rate is
-    # 4 outbound/min regardless of tab count. Failure is cached too —
-    # no point hammering a dead host once we know it's dead.
-    qwen_configured = bool(config.QWEN_RAFT_URL)
-    qwen_available = False
-    if qwen_configured and "qwen_raft" in router.backends:
-        cached = getattr(app.state, "qwen_health_cache", None)
-        now = time.monotonic()
-        if cached is not None and (now - cached[0]) < QWEN_HEALTH_TTL_SECONDS:
-            qwen_available = bool(cached[1])
-        else:
-            try:
-                qwen_health = await asyncio.wait_for(
-                    router.backends["qwen_raft"].health_check(), timeout=2.0,
-                )
-                qwen_available = bool(qwen_health.get("ok"))
-            except Exception:  # noqa: BLE001 — status must never 500
-                qwen_available = False
-            app.state.qwen_health_cache = (now, qwen_available)
-    # 2026-05-13: parallel health probe for base Qwen Instruct
-    qwen_base_configured = bool(config.QWEN_BASE_URL)
-    qwen_base_available = False
-    if qwen_base_configured and "qwen_base" in router.backends:
-        cached = getattr(app.state, "qwen_base_health_cache", None)
-        now = time.monotonic()
-        if cached is not None and (now - cached[0]) < QWEN_HEALTH_TTL_SECONDS:
-            qwen_base_available = bool(cached[1])
-        else:
-            try:
-                qwen_base_health = await asyncio.wait_for(
-                    router.backends["qwen_base"].health_check(), timeout=2.0,
-                )
-                qwen_base_available = bool(qwen_base_health.get("ok"))
-            except Exception:  # noqa: BLE001
-                qwen_base_available = False
-            app.state.qwen_base_health_cache = (now, qwen_base_available)
-
-    # Settings page (A 档, 2026-05-12): expose model + base-URL + API-key
-    # *configuration state* so the frontend Settings tab can render
-    # "已配置 / 未配置" badges without ever seeing the secret values. Booleans
-    # only for API keys — `bool(config.OPENAI_API_KEY)` collapses the empty
-    # string default to False without leaking the actual key.
-    qwen_url_host: str | None = None
-    if config.QWEN_RAFT_URL:
-        try:
-            qwen_url_host = urllib_parse.urlparse(config.QWEN_RAFT_URL).hostname
-        except Exception:
-            qwen_url_host = None
+    # Settings: expose which backends are configured (no secret values).
+    available_backends = list(router.backends.keys())
 
     return {
-        "backends": list(router.backends.keys()),
+        "backends": available_backends,
+        "available_backends": available_backends,
         "courses": len(courses),
         "total_chunks": total_chunks,
-        "usage": {**usage, "total_cost": total_cost},
+        "usage": usage,
         "latency_ms": {
             "search_p50": _p50(LATENCY_SAMPLES["search"]),
             "chat_p50": _p50(LATENCY_SAMPLES["chat"]),
         },
         "embedding_mode": config.EMBEDDING_MODE,
         "embedding_model": config.EMBEDDING_MODEL,
-        # LaTeX-refactor: frontend reads this to decide whether to show the
-        # "高质量编译" PDF button (vs. only the browser-print fallback).
+        "embedding_presets": _embedding_presets_payload(),
+        "active_preset_id": config.active_preset_id(),
+        "embedding_api_configured": bool(config.EMBEDDING_API_KEY),
+        "embedding_rebuild": _embedding_rebuild_view(),
         "tectonic_available": bool(getattr(app.state, "tectonic_available", False)),
-        # PPTX → PDF sidecar converter (LibreOffice). When True, uploaded
-        # pptx files get a renderable PDF preview and the Reader's
-        # native iframe viewer instead of falling back to chunk-text mode.
         "pptx_pdf_available": bool(getattr(app.state, "pptx_pdf_available", False)),
-        # fix-all v2 #V2: surface embed warm state so operators see a
-        # degraded backend without grepping logs. None = warm-up still
-        # in flight (fire-and-forget hasn't resolved yet); False = failed.
         "embed_warm_ok": getattr(app.state, "embed_warm_ok", None),
-        # R4-5 part 2: qwen_raft backend chip uses these to decide
-        # disabled state + tooltip wording.
-        "qwen_raft_configured": qwen_configured,
-        "qwen_raft_available": qwen_available,
-        "qwen_base_configured": qwen_base_configured,
-        "qwen_base_available": qwen_base_available,
-        # Settings page read-only model/key/base-URL surface.
+        "mineru_warm_ok": getattr(app.state, "mineru_warm_ok", None),
+        # fix-all v1 M8: surface the sticky-disable reason so operators
+        # can debug "why is mineru in subprocess-CLI mode this session"
+        # without spelunking logs. None when server is healthy or
+        # un-attempted; otherwise a short reason string (e.g.
+        # "mineru-api CLI not found", "health check timed out").
+        "mineru_server_disabled_reason": _mineru_server_disabled_reason(),
         "default_backend": config.DEFAULT_BACKEND,
         "openai_model": config.OPENAI_MODEL,
-        "openai_base_url": config.OPENAI_BASE_URL,
+        "openai_base_url": _redact_url(config.OPENAI_BASE_URL),
         "openai_api_key_configured": bool(config.OPENAI_API_KEY),
         "claude_model": config.CLAUDE_MODEL,
         "anthropic_api_key_configured": bool(config.ANTHROPIC_API_KEY),
-        "qwen_raft_model_name": config.QWEN_RAFT_MODEL_NAME if qwen_configured else None,
-        "qwen_raft_url_host": qwen_url_host,
-        "qwen_base_model_name": config.QWEN_BASE_MODEL_NAME if qwen_base_configured else None,
-        # fix-all v1 #M5 (2026-05-16 review-swarm): expose which backend
-        # actually serves the rewrite_history task_type. Falls through
-        # the same router resolution path as production (TASK_ROUTES →
-        # DEFAULT_BACKEND → first-available fallback) so operators see
-        # the *effective* binding, not the static config entry.
-        "rewrite_history_backend": (
-            router.get_backend("rewrite_history").name
-            if router.backends else None
+        "local_llm_model": config.LOCAL_LLM_MODEL or None,
+        "local_llm_base_url": _redact_url(config.LOCAL_LLM_BASE_URL),
+        "local_llm_configured": bool(
+            config.LOCAL_LLM_BASE_URL and config.LOCAL_LLM_MODEL
         ),
         "version": app.version,
     }
@@ -3950,6 +4298,22 @@ def _p50(samples: list[float]) -> float:
         return 0.0
     ordered = sorted(samples)
     return round(ordered[len(ordered) // 2], 1)
+
+
+def _mineru_server_disabled_reason() -> str | None:
+    """Read the mineru-api sticky-disable reason for /api/status.
+
+    fix-all v1 M8: surfaces ``_MINERU_SERVER_DISABLED_REASON`` so an
+    operator viewing /api/status can tell whether the server is healthy,
+    intentionally disabled (env), or stuck on a startup failure. Import
+    is local so importing api.server doesn't drag in extractors_mineru
+    at module top level.
+    """
+    try:
+        from nano_notebooklm.ingest import extractors_mineru as _m
+        return _m._MINERU_SERVER_DISABLED_REASON
+    except Exception:  # noqa: BLE001 — status endpoint must never 500
+        return None
 
 
 def _kg_to_mindmap(kg_data: dict, course_id: str) -> dict:

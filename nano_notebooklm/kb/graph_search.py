@@ -252,11 +252,20 @@ def _resolve_node_embeddings(
     cache: dict[str, np.ndarray] = {}
     to_compute: list[tuple[str, str]] = []  # (node_id, text)
 
+    # Per-preset cache (2026-05-20): prefer the active preset's bucket; fall
+    # back to the legacy single `concept_embedding` only when its dim still
+    # matches (e.g. operator hasn't switched preset since the KG was built).
+    active_preset = config.active_preset_id()
     for node in nodes:
         nid = node.get("id") or ""
         if not nid:
             continue
-        cached = node.get("concept_embedding")
+        cached = None
+        bucket = node.get("concept_embeddings")
+        if isinstance(bucket, dict):
+            cached = bucket.get(active_preset)
+        if cached is None:
+            cached = node.get("concept_embedding")
         if cached is not None:
             try:
                 arr = np.asarray(cached, dtype=np.float32)
@@ -323,7 +332,15 @@ def _resolve_node_embeddings(
             if target is not None:
                 # Store as plain Python list so the cached dict stays
                 # JSON-serialisable if any caller later decides to flush.
-                target["concept_embedding"] = emb.tolist()
+                emb_list = emb.tolist()
+                # Per-preset write-back: populate the active preset's bucket
+                # and refresh the legacy field for old readers.
+                bucket = target.get("concept_embeddings")
+                if not isinstance(bucket, dict):
+                    bucket = {}
+                bucket[active_preset] = emb_list
+                target["concept_embeddings"] = bucket
+                target["concept_embedding"] = emb_list
         else:
             logger.debug(
                 "graph_search: batch embed for %s shape %s != expected (%d,)",

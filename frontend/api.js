@@ -30,11 +30,8 @@ function _post(path, payload, opts = {}) {
 }
 
 const API = {
-  // R4-1: mode="user" (default) hides preset courses; "all" returns everything.
-  // Frontend reads URL `?show_preset=1` to opt back into the all-courses view.
-  async getCourses(mode = "user") {
-    const qs = mode && mode !== "user" ? `?mode=${encodeURIComponent(mode)}` : "?mode=user";
-    return _request(`/courses${qs}`);
+  async getCourses() {
+    return _request(`/courses`);
   },
 
   async getSources(courseId) {
@@ -60,9 +57,9 @@ const API = {
       question, course_id: courseId, top_k: topK, checked_files: checkedFiles,
     };
     if (userLang) body.user_lang = userLang;
-    // R4-5 part 2: thread the backend chip selection through to ChatRequest.
-    // Server-side Pydantic Literal rejects anything other than "codex"/"qwen_raft".
-    if (backend === "codex" || backend === "qwen_raft" || backend === "qwen_base") body.backend = backend;
+    // Thread the backend chip selection. Server validates against the
+    // actually-configured router backends.
+    if (backend === "openai" || backend === "claude" || backend === "local") body.backend = backend;
     // 2026-05-12: persona chip — empty / null means use server default.
     if (persona && typeof persona === "string" && persona.trim()) {
       body.persona = persona.trim();
@@ -298,10 +295,6 @@ const API = {
     return res.json();
   },
 
-  async getMastery(courseId) {
-    return _request(`/mastery/${encodeURIComponent(courseId)}`);
-  },
-
   async getChunk(chunkId, { signal } = {}) {
     return _request(`/chunks/${encodeURIComponent(chunkId)}`, { signal });
   },
@@ -351,6 +344,16 @@ const API = {
 
   async getStatus() {
     return _request("/status");
+  },
+
+  // Switch the active embedding preset. Server persists the choice,
+  // resets kb.embed_fn, and kicks off a background rebuild of every
+  // course's FAISS index against the new model. UI should poll /api/status
+  // (embedding_rebuild field) for progress; the per-preset FAISS namespace
+  // means switching back to a previously-used preset is instant — its
+  // index is still on disk.
+  async setEmbeddingPreset(presetId) {
+    return _post("/settings/embedding", { preset_id: presetId });
   },
 
   async runSubagent(name, payload = {}) {

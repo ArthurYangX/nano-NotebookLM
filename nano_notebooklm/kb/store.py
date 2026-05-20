@@ -71,17 +71,24 @@ def _get_default_embed_fn() -> Callable[[list[str]], np.ndarray]:
 def _build_api_embed_fn() -> Callable[[list[str]], np.ndarray]:
     """Build an embedding function backed by an OpenAI-compatible /embeddings endpoint.
 
-    Uses OPENAI_BASE_URL / OPENAI_API_KEY from config. Vectors are L2-normalized to
-    match the local backend so cosine similarity (FAISS IP) stays correct.
+    Uses EMBEDDING_API_KEY / EMBEDDING_API_BASE_URL from config (fall back to
+    OPENAI_*). Vectors are L2-normalized to match the local backend so cosine
+    similarity (FAISS IP) stays correct.
+
+    2026-05-17: split out from OPENAI_* because DeepSeek chat backend doesn't
+    expose /v1/embeddings — embedding stays on the codex proxy by default.
     """
     import openai
 
-    if not config.OPENAI_API_KEY:
+    embed_key = config.EMBEDDING_API_KEY
+    embed_url = config.EMBEDDING_API_BASE_URL
+    if not embed_key:
         raise RuntimeError(
-            "EMBEDDING_MODE=api requires OPENAI_API_KEY. Set it in .env or switch to local."
+            "EMBEDDING_MODE=api requires EMBEDDING_API_KEY (or OPENAI_API_KEY as fallback). "
+            "Set it in .env or switch to local."
         )
 
-    client = openai.OpenAI(api_key=config.OPENAI_API_KEY, base_url=config.OPENAI_BASE_URL)
+    client = openai.OpenAI(api_key=embed_key, base_url=embed_url)
     model_name = config.EMBEDDING_MODEL
     # 2026-05-13: extend fallback to also catch the multilingual MiniLM
     # name — config.py defaults to that under EMBEDDING_MODE=local but a
@@ -110,12 +117,97 @@ def _build_api_embed_fn() -> Callable[[list[str]], np.ndarray]:
     return embed
 
 
+def migrate_legacy_faiss_layout(artifacts_dir: str | Path | None = None) -> dict:
+    """One-shot: indices/faiss/{global,course_id} → indices/faiss/<preset>/...
+
+    Older builds (pre-preset namespacing) stored FAISS directly under
+    ``indices/faiss/<suffix>/``. The new layout interposes a preset segment
+    so per-preset caches don't collide. On first startup after the upgrade
+    we move existing bare directories under the active preset namespace so
+    the user doesn't lose their indexed corpus.
+
+    Idempotent per-entry: each remaining bare directory is migrated on its
+    own; we never short-circuit on "preset dir already exists" because that
+    could leave one legacy dir behind after a partial migration (review-
+    swarm fix-all #M4). Symlinks are skipped (#M2 — symlink under indices/
+    pointing outside the artifacts tree must not be followed by rename/
+    move). Cross-mount renames fall back to ``shutil.move``.
+    """
+    import shutil as _shutil
+
+    root = Path(artifacts_dir or config.ARTIFACTS_DIR) / "indices" / "faiss"
+    if not root.exists():
+        return {"moved": [], "skipped": "no faiss dir"}
+
+    active = config.active_preset_id()
+    if active == "custom":
+        # Operator pinned EMBEDDING_MODEL to a non-preset value via env —
+        # we can't safely guess which preset owns the legacy indices. Leave
+        # them in place; the operator can rename the directory manually.
+        return {"moved": [], "skipped": "custom preset"}
+
+    preset_dir = root / active
+    # Anything at root not named after a known preset id (incl. "custom") is
+    # a legacy bare-suffix directory. Skip symlinks defensively.
+    legacy_dirs = [
+        p for p in root.iterdir()
+        if p.is_dir()
+        and not p.is_symlink()
+        and p.name not in config.EMBEDDING_PRESETS
+        and p.name != "custom"
+    ]
+    if not legacy_dirs:
+        return {"moved": [], "skipped": "already migrated"}
+
+    preset_dir.mkdir(parents=True, exist_ok=True)
+    moved: list[str] = []
+    skipped: list[str] = []
+    for src in legacy_dirs:
+        dst = preset_dir / src.name
+        # Defensive path-resolve check: dst must stay inside preset_dir
+        # (#M2 symlink/traversal guard). resolve() collapses ``..``.
+        try:
+            dst.resolve().relative_to(preset_dir.resolve())
+        except ValueError:
+            logger.warning(
+                "migrate_legacy_faiss_layout: %s resolves outside preset dir; skipping",
+                dst,
+            )
+            skipped.append(src.name)
+            continue
+        if dst.exists():
+            logger.info(
+                "migrate_legacy_faiss_layout: dst %s already exists; leaving %s in place",
+                dst, src,
+            )
+            skipped.append(src.name)
+            continue
+        try:
+            _shutil.move(str(src), str(dst))
+            moved.append(src.name)
+        except OSError as exc:
+            logger.warning(
+                "migrate_legacy_faiss_layout: failed to move %s → %s (%s); leaving in place",
+                src, dst, type(exc).__name__,
+            )
+            skipped.append(src.name)
+    logger.info(
+        "migrate_legacy_faiss_layout: moved %d / skipped %d legacy dir(s) under %s/",
+        len(moved), len(skipped), active,
+    )
+    return {"moved": moved, "skipped_dirs": skipped, "target_preset": active}
+
+
 class KBStore:
     """Central knowledge base managing documents, chunks, and search indices."""
 
     def __init__(self, artifacts_dir: str | Path | None = None, embed_fn: Callable | None = None):
         self.artifacts_dir = Path(artifacts_dir or config.ARTIFACTS_DIR)
         self._embed_fn = embed_fn
+        # If caller passed a custom embed_fn (test fixtures, scripts), pin
+        # the active preset to whatever they're using — we never auto-switch
+        # the path namespace under a caller that injected their own fn.
+        self._embed_fn_pinned = embed_fn is not None
         self._vector_index: VectorIndex | None = None
         self._bm25_index: BM25Index | None = None
         self._hybrid: HybridSearch | None = None
@@ -130,12 +222,45 @@ class KBStore:
             self._embed_fn = _get_default_embed_fn()
         return self._embed_fn
 
+    def reset_embed_fn(self) -> None:
+        """Drop cached embed_fn and any loaded indices.
+
+        Called when the user switches embedding preset — next access to
+        ``embed_fn`` lazy-loads the new model, and next ``search`` triggers
+        a fresh ``_load_indices`` against the new preset's FAISS namespace.
+        Indexes themselves are not deleted; switching back to a previously-
+        used preset reads its existing files instantly.
+        """
+        if self._embed_fn_pinned:
+            # Caller-injected embed_fn → reset would break their wiring.
+            return
+        self._embed_fn = None
+        self._vector_index = None
+        self._bm25_index = None
+        self._hybrid = None
+        self._all_chunks = []
+        self._chunk_index = None
+
+    def _faiss_root(self, preset_id: str | None = None) -> Path:
+        """Per-preset FAISS namespace. All save/load goes through here so a
+        preset switch becomes a path-route, not a destructive rebuild.
+
+        ``preset_id`` overrides ``config.active_preset_id()`` — used by the
+        embedding rebuild loop to pin writes to the preset captured at
+        task-spawn time, so an intervening preset switch (review-swarm H1)
+        cannot make rebuild-A's freshly embedded vectors land under
+        preset-B's namespace.
+        """
+        active = preset_id or config.active_preset_id()
+        return self.artifacts_dir / "indices" / "faiss" / active
+
     def ingest_course(
         self,
         course_dir: str | Path,
         course_id: str | None = None,
         engine: str = "pymupdf",
         lang: str = "ch",
+        on_progress: Callable[[int, int], None] | None = None,
     ) -> Course:
         """Ingest all documents from a course directory.
 
@@ -216,9 +341,15 @@ class KBStore:
                         type(exc).__name__,
                     )
 
+        total_files = len(files)
+        if on_progress:
+            try:
+                on_progress(0, max(total_files, 1))
+            except Exception:
+                logger.warning("on_progress raised at start; suppressed", exc_info=True)
         with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}")) as progress:
-            task = progress.add_task(f"Ingesting {course_id}...", total=len(files))
-            for filepath in files:
+            task = progress.add_task(f"Ingesting {course_id}...", total=total_files)
+            for i, filepath in enumerate(files, start=1):
                 try:
                     pages: list[PageInfo] | None = None
                     if engine == "mineru" and filepath.suffix.lower() == ".pdf":
@@ -247,6 +378,11 @@ class KBStore:
                     logger.warning(f"Failed to process {filepath}: {e}")
                 finally:
                     progress.advance(task)
+                    if on_progress:
+                        try:
+                            on_progress(i, max(total_files, 1))
+                        except Exception:
+                            logger.warning("on_progress raised mid-loop; suppressed", exc_info=True)
 
         # Save chunks
         chunks_path = course_artifacts / "chunks.json"
@@ -274,7 +410,15 @@ class KBStore:
         logger.info(f"Ingested {course_id}: {len(all_chunks)} chunks from {len(files)} files")
         return course
 
-    def build_index(self, course_id: str | None = None):
+    def build_index(
+        self,
+        course_id: str | None = None,
+        on_embed_progress: Callable[[int, int], None] | None = None,
+        *,
+        preset_id: str | None = None,
+        skip_bm25: bool = False,
+        skip_global: bool = False,
+    ):
         """Build search indices.
 
         review-swarm fix-all v3 #C7: a single-course rebuild used to
@@ -288,8 +432,20 @@ class KBStore:
           full ``_load_all_chunks(None)`` set and persist it as the global
           index. Subsequent ``search`` calls always see the union of
           courses regardless of which course triggered the rebuild.
+
+        Keyword-only args (review-swarm fix-all #H1/#M3, 2026-05-20):
+          preset_id: pin FAISS writes to this preset namespace, ignoring
+            ``config.active_preset_id()``. Used by the embedding rebuild
+            loop so an intervening preset switch can't redirect vectors.
+          skip_bm25: skip BM25 rebuild (preset-independent — pure waste
+            during a preset switch where only embeddings change).
+          skip_global: skip the global FAISS+BM25 rebuild and the
+            in-memory hybrid index update. Used by the rebuild loop to
+            avoid an N+1 global rebuild — caller does one final pass
+            with skip_global=False after the loop.
         """
         index_dir = self.artifacts_dir / "indices"
+        faiss_root = self._faiss_root(preset_id)
 
         # review-swarm fix-all v2 (2026-05-16): load cached embeddings
         # from the previously-saved global index so unchanged chunks
@@ -297,35 +453,112 @@ class KBStore:
         # via the API. Before this fix, every upload triggered a full
         # re-embed of all 10k chunks at ~60s/batch through codex proxy
         # = ~2.5 hours. With cache, a 374-chunk delta uploads in ~6 min.
-        global_cache_dir = index_dir / "faiss" / "global"
+        global_cache_dir = faiss_root / "global"
         cached_global = VectorIndex.load_cached_vectors(global_cache_dir)
 
+        # Pre-compute total miss count across both build phases so the
+        # emitted progress is monotonic and uses a single shared denominator
+        # (otherwise the bar would hit 100% during per-course build, then
+        # restart from 0% for the global build).
+        course_chunks_pre: list[Chunk] = []
+        per_course_misses: int = 0
+        # Computed once in the pre-compute pass and reused by the per-course
+        # build below — avoids a second `load_cached_vectors` round-trip
+        # (FAISS deserialize + meta JSON parse) for the same per-course
+        # cache directory.
+        course_merged_cache: dict | None = None
+        merged_cache_pre: dict = cached_global
         if course_id:
-            course_chunks = self._load_all_chunks(course_id)
+            course_chunks_pre = self._load_all_chunks(course_id)
+            if course_chunks_pre:
+                course_cache_dir_pre = faiss_root / course_id
+                cached_course_pre = VectorIndex.load_cached_vectors(course_cache_dir_pre)
+                merged_cache_pre = {**cached_global, **cached_course_pre}
+                course_merged_cache = merged_cache_pre
+                per_course_misses = sum(1 for c in course_chunks_pre if c.chunk_id not in merged_cache_pre)
+        all_chunks_pre = self._load_all_chunks(None)
+        # After per-course build, its fresh vectors land in cached_global,
+        # so global build's misses are roughly the chunks not yet anywhere.
+        post_per_course_known = set(merged_cache_pre.keys()) | {c.chunk_id for c in course_chunks_pre}
+        global_misses = sum(1 for c in all_chunks_pre if c.chunk_id not in post_per_course_known)
+        total_embed_misses = max(1, per_course_misses + global_misses)
+        embed_done = 0
+
+        def _embed_cb_factory(phase_total: int):
+            """Return a per-phase on_progress mapped into the global denominator.
+
+            Must be called *after* the prior phase finished, so it captures
+            the up-to-date ``embed_done`` as this phase's start offset.
+            Inside ``_cb`` we (a) clamp the in-phase count to ``phase_total``
+            in case the underlying build over-counts (e.g. dim-mismatch
+            recursion re-embeds everything), and (b) enforce monotonicity so
+            the outer bar never visually regresses. Traceback for outer-cb
+            failures is logged once per phase to avoid spamming when the
+            callback is consistently broken.
+            """
+            phase_start = embed_done
+            cb_failed = [False]
+            def _cb(done_in_phase: int, _total_in_phase: int):
+                nonlocal embed_done
+                clamped = min(max(done_in_phase, 0), max(phase_total, 0))
+                new_done = min(phase_start + clamped, total_embed_misses)
+                if new_done < embed_done:
+                    new_done = embed_done
+                embed_done = new_done
+                if on_embed_progress:
+                    try:
+                        on_embed_progress(embed_done, total_embed_misses)
+                    except Exception:
+                        if not cb_failed[0]:
+                            logger.warning(
+                                "on_embed_progress raised; suppressing further tracebacks this phase",
+                                exc_info=True,
+                            )
+                            cb_failed[0] = True
+            return _cb
+
+        # Kick off so the bar leaves 0% even when total_embed_misses is 0
+        # (full cache hit — both builds will be instant).
+        if on_embed_progress and total_embed_misses == 0:
+            try:
+                on_embed_progress(1, 1)
+            except Exception:
+                logger.warning("on_embed_progress raised at kickoff; suppressed", exc_info=True)
+
+        if course_id:
+            course_chunks = course_chunks_pre
             if course_chunks:
                 # Per-course rebuild also benefits from the same cache —
                 # course's own chunks may already be in the global cache
-                # from a prior rebuild.
-                course_cache_dir = index_dir / "faiss" / course_id
-                cached_course = VectorIndex.load_cached_vectors(course_cache_dir)
-                # Merge global cache as fallback (covers chunks that
-                # exist globally but aren't yet in this course's per-
-                # course saved index — e.g. first time this course is
-                # rebuilt after a global rebuild created them).
-                merged_cache = {**cached_global, **cached_course}
+                # from a prior rebuild. We reuse the merged cache computed
+                # in the pre-compute pass above (`course_merged_cache`)
+                # rather than reloading the per-course FAISS index.
+                course_cache_dir = faiss_root / course_id
+                merged_cache = course_merged_cache if course_merged_cache is not None else cached_global
                 course_vector = VectorIndex(self.embed_fn)
-                course_vector.build(course_chunks, cached_vectors=merged_cache)
+                course_vector.build(
+                    course_chunks,
+                    cached_vectors=merged_cache,
+                    on_progress=_embed_cb_factory(per_course_misses),
+                )
                 course_vector.save(course_cache_dir)
                 # Pull freshly-embedded vectors so the global build
                 # below can reuse them instead of re-embedding the same
                 # chunks a second time. Without this, the per-course +
                 # global rebuild pattern double-pays for new chunks.
                 cached_global.update(VectorIndex.load_cached_vectors(course_cache_dir))
-                course_bm25 = BM25Index()
-                course_bm25.build(course_chunks)
-                course_bm25.save(index_dir / "bm25" / f"{course_id}.json")
+                if not skip_bm25:
+                    course_bm25 = BM25Index()
+                    course_bm25.build(course_chunks)
+                    course_bm25.save(index_dir / "bm25" / f"{course_id}.json")
 
-        all_chunks = self._load_all_chunks(None)
+        if skip_global:
+            # Caller is doing a multi-course rebuild and will issue one
+            # global pass at the end — skip the per-iteration global
+            # rebuild to avoid N+1 work.
+            return
+
+        all_chunks = all_chunks_pre
         if not all_chunks:
             logger.warning("No chunks to index")
             return
@@ -334,19 +567,30 @@ class KBStore:
 
         logger.info(f"Building global vector index for {len(all_chunks)} chunks...")
         self._vector_index = VectorIndex(self.embed_fn)
-        self._vector_index.build(all_chunks, cached_vectors=cached_global)
+        self._vector_index.build(
+            all_chunks,
+            cached_vectors=cached_global,
+            on_progress=_embed_cb_factory(global_misses),
+        )
 
-        logger.info("Building global BM25 index...")
-        self._bm25_index = BM25Index()
-        self._bm25_index.build(all_chunks)
-
-        self._hybrid = HybridSearch(self._vector_index, self._bm25_index)
+        if not skip_bm25:
+            logger.info("Building global BM25 index...")
+            self._bm25_index = BM25Index()
+            self._bm25_index.build(all_chunks)
+            self._hybrid = HybridSearch(self._vector_index, self._bm25_index)
+        else:
+            # No BM25 update — preserve the existing global BM25 from disk
+            # so hybrid search still works. _hybrid stays untouched if it
+            # was already loaded; otherwise next search will lazy-load.
+            if self._bm25_index is not None:
+                self._hybrid = HybridSearch(self._vector_index, self._bm25_index)
 
         # Invalidate find_chunk cache — _all_chunks just changed.
         self._chunk_index = None
 
-        self._vector_index.save(index_dir / "faiss" / "global")
-        self._bm25_index.save(index_dir / "bm25" / "global.json")
+        self._vector_index.save(faiss_root / "global")
+        if not skip_bm25:
+            self._bm25_index.save(index_dir / "bm25" / "global.json")
 
         logger.info(f"Global index built: {self._vector_index.total_vectors} vectors")
 
@@ -457,7 +701,7 @@ class KBStore:
         index_dir = self.artifacts_dir / "indices"
         suffix = course_id if course_id else "global"
 
-        faiss_dir = index_dir / "faiss" / suffix
+        faiss_dir = self._faiss_root() / suffix
         bm25_path = index_dir / "bm25" / f"{suffix}.json"
         # Legacy .pkl files (pre fix-all v3 #C6) are intentionally not loaded
         # — pickle.load was the RCE risk; on a fresh build a .json sibling

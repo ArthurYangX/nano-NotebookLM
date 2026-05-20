@@ -98,10 +98,30 @@ function Settings({
   persona, onCommitPersona,
   hiddenCourseIds, onUnhideAll,
   courses,
+  theme, onCommitTheme, autoResolved,
+  density, onCommitDensity,
+  baseSize, onCommitBaseSize,
+  onStatusRefresh,
 }) {
   const [storageScan, setStorageScan] = useS(() => _scanLocalStorage());
   const [personaDraft, setPersonaDraft] = useS(persona || "");
+  // Embedding preset switch UX: while the POST is in flight we set
+  // `embedSwitching` to the target preset_id so the radio shows a loading
+  // hint and other radios disable. Once the server acks, we clear it; the
+  // backend's `embedding_rebuild` state then drives the banner via polling.
+  const [embedSwitching, setEmbedSwitching] = useS(null);
+  const [embedSwitchError, setEmbedSwitchError] = useS(null);
   useSEffect(() => { setPersonaDraft(persona || ""); }, [persona]);
+
+  // While a background rebuild is running, tick /api/status faster so the
+  // banner progresses smoothly. Cleans up on idle / unmount.
+  const rebuildState = (backendStatus && backendStatus.embedding_rebuild) || null;
+  const rebuildRunning = rebuildState && rebuildState.status === "running";
+  useSEffect(() => {
+    if (!rebuildRunning || !onStatusRefresh) return undefined;
+    const t = setInterval(() => { onStatusRefresh(); }, 1500);
+    return () => clearInterval(t);
+  }, [rebuildRunning, onStatusRefresh]);
 
   function rescan() { setStorageScan(_scanLocalStorage()); }
 
@@ -148,6 +168,9 @@ function Settings({
           "nano-nlm:v1:notes-toc-hidden",
           "nano-nlm:v1:pdf-outline-hidden",
           "nano-nlm:v1:notes-toolbar-collapsed",
+          "nano-nlm:v1:theme",
+          "nano-nlm:v1:density",
+          "nano-nlm:v1:base-size",
         ]);
         if (preserved.has(k)) continue;
         toDel.push(k);
@@ -170,6 +193,9 @@ function Settings({
       "nano-nlm:v1:notes-toc-hidden",
       "nano-nlm:v1:pdf-outline-hidden",
       "nano-nlm:v1:notes-toolbar-collapsed",
+      "nano-nlm:v1:theme",
+      "nano-nlm:v1:density",
+      "nano-nlm:v1:base-size",
     ].forEach(k => {
       try { window.localStorage.removeItem(k); }
       catch (e) { console.warn("[settings] resetAllPrefs: removeItem(" + k + ") failed:", e); }
@@ -183,14 +209,35 @@ function Settings({
   // statusReady 用于驱动加载态 badge / 占位符，避免首屏闪红误导。
   const s = backendStatus || {};
   const statusReady = !!backendStatus;
-  const qwenConfigured = !!s.qwen_raft_configured;
-  const qwenAvailable = !!s.qwen_raft_available;
-  // 2026-05-13: parallel base Qwen2.5-7B-Instruct option
-  const qwenBaseConfigured = !!s.qwen_base_configured;
-  const qwenBaseAvailable = !!s.qwen_base_available;
+  const available = new Set(s.available_backends || s.backends || []);
+  const claudeAvailable = available.has("claude");
+  const localConfigured = !!s.local_llm_configured;
+  const localAvailable = available.has("local");
   const embedWarm = s.embed_warm_ok;
   const embedWarmLabel = embedWarm == null ? "warming…" : (embedWarm ? "ok" : "failed");
   const loadingDash = statusReady ? "—" : "加载中…";
+
+  // ── Embedding presets ──
+  const presets = Array.isArray(s.embedding_presets) ? s.embedding_presets : [];
+  const activePresetId = s.active_preset_id || null;
+  const embedApiConfigured = !!s.embedding_api_configured;
+
+  async function pickEmbedding(presetId) {
+    if (!presetId || presetId === activePresetId || embedSwitching) return;
+    setEmbedSwitchError(null);
+    setEmbedSwitching(presetId);
+    try {
+      await window.API.setEmbeddingPreset(presetId);
+      // Refresh /api/status so the radio + banner reflect the new active
+      // preset and the rebuild state appears immediately.
+      if (onStatusRefresh) onStatusRefresh();
+    } catch (e) {
+      console.warn("[settings] setEmbeddingPreset failed:", e);
+      setEmbedSwitchError(e && e.message ? e.message : String(e));
+    } finally {
+      setEmbedSwitching(null);
+    }
+  }
 
   // ── 课程信息（用于课程缓存表） ──
   const courseLookup = useSMemo(() => {
@@ -213,67 +260,77 @@ function Settings({
         {/* ───────── AI Backend & Models ───────── */}
         <Section title="AI Backend & Models" hint="只读 — 改 .env 后重启服务">
           <div className="settings-radio-group">
-            <label className={"settings-radio" + (backend === "codex" ? " active" : "")}>
+            {(() => {
+              const openaiLabel = (() => {
+                const url = (s.openai_base_url || "").toLowerCase();
+                if (url.includes("deepseek")) return "DeepSeek";
+                if (url.includes("moonshot")) return "Moonshot (Kimi)";
+                if (url.includes("zhipu") || url.includes("bigmodel")) return "Zhipu (GLM)";
+                if (url.includes("minimax")) return "MiniMax";
+                if (url.includes("groq")) return "Groq";
+                if (url.includes("together")) return "Together";
+                if (url.includes("googleapis") || url.includes("generativelanguage")) return "Gemini";
+                if (url.includes("openai.com")) return "OpenAI";
+                return "OpenAI-compatible";
+              })();
+              return (
+                <label className={"settings-radio" + (backend === "openai" ? " active" : "")}>
+                  <input
+                    type="radio"
+                    name="backend"
+                    value="openai"
+                    checked={backend === "openai"}
+                    disabled={!available.has("openai")}
+                    onChange={() => onCommitBackend && onCommitBackend("openai")}
+                  />
+                  <div>
+                    <div className="settings-radio-title">🤖 {openaiLabel} {s.openai_model || "—"} <span className="settings-tag">主路径</span></div>
+                    <div className="settings-radio-desc">
+                      模型: <code>{s.openai_model || loadingDash}</code>，base URL: <code>{s.openai_base_url || loadingDash}</code>
+                    </div>
+                  </div>
+                </label>
+              );
+            })()}
+
+            <label className={"settings-radio" + (backend === "claude" ? " active" : "") + (!claudeAvailable ? " disabled" : "")}>
               <input
                 type="radio"
                 name="backend"
-                value="codex"
-                checked={backend === "codex"}
-                onChange={() => onCommitBackend && onCommitBackend("codex")}
-              />
-              <div>
-                <div className="settings-radio-title">🤖 Codex {(s.openai_model || "").replace(/^gpt-/i, "GPT-") || "GPT"} <span className="settings-tag">主路径</span></div>
-                <div className="settings-radio-desc">
-                  生产默认。模型: <code>{s.openai_model || loadingDash}</code>，base URL: <code>{s.openai_base_url || loadingDash}</code>
-                </div>
-              </div>
-            </label>
-            <label className={"settings-radio" + (backend === "qwen_raft" ? " active" : "") + (!statusReady || !qwenConfigured || !qwenAvailable ? " disabled" : "")}>
-              <input
-                type="radio"
-                name="backend"
-                value="qwen_raft"
-                checked={backend === "qwen_raft"}
-                disabled={!statusReady || !qwenConfigured || !qwenAvailable}
-                onChange={() => onCommitBackend && onCommitBackend("qwen_raft")}
-              />
-              <div>
-                <div className="settings-radio-title">
-                  🎓 Qwen2.5-7B-RAFT <span className="settings-tag">微调 · 7B · 4-bit (nf4)</span>
-                  {!statusReady && <span className="settings-badge warn">加载中…</span>}
-                  {statusReady && !qwenConfigured && <Badge ok={false} labelBad="未配置 QWEN_RAFT_URL" />}
-                  {statusReady && qwenConfigured && !qwenAvailable && <Badge ok={false} labelBad="AutoDL 主机不可达" />}
-                </div>
-                <div className="settings-radio-desc">
-                  {qwenConfigured
-                    ? <>模型: <code>{s.qwen_raft_model_name || "—"}</code> · host: <code>{s.qwen_raft_url_host || "—"}</code></>
-                    : <>在 <code>.env</code> 设置 <code>QWEN_RAFT_URL</code> 启用本地微调后端</>}
-                </div>
-              </div>
-            </label>
-            {/* 2026-05-13: parallel base Qwen2.5-7B-Instruct option for
-                A/B compare with RAFT. Same backend class, different URL
-                (QWEN_BASE_URL pointing at :8002 on AutoDL host). */}
-            <label className={"settings-radio" + (backend === "qwen_base" ? " active" : "") + (!statusReady || !qwenBaseConfigured || !qwenBaseAvailable ? " disabled" : "")}>
-              <input
-                type="radio"
-                name="backend"
-                value="qwen_base"
-                checked={backend === "qwen_base"}
-                disabled={!statusReady || !qwenBaseConfigured || !qwenBaseAvailable}
-                onChange={() => onCommitBackend && onCommitBackend("qwen_base")}
+                value="claude"
+                checked={backend === "claude"}
+                disabled={!claudeAvailable}
+                onChange={() => onCommitBackend && onCommitBackend("claude")}
               />
               <div>
                 <div className="settings-radio-title">
-                  🐧 Qwen2.5-7B-Instruct <span className="settings-tag">基座 · 7B · 4-bit (nf4)</span>
-                  {!statusReady && <span className="settings-badge warn">加载中…</span>}
-                  {statusReady && !qwenBaseConfigured && <Badge ok={false} labelBad="未配置 QWEN_BASE_URL" />}
-                  {statusReady && qwenBaseConfigured && !qwenBaseAvailable && <Badge ok={false} labelBad="AutoDL 主机不可达" />}
+                  🧠 Anthropic Claude
+                  {statusReady && !claudeAvailable && <Badge ok={false} labelBad="未配置 ANTHROPIC_API_KEY" />}
                 </div>
                 <div className="settings-radio-desc">
-                  {qwenBaseConfigured
-                    ? <>模型: <code>{s.qwen_base_model_name || "—"}</code> · 未经 RAFT 微调，更善于调用预训练知识</>
-                    : <>在 <code>.env</code> 设置 <code>QWEN_BASE_URL</code> 启用基座对照</>}
+                  模型: <code>{s.claude_model || loadingDash}</code>
+                </div>
+              </div>
+            </label>
+
+            <label className={"settings-radio" + (backend === "local" ? " active" : "") + (!localAvailable ? " disabled" : "")}>
+              <input
+                type="radio"
+                name="backend"
+                value="local"
+                checked={backend === "local"}
+                disabled={!localAvailable}
+                onChange={() => onCommitBackend && onCommitBackend("local")}
+              />
+              <div>
+                <div className="settings-radio-title">
+                  💻 Local model <span className="settings-tag">Ollama / vLLM / LM Studio</span>
+                  {statusReady && !localConfigured && <Badge ok={false} labelBad="未配置 LOCAL_LLM_BASE_URL" />}
+                </div>
+                <div className="settings-radio-desc">
+                  {localConfigured
+                    ? <>模型: <code>{s.local_llm_model || "—"}</code> · endpoint: <code>{s.local_llm_base_url || "—"}</code></>
+                    : <>在 <code>.env</code> 设置 <code>LOCAL_LLM_BASE_URL</code> + <code>LOCAL_LLM_MODEL</code> 启用本地模型</>}
                 </div>
               </div>
             </label>
@@ -282,18 +339,107 @@ function Settings({
           <hr className="settings-divider" />
 
           <Row label="Default backend (.env)" value={<code>{s.default_backend || loadingDash}</code>} />
-          <Row label="OpenAI / Codex model" value={<code>{s.openai_model || loadingDash}</code>} />
-          <Row label="OpenAI base URL" value={<code>{s.openai_base_url || loadingDash}</code>} />
-          <Row label="OPENAI_API_KEY" value={<LoadingBadge ready={statusReady} ok={!!s.openai_api_key_configured} />} />
-          <Row label="Claude model" value={<code>{s.claude_model || loadingDash}</code>} />
-          <Row label="ANTHROPIC_API_KEY" value={<LoadingBadge ready={statusReady} ok={!!s.anthropic_api_key_configured} />} />
+          <Row label="Main API model" value={<code>{s.openai_model || loadingDash}</code>} />
+          <Row label="Main API base URL" value={<code>{s.openai_base_url || loadingDash}</code>} />
+          <Row label="Main API key" value={<LoadingBadge ready={statusReady} ok={!!s.openai_api_key_configured} />} />
           <Row label="Active backends" value={<code>{statusReady ? ((s.backends || []).join(", ") || "—") : "加载中…"}</code>} />
         </Section>
 
-        {/* ───────── Embedding & Tools ───────── */}
-        <Section title="Embedding & Tools" hint="只读">
+        {/* ───────── Embedding Model ───────── */}
+        <Section title="Embedding Model" hint="切换会按需在后台重建索引 · 切回旧选项是秒切（每个预设保留独立索引）">
+          {/* Rebuild progress banner — surfaces after a switch while
+              kb.build_index runs across all courses for the new preset. */}
+          {rebuildState && rebuildState.status === "running" && (
+            <div className="settings-banner warn" style={{ marginBottom: 10 }}>
+              <strong>正在重建索引</strong> · 预设 <code>{rebuildState.preset_id}</code> · 进度{" "}
+              {rebuildState.done_courses}/{rebuildState.total_courses}
+              {rebuildState.current_course ? <> · 当前 <code>{rebuildState.current_course}</code></> : null}
+              <div className="settings-pref-hint">期间问答可用，但未重建课程的语义检索会临时退化为 BM25-only。</div>
+            </div>
+          )}
+          {rebuildState && rebuildState.status === "done" && rebuildState.preset_id && (
+            <div className="settings-banner ok" style={{ marginBottom: 10 }}>
+              ✓ 索引已重建至 <code>{rebuildState.preset_id}</code>（{rebuildState.done_courses} 门课程）
+            </div>
+          )}
+          {/* H5: some courses failed mid-build. Status is "partial" — render
+              the failed list so the user knows which courses' retrieval is
+              broken instead of seeing a misleading green "done" banner. */}
+          {rebuildState && rebuildState.status === "partial" && (
+            <div className="settings-banner bad" style={{ marginBottom: 10 }}>
+              ⚠ 部分重建失败 · 预设 <code>{rebuildState.preset_id}</code>
+              （{rebuildState.done_courses}/{rebuildState.total_courses} 完成）
+              {Array.isArray(rebuildState.failed_courses) && rebuildState.failed_courses.length > 0 && (
+                <div className="settings-pref-hint">
+                  失败课程：{rebuildState.failed_courses.map(c => <code key={c} style={{ marginRight: 6 }}>{c}</code>)}
+                  <br />可重新选这个预设触发重试，或检查服务端日志。
+                </div>
+              )}
+            </div>
+          )}
+          {rebuildState && rebuildState.status === "error" && (
+            <div className="settings-banner bad" style={{ marginBottom: 10 }}>
+              重建失败：<code>{rebuildState.error || "unknown"}</code>
+            </div>
+          )}
+          {embedSwitchError && (
+            <div className="settings-banner bad" style={{ marginBottom: 10 }}>
+              切换失败：{embedSwitchError}
+            </div>
+          )}
+
+          <div className="settings-radio-group">
+            {presets.map(p => {
+              const disabled = (p.requires_api_key && !embedApiConfigured) || (embedSwitching && embedSwitching !== p.id);
+              const isActive = activePresetId === p.id;
+              const isSwitching = embedSwitching === p.id;
+              const blockedByKey = p.requires_api_key && !embedApiConfigured;
+              return (
+                <label
+                  key={p.id}
+                  className={"settings-radio" + (isActive ? " active" : "") + (disabled ? " disabled" : "")}
+                >
+                  <input
+                    type="radio"
+                    name="embedding-preset"
+                    value={p.id}
+                    checked={isActive}
+                    disabled={!!disabled}
+                    onChange={() => pickEmbedding(p.id)}
+                  />
+                  <div>
+                    <div className="settings-radio-title">
+                      {p.label}
+                      {" "}<span className="settings-tag">{p.mode === "api" ? "API" : "本地"} · {p.dim}d</span>
+                      {isSwitching && <span className="settings-badge warn" style={{ marginLeft: 8 }}>切换中…</span>}
+                      {statusReady && blockedByKey && <Badge ok={false} labelBad="未配置 EMBEDDING_API_KEY" />}
+                    </div>
+                    <div className="settings-radio-desc">
+                      {p.description}
+                      {p.download_size_mb > 0 && (
+                        <> · 首次下载约 {(p.download_size_mb / 1024).toFixed(1)} GB</>
+                      )}
+                      <br />
+                      <span style={{ color: "var(--ink-3, #888)" }}>
+                        模型: <code>{p.model}</code>
+                      </span>
+                    </div>
+                  </div>
+                </label>
+              );
+            })}
+            {activePresetId === "custom" && (
+              <div className="settings-pref-hint" style={{ marginTop: 6 }}>
+                ⚠ 当前 <code>EMBEDDING_MODEL</code> 是 env 自定义值（<code>{s.embedding_model || "—"}</code>），不属于任何预设。选一个预设后会持久化并覆盖 env 默认。
+              </div>
+            )}
+          </div>
+
+          <hr className="settings-divider" />
+
           <Row label="Embedding mode" value={<code>{s.embedding_mode || loadingDash}</code>} />
           <Row label="Embedding model" value={<code>{s.embedding_model || loadingDash}</code>} />
+          <Row label="Active preset" value={<code>{activePresetId || loadingDash}</code>} />
           <Row label="Embed warm-up" value={
             <span className={"settings-badge " + (embedWarm === true ? "ok" : embedWarm === false ? "bad" : "warn")}>
               {embedWarmLabel}
@@ -301,6 +447,66 @@ function Settings({
           } />
           <Row label="Tectonic (PDF 编译)" value={<LoadingBadge ready={statusReady} ok={!!s.tectonic_available} labelOk="可用" labelBad="未安装" />} />
           <Row label="PPTX → PDF (LibreOffice)" value={<LoadingBadge ready={statusReady} ok={!!s.pptx_pdf_available} labelOk="可用" labelBad="未安装" />} />
+        </Section>
+
+        {/* ───────── 外观 ───────── */}
+        <Section title="外观" hint="保存在本机浏览器">
+          <div className="settings-pref-row">
+            <div className="settings-pref-label">主题</div>
+            <div className="settings-pref-ctrl">
+              {[
+                { v: "paper",  label: "Paper",  hint: "默认浅色" },
+                { v: "sepia",  label: "Sepia",  hint: "暖纸色" },
+                { v: "slate",  label: "Slate",  hint: "石板灰" },
+                { v: "dark",   label: "Dark",   hint: "深色" },
+                { v: "auto",   label: "Auto",   hint: "跟随系统" },
+              ].map(o => (
+                <button
+                  key={o.v}
+                  className={"settings-chip" + (theme === o.v ? " active" : "")}
+                  title={o.hint}
+                  onClick={() => onCommitTheme && onCommitTheme(o.v)}
+                >{o.label}</button>
+              ))}
+              <span className="settings-pref-hint">
+                {theme === "auto"
+                  ? `Auto · 现在 = ${autoResolved === "dark" ? "Dark" : "Paper"}（跟随系统 prefers-color-scheme）`
+                  : `当前：${theme}`}
+              </span>
+            </div>
+          </div>
+
+          <div className="settings-pref-row">
+            <div className="settings-pref-label">密度</div>
+            <div className="settings-pref-ctrl">
+              {[
+                { v: "compact",     label: "Compact" },
+                { v: "comfortable", label: "Comfortable" },
+                { v: "airy",        label: "Airy" },
+              ].map(o => (
+                <button
+                  key={o.v}
+                  className={"settings-chip" + (density === o.v ? " active" : "")}
+                  onClick={() => onCommitDensity && onCommitDensity(o.v)}
+                >{o.label}</button>
+              ))}
+              <span className="settings-pref-hint">控制行高 / 卡片内边距倍率</span>
+            </div>
+          </div>
+
+          <div className="settings-pref-row">
+            <div className="settings-pref-label">基础字号</div>
+            <div className="settings-pref-ctrl">
+              <input
+                type="range"
+                min={13} max={18} step={1}
+                value={baseSize}
+                onChange={e => onCommitBaseSize && onCommitBaseSize(parseInt(e.target.value, 10))}
+                style={{ verticalAlign: "middle" }}
+              />
+              <span className="settings-pref-hint mono">{baseSize}px</span>
+            </div>
+          </div>
         </Section>
 
         {/* ───────── 用户偏好 ───────── */}
@@ -417,9 +623,12 @@ function Settings({
           <Row label="索引 chunks 总数" value={(s.total_chunks ?? 0).toLocaleString()} />
           <Row label="搜索 p50 (ms)" value={s.latency_ms?.search_p50 ?? "—"} mono />
           <Row label="对话 p50 (ms)" value={s.latency_ms?.chat_p50 ?? "—"} mono />
-          <Row label="累计成本" value={
-            s.usage?.total_cost != null
-              ? `$${Number(s.usage.total_cost).toFixed(4)}`
+          {/* "累计成本" 行 2026-05-20 删除：router._track_usage 只累加 token
+              数，从未接定价表，total_cost 一直返回 0.0。要恢复需为每个 backend
+              加 $/1M-token 价目表 — 直到那时之前显示 0 只会误导。 */}
+          <Row label="累计 tokens" value={
+            s.usage
+              ? `in ${(s.usage.input_tokens ?? 0).toLocaleString()} · out ${(s.usage.output_tokens ?? 0).toLocaleString()}`
               : "—"
           } mono />
           <Row label="后端版本" value={<code>{s.version || "—"}</code>} />

@@ -8,6 +8,7 @@ from pathlib import Path
 
 import networkx as nx
 
+from nano_notebooklm import config
 from nano_notebooklm.types import Concept, Relation
 
 logger = logging.getLogger(__name__)
@@ -49,25 +50,41 @@ class KnowledgeGraph:
                     existing["parent_topic"] = c.parent_topic
                 if existing.get("learning_order") is None and c.learning_order is not None:
                     existing["learning_order"] = c.learning_order
-                # fix-all v1 #A1 + v3 #L7: keep the first non-null
-                # concept_embedding (first-seen discipline mirrors
-                # parent_topic above) — *except* when the existing
-                # embedding has a different dimension from the new one,
-                # which signals the operator switched EMBEDDING_MODE
-                # (e.g. local 384d → API 1536d). In that case the cached
-                # value is stale and graph_search would silently drop it
-                # on every query; overwrite so the next save persists the
-                # fresh dimension.
-                existing_emb = existing.get("concept_embedding")
+                # Per-preset cache (2026-05-20): we now keep a
+                # `concept_embeddings: {preset_id: [vec]}` dict alongside the
+                # legacy single `concept_embedding` field. Switching embedding
+                # preset routes reads to the active preset's vector and falls
+                # back to the legacy field only when its dim matches (handled
+                # in kb.graph_search). Writes always populate the namespaced
+                # dict under the currently active preset id.
                 new_emb = c.concept_embedding
                 if new_emb is not None:
-                    if existing_emb is None:
-                        existing["concept_embedding"] = new_emb
-                    elif (isinstance(existing_emb, list)
+                    active = config.active_preset_id()
+                    bucket = existing.get("concept_embeddings")
+                    if not isinstance(bucket, dict):
+                        bucket = {}
+                    existing_in_slot = bucket.get(active)
+                    # First-seen discipline per preset slot — but overwrite
+                    # when the slot carries a stale dim (e.g. the slot was
+                    # back-filled at migration time from the legacy single-
+                    # vector field). Preserves the L7 invariant that a dim
+                    # mismatch never lingers under the active preset key.
+                    if existing_in_slot is None:
+                        bucket[active] = new_emb
+                    elif (isinstance(existing_in_slot, list)
                           and isinstance(new_emb, list)
-                          and len(existing_emb) != len(new_emb)):
-                        existing["concept_embedding"] = new_emb
+                          and len(existing_in_slot) != len(new_emb)):
+                        bucket[active] = new_emb
+                    existing["concept_embeddings"] = bucket
+                    # Keep the legacy field pointed at the active-preset
+                    # value so old readers (and on-disk consumers that
+                    # haven't been updated) still see something sensible.
+                    existing["concept_embedding"] = bucket[active]
             else:
+                active = config.active_preset_id()
+                concept_embeddings: dict[str, list[float]] = {}
+                if c.concept_embedding is not None:
+                    concept_embeddings[active] = c.concept_embedding
                 self.graph.add_node(
                     c.concept_id,
                     name=c.name,
@@ -80,9 +97,8 @@ class KnowledgeGraph:
                     source_chunks=c.source_chunks,
                     parent_topic=c.parent_topic,
                     learning_order=c.learning_order,
-                    # fix-all v1 #A1: persist the cached embedding so
-                    # graph_search hits the fast path on every chat.
                     concept_embedding=c.concept_embedding,
+                    concept_embeddings=concept_embeddings,
                 )
 
     def add_relations(self, relations: list[Relation]):

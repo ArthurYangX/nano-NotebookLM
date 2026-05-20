@@ -3369,10 +3369,9 @@ mark.hl-flash, .hl-jump.hl-flash { animation: hl-flash 0.9s ease-out; }
   background: oklch(0.985 0 0);
 }
 
-/* R4-5 part 2: backend chip — topbar toggle for codex GPT-5.4 / Qwen-RAFT.
-   Visual baseline matches `.lang-chip` (same mono font, padding, border
-   radius, hover, disabled). Two state variants change the border + text
-   tint so the operator sees which backend is active at a glance. */
+/* Backend chip — topbar toggle for openai / claude / local. Visual
+   baseline matches `.lang-chip` (same mono font, padding, border radius,
+   hover, disabled). State variants tint border + text per backend. */
 .backend-chip {
   font-family: var(--mono);
   font-size: 11px;
@@ -3389,22 +3388,19 @@ mark.hl-flash, .hl-jump.hl-flash { animation: hl-flash 0.9s ease-out; }
 }
 .backend-chip:hover { background: var(--paper-2); border-color: var(--ink-4); }
 .backend-chip:disabled { opacity: 0.45; cursor: not-allowed; }
-.backend-chip.backend-codex {
+.backend-chip.backend-openai {
   border-color: oklch(0.80 0.04 235);
   color: oklch(0.40 0.12 235);
 }
-.backend-chip.backend-qwen,
-.backend-chip.backend-qwen-raft {
-  border-color: oklch(0.78 0.10 305);
-  color: oklch(0.38 0.18 305);
-  background: oklch(0.97 0.04 305);
+.backend-chip.backend-claude {
+  border-color: oklch(0.78 0.10 35);
+  color: oklch(0.40 0.16 35);
+  background: oklch(0.97 0.04 35);
 }
-/* 2026-05-13: base Qwen Instruct chip — warmer cyan so the two qwen
-   variants are visually distinct in the cycle. */
-.backend-chip.backend-qwen-base {
-  border-color: oklch(0.78 0.10 195);
-  color: oklch(0.38 0.18 195);
-  background: oklch(0.97 0.04 195);
+.backend-chip.backend-local {
+  border-color: oklch(0.78 0.10 145);
+  color: oklch(0.38 0.16 145);
+  background: oklch(0.97 0.04 145);
 }
 
 /* Persona chip CSS removed 2026-05-12: persona editing now lives in the
@@ -3752,6 +3748,26 @@ mark.hl-flash, .hl-jump.hl-flash { animation: hl-flash 0.9s ease-out; }
   border-color: oklch(0.80 0.10 25);
 }
 .settings-badge.warn {
+  color: oklch(0.50 0.15 65);
+  background: oklch(0.97 0.04 65);
+  border-color: oklch(0.80 0.10 65);
+}
+
+.settings-banner {
+  padding: 10px 14px; border-radius: 8px; border: 1px solid;
+  font-size: 13px; line-height: 1.5;
+}
+.settings-banner.ok {
+  color: oklch(0.42 0.16 145);
+  background: oklch(0.97 0.04 145);
+  border-color: oklch(0.78 0.10 145);
+}
+.settings-banner.bad {
+  color: oklch(0.50 0.18 25);
+  background: oklch(0.97 0.03 25);
+  border-color: oklch(0.80 0.10 25);
+}
+.settings-banner.warn {
   color: oklch(0.50 0.15 65);
   background: oklch(0.97 0.04 65);
   border-color: oklch(0.80 0.10 65);

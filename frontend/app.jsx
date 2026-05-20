@@ -4,13 +4,20 @@
 const { useState, useEffect, useRef } = React;
 
 const TWEAK_DEFAULTS = /*EDITMODE-BEGIN*/{
-  "theme": "paper",
-  "density": "comfortable",
-  "baseSize": 15,
   "mindmapLayout": "radial",
   "noteStyle": "outline",
   "serifHeads": true
 }/*EDITMODE-END*/;
+
+// 2026-05-20: appearance defaults moved out of the EDITMODE block. Theme /
+// density / baseSize are now end-user controls in Settings (persisted to
+// localStorage), not design-host knobs. The dev-only TweaksPanel no longer
+// renders these — see the Appearance section removed alongside this.
+const APPEARANCE_DEFAULTS = {
+  theme: "paper",
+  density: "comfortable",
+  baseSize: 15,
+};
 
 // CitationPreviewModal — opens a small floating window when the user clicks
 // a Notes citation chip. Hands the file off to the browser's native PDF
@@ -157,11 +164,9 @@ function CoursePickerModal({ courses, defaultId, defaultEngine, onPick, onCancel
   }, []);
 
   const trimmed = newName.trim();
-  // fix-all #M1: duplicate detection is case- and whitespace-insensitive over
-  // BOTH the course id and the course display name. " CS231N " or "cs231n"
-  // typed against an existing `id="CS231N"` previously slipped through the
-  // strict-equality guard and created a sibling course — the exact failure
-  // the picker is meant to prevent.
+  // Duplicate detection is case- and whitespace-insensitive over BOTH
+  // the course id and the course display name. " Foo " or "foo" typed
+  // against an existing `id="Foo"` must not create a sibling course.
   const existingKeys = new Set();
   for (const c of courses) {
     if (typeof c?.id === "string") existingKeys.add(c.id.trim().toLowerCase());
@@ -451,7 +456,11 @@ function App() {
   const [realMindmap, setRealMindmap] = useState(null);
   const [examAnalysis, setExamAnalysis] = useState(null);
   const [reportData, setReportData] = useState(null);
-  const [masteryData, setMasteryData] = useState(null);
+  // 2026-05-20: masteryData state retired — UI consumers (topbar ◎ icon,
+  // SkillsDashboard card) were removed once Exam Prep covered the loop.
+  // Backend /api/mastery + mastery_tracker still live but have no frontend
+  // reader. Restore by un-deleting this state + the `kind === "mastery"`
+  // branch in `handleSkillEntry` if a new UI surface needs it.
   const [sessionDays, setSessionDays] = useState({});
 
   // ── R3-2: explicit user language preference ──
@@ -461,19 +470,21 @@ function App() {
   // shows the current value and re-opens the modal so the choice is reversible.
   const [userLang, setUserLangState] = useState(() => StudyState.loadUserLang(window.localStorage));
   const [showLangModal, setShowLangModal] = useState(false);
-  // ── R4-5 part 2: backend chip (codex GPT-5.4 / Qwen-RAFT) ──
-  // Default = codex (the production main path). Qwen is opt-in and the
-  // topbar chip greys out when /api/status reports the AutoDL host is
-  // unreachable. Persist across reloads in localStorage so the
-  // selection survives a tab refresh.
+  // ── Backend chip: openai / claude / local ──
+  // Default = openai (the configured main provider). Selection persists in
+  // localStorage; the chip greys out if the chosen backend isn't configured.
   const [backend, setBackend] = useState(() => {
     try {
       const v = window.localStorage.getItem("nano-nlm:v1:backend");
-      // 2026-05-13: qwen_base is the parallel base-Instruct option;
-      // accept it alongside qwen_raft. Anything else → default codex.
-      if (v === "qwen_raft" || v === "qwen_base") return v;
-      return "codex";
-    } catch (e) { return "codex"; }
+      if (v === "openai" || v === "claude" || v === "local") return v;
+      // Stale value from an older build (or unknown string). Reset
+      // storage so cross-tab listeners + the post-`/api/status`
+      // rollback effect agree on the new default.
+      if (v != null) {
+        try { window.localStorage.setItem("nano-nlm:v1:backend", "openai"); } catch (e) {}
+      }
+      return "openai";
+    } catch (e) { return "openai"; }
   });
   function commitBackend(value) {
     setBackend(value);
@@ -556,14 +567,6 @@ function App() {
     } catch {}
   }
 
-  // ── R4-1: course list mode (?show_preset=1 → "all", else "user") ──
-  // Default hides 8 preset courses so the upload-only flow doesn't see stale
-  // ingested chunks. URL flag is the rollback hatch until R4-4 验收 ok.
-  const courseModeRef = useRef(
-    (typeof window !== "undefined" && new URLSearchParams(window.location.search).get("show_preset") === "1")
-      ? "all"
-      : "user"
-  );
 
   // fix-all v1 #A6: retry button needs to re-run the last upload. We
   // can't pass a closure through processing state (function identity
@@ -712,29 +715,9 @@ function App() {
 
   // ── Load courses on mount ──
   useEffect(() => {
-    API.getCourses(courseModeRef.current).then(data => {
+    API.getCourses().then(data => {
       const crs = data.courses || [];
-      // R5-2 fix-all v2 #1: in default mode, the backend hides the 8
-      // preset courses. If the user previously worked on one in
-      // ?show_preset=1 mode and saved notes/highlights/KG/quiz to
-      // localStorage, that data is orphaned — the dropdown doesn't
-      // list the course, so they can't navigate to it. Detect cached
-      // preset courses and surface them with an `auto_resurfaced: true`
-      // flag so the dropdown re-adds them. We still respect
-      // hiddenCourseIds (a per-browser opt-out) so the user can
-      // explicitly hide a resurfaced preset.
-      let merged = crs;
-      if (courseModeRef.current !== "all") {
-        try {
-          const cachedIds = StudyState.findCoursesWithCache(localStorage);
-          const known = new Set(crs.map(c => c.id));
-          const extras = cachedIds
-            .filter(cid => !known.has(cid))
-            .map(cid => ({ id: cid, name: cid, auto_resurfaced: true }));
-          if (extras.length) merged = crs.concat(extras);
-        } catch { /* localStorage flaky → no resurface, dropdown reflects backend only */ }
-      }
-      setCourses(merged);
+      setCourses(crs);
       const hidden = new Set(StudyState.loadHiddenCourses(localStorage));
       const firstVisible = merged.find(c => !hidden.has(c.id));
       if (firstVisible) setActiveCourse(firstVisible.id);
@@ -836,10 +819,7 @@ function App() {
   }
 
   useEffect(() => {
-    // fix-all v1 #V6 (R4-5 review v1): ±20% jitter so concurrent tabs
-    // opened together don't all poll in lockstep — the AutoDL host
-    // (and the cached qwen health probe) sees a smoothed request rate
-    // instead of a 6N req/min unison pulse.
+    // ±20% jitter so concurrent tabs don't poll the server in lockstep.
     const POLL_BASE_MS = 10000;
     const POLL_JITTER_RATIO = 0.2;
     const interval = POLL_BASE_MS + (Math.random() * 2 - 1) * POLL_BASE_MS * POLL_JITTER_RATIO;
@@ -849,23 +829,16 @@ function App() {
     return () => clearInterval(iv);
   }, []);
 
-  // fix-all v1 #V6 (R4-5 review v1): auto-rollback the chip when the
-  // operator-side QWEN_RAFT_URL is unconfigured or the AutoDL host
-  // becomes unreachable. Without this, localStorage persists a stale
-  // "qwen_raft" selection across reloads → chip greys out but state
-  // keeps sending backend="qwen_raft" → every chat gets a 422 (URL
-  // unset) or a silent fallback (URL set, host down). Auto-rollback
-  // resets to codex once status confirms qwen is unavailable.
+  // Auto-rollback the chip when the selected backend isn't configured
+  // on the server (e.g. user picked "local" but operator removed
+  // LOCAL_LLM_BASE_URL from .env). Falls back to "openai", then to the
+  // first available backend, so the chip never points at a 422 path.
   useEffect(() => {
     if (!backendStatus) return;
-    if (backend === "qwen_raft") {
-      if (!backendStatus.qwen_raft_configured || !backendStatus.qwen_raft_available) {
-        commitBackend("codex");
-      }
-    } else if (backend === "qwen_base") {
-      if (!backendStatus.qwen_base_configured || !backendStatus.qwen_base_available) {
-        commitBackend("codex");
-      }
+    const available = new Set(backendStatus.available_backends || backendStatus.backends || []);
+    if (available.size && !available.has(backend)) {
+      const fallback = available.has("openai") ? "openai" : [...available][0];
+      if (fallback) commitBackend(fallback);
     }
   }, [backendStatus, backend]);
 
@@ -903,7 +876,6 @@ function App() {
     if (cachedMm) window.MINDMAP = cachedMm;
     setExamAnalysis(loadCached(activeCourse, "exam-analysis"));
     setReportData(loadCached(activeCourse, "report"));
-    setMasteryData(loadCached(activeCourse, "mastery"));
     setGenerationState(StudyState.createGenerationState());
     // Cross-course leak guard: a citation modal opened for the *previous*
     // course must close on switch. Otherwise the iframe keeps showing
@@ -1012,12 +984,37 @@ function App() {
   }, [activeCourse, courses, hiddenCourseIds]);
 
   // ── Theme ──
+  // `auto` follows the OS via `prefers-color-scheme`: dark scheme → dark
+  // theme, otherwise the light Paper baseline. We listen for OS-level
+  // changes so the user doesn't need to refresh when switching modes.
+  // For paper we `removeAttribute` rather than setting an empty string so
+  // future `[data-theme]` (attribute-presence) selectors don't false-match.
   useEffect(() => {
     const root = document.documentElement;
-    root.setAttribute("data-theme", tweaks.theme === "paper" ? "" : tweaks.theme);
-    document.body.style.setProperty("--density", tweaks.density === "compact" ? "0.92" : tweaks.density === "airy" ? "1.08" : "1");
-    document.body.style.setProperty("--base-size", tweaks.baseSize + "px");
-  }, [tweaks.theme, tweaks.density, tweaks.baseSize]);
+    const apply = () => {
+      let resolved = theme;
+      if (theme === "auto") {
+        const prefersDark = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
+        resolved = prefersDark ? "dark" : "paper";
+        setAutoResolved(resolved);
+      }
+      if (resolved === "paper") root.removeAttribute("data-theme");
+      else root.setAttribute("data-theme", resolved);
+    };
+    apply();
+    if (theme === "auto" && window.matchMedia) {
+      const mq = window.matchMedia("(prefers-color-scheme: dark)");
+      const onChange = () => apply();
+      mq.addEventListener ? mq.addEventListener("change", onChange) : mq.addListener(onChange);
+      return () => {
+        mq.removeEventListener ? mq.removeEventListener("change", onChange) : mq.removeListener(onChange);
+      };
+    }
+  }, [theme]);
+  useEffect(() => {
+    document.body.style.setProperty("--density", density === "compact" ? "0.92" : density === "airy" ? "1.08" : "1");
+    document.body.style.setProperty("--base-size", baseSize + "px");
+  }, [density, baseSize]);
 
   // ── Get checked source file names for context filtering ──
   // Delegates to StudyState.getCheckedSourceFiles which returns raw filenames
@@ -1119,6 +1116,19 @@ function App() {
       }
       return out;
     }
+    // Partial-state persistence: when review pass is too slow to finish
+    // (5+ chapter courses can take 10+ min server-side), if the user reloads
+    // before `done` fires, the try block's saveNoteDraft never runs and
+    // localStorage retains a stale older version. Persist after each
+    // sanitized file_done / file_cached so reload at least restores the
+    // per-file baseline (no cross-file polish, but all sections present).
+    function persistPartialDraft(body) {
+      if (!activeCourse) return;
+      const content = String(body || "");
+      if (!content) return;
+      try { StudyState.saveNoteDraft(localStorage, activeCourse, content); }
+      catch (e) { /* best-effort partial save */ }
+    }
     function rebuildDraftFromFiles() {
       // 2026-05-12: include `running` files too so token-streamed
       // file_delta deltas show up in the rendered draft. Earlier code
@@ -1174,7 +1184,13 @@ function App() {
       cachedBatchPending = true;
       setTimeout(() => {
         cachedBatchPending = false;
-        if (!inReview) setRealNotes(rebuildDraftFromFiles());
+        const draft = rebuildDraftFromFiles();
+        if (!inReview) setRealNotes(draft);
+        // Partial persistence: each batch of file_done / file_cached
+        // saves the assembled per-file body so reload-before-done
+        // restores complete-but-unreviewed content (better than the
+        // months-old stale draft localStorage would otherwise return).
+        persistPartialDraft(draft);
       }, 0);
     }
     // file_delta (2026-05-12): per-file streaming now ships ~10-20
@@ -1339,7 +1355,12 @@ function App() {
       // with a stale partial draft via setRealNotes(rebuildDraftFromFiles()).
       if (fileDeltaTimer) { clearTimeout(fileDeltaTimer); fileDeltaTimer = null; }
       const msg = "Error: " + e.message;
-      setRealNotes(prev => prev || rebuildDraftFromFiles() || msg);
+      const partial = reviewPartial || rebuildDraftFromFiles();
+      setRealNotes(prev => prev || partial || msg);
+      // Persist whatever progress we made (review_chunk accumulation
+      // wins over per-file baseline when review was in flight). Keeps
+      // a reload after a stream abort from reverting to a stale draft.
+      persistPartialDraft(partial);
       setGenerationState(s => StudyState.recordGenerationFailure(s, e, (s.failures || 0) + 1));
       setNoteReviewing(false);
     }
@@ -1401,17 +1422,12 @@ function App() {
         const data = { content: (final && final.content) || partial };
         setReportData(data);
         saveCached(activeCourse, "report", data);
-      } else if (kind === "mastery") {
-        const data = await API.getMastery(activeCourse);
-        setMasteryData(data);
-        saveCached(activeCourse, "mastery", data);
       }
       setMode("notes");
       await API.appendSessionLog(activeCourse, "generation", { kind }).catch(() => {});
     } catch (e) {
       if (kind === "exam-analysis") setExamAnalysis({ error: e.message });
       if (kind === "report") setReportData({ error: e.message });
-      if (kind === "mastery") setMasteryData({ error: e.message, weak_areas: [] });
     }
     setStreaming(false);
   }
@@ -1599,20 +1615,8 @@ function App() {
         // Refresh course list (chunks may have landed even on KG-stage
         // error) and activate the new course on success.
         try {
-          const data = await API.getCourses(courseModeRef.current);
-          const crs = data.courses || [];
-          let merged = crs;
-          if (courseModeRef.current !== "all") {
-            try {
-              const cachedIds = StudyState.findCoursesWithCache(localStorage);
-              const known = new Set(crs.map(c => c.id));
-              const extras = cachedIds
-                .filter(cid => !known.has(cid))
-                .map(cid => ({ id: cid, name: cid, auto_resurfaced: true }));
-              if (extras.length) merged = crs.concat(extras);
-            } catch { /* nop */ }
-          }
-          setCourses(merged);
+          const data = await API.getCourses();
+          setCourses(data.courses || []);
           if (s.status === "done") {
             setActiveCourse(courseName);
           }
@@ -1761,7 +1765,6 @@ function App() {
     // still renders normally; only the tab-bar trigger is gone.
   ];
   const backendDegraded = !backendStatus || !Array.isArray(backendStatus.backends) || backendStatus.backends.length === 0;
-  const masteryView = StudyState.formatMasteryState(masteryData || {});
 
   return (
     <div className="app">
@@ -1780,17 +1783,9 @@ function App() {
             <option value="">🌐 All Courses ({totalChunks} chunks)</option>
             {visibleCourses.map(c => {
               const flag = c.lang === "zh" ? "🇨🇳" : c.lang === "mixed" ? "🌐" : "🇺🇸";
-              // R5-2 fix-all v2 #1: surface auto-resurfaced preset courses
-              // visually so the user knows the row is reaching beyond the
-              // current backend filter. Label appended in parens since the
-              // chunks count is unknown (not returned by the backend in
-              // default mode).
-              const suffix = c.auto_resurfaced
-                ? " · (cached, preset)"
-                : ` (${c.chunks || 0} chunks)`;
               return (
                 <option key={c.id} value={c.id}>
-                  {flag} {c.name}{suffix}
+                  {flag} {c.name} ({c.chunks || 0} chunks)
                 </option>
               );
             })}
@@ -1819,52 +1814,31 @@ function App() {
           >
             {userLang === "zh" ? "中" : userLang === "en" ? "EN" : "?"}
           </button>
-          {/* R4-5 part 2: backend chip — toggles codex / qwen_raft. Greys
-              out when /api/status reports Qwen unavailable or unconfigured. */}
-          {/* 2026-05-13: read codex model name from /api/status so the
-              chip label and tooltips reflect whatever OPENAI_MODEL is
-              actually in use (default gpt-5.5, was gpt-5.4 until tonight).
-              Falls back to a generic "GPT" when /api/status hasn't loaded. */}
-          {/* 2026-05-13: tri-state backend chip — Codex → Qwen-RAFT → Qwen-Base → Codex.
-              Each click cycles to the next AVAILABLE backend; disabled
-              entries auto-skip. Tooltip names the current one + says
-              "click to switch". Settings page has explicit radios for
-              the same three options. */}
+          {/* Backend chip — cycles through configured backends (openai /
+              claude / local). Each click moves to the next available one;
+              chip is disabled when only one backend is configured. */}
           {(() => {
-            const cycle = ["codex", "qwen_raft", "qwen_base"];
-            const avail = (b) => {
-              if (b === "codex") return true;
-              if (b === "qwen_raft") return !!(backendStatus?.qwen_raft_configured && backendStatus?.qwen_raft_available);
-              if (b === "qwen_base") return !!(backendStatus?.qwen_base_configured && backendStatus?.qwen_base_available);
-              return false;
-            };
+            const available = (backendStatus?.available_backends || backendStatus?.backends || []);
+            const cycle = ["openai", "claude", "local"].filter(b => available.includes(b));
             const next = () => {
+              if (!cycle.length) return backend;
               const i = cycle.indexOf(backend);
-              for (let k = 1; k <= cycle.length; k++) {
-                const cand = cycle[(i + k) % cycle.length];
-                if (avail(cand)) return cand;
-              }
-              return "codex";
+              return cycle[(i + 1) % cycle.length];
             };
-            const variant = backend === "qwen_raft" ? "qwen-raft" : backend === "qwen_base" ? "qwen-base" : "codex";
-            const label = backend === "qwen_raft"
-              ? "🎓 RAFT"
-              : backend === "qwen_base"
-                ? "🐧 Base"
-                : "🤖 " + (((backendStatus && backendStatus.openai_model) || "GPT").replace(/^gpt-/i, "GPT-"));
-            const tip = backend === "qwen_raft"
-              ? "Qwen-RAFT 微调 · 点击切换"
-              : backend === "qwen_base"
-                ? "Qwen-Instruct 基座 · 点击切换"
-                : "Codex · 点击切换";
-            const cantPickAnyQwen = !avail("qwen_raft") && !avail("qwen_base");
+            const labelFor = (b) => {
+              if (b === "claude") return "🧠 " + ((backendStatus?.claude_model) || "Claude");
+              if (b === "local") return "💻 " + ((backendStatus?.local_llm_model) || "Local");
+              return "🤖 " + ((backendStatus?.openai_model) || "OpenAI");
+            };
+            const variant = backend === "claude" ? "claude" : backend === "local" ? "local" : "openai";
+            const tip = cycle.length > 1 ? "点击切换后端" : "唯一已配置后端";
             return (
               <button
                 className={"backend-chip mono backend-" + variant}
                 title={tip}
                 onClick={() => commitBackend(next())}
-                disabled={streaming || cantPickAnyQwen && backend === "codex"}
-              >{label}</button>
+                disabled={streaming || cycle.length <= 1}
+              >{labelFor(backend)}</button>
             );
           })()}
           <button className="icon-btn" title="Generate Notes (uses cache when available)" onClick={() => handleGenerateNotes()} disabled={streaming}>📝</button>
@@ -1918,7 +1892,11 @@ function App() {
           <button className="icon-btn" title="Build Knowledge Graph" onClick={handleGenerateMindmap} disabled={streaming}>🧠</button>
           <button className="icon-btn" title="Exam Analysis" onClick={() => handleSkillEntry("exam-analysis")} disabled={streaming}>⌁</button>
           <button className="icon-btn" title="Course Report" onClick={() => handleSkillEntry("report")} disabled={streaming}>▤</button>
-          <button className="icon-btn" title="Mastery Dashboard" onClick={() => handleSkillEntry("mastery")} disabled={streaming}>◎</button>
+          {/* Mastery Dashboard icon 2026-05-20 retired: superseded by ★ Exam
+              Prep tab. Backend mastery_tracker + /api/mastery still wired
+              server-side; the frontend state, GET call, and SkillsDashboard
+              card were removed at the same time (see notes near
+              masteryData declaration). */}
           {/* 2026-05-12: settings entry. Single source of truth — the
               Settings tab was retired from the main tab bar so this icon
               is the only way in. Persona / language / backend / cache
@@ -2005,9 +1983,8 @@ function App() {
               <div className="empty-courses-card">
                 <div className="empty-courses-glyph">📂</div>
                 <h2>上传文档开始</h2>
-                <p>nano-NOTEBOOKLM 现在是 upload-only 模式。先上传一份 PDF / PPTX / DOCX / Markdown，系统会自动抽取章节、构建知识图谱，再驱动问答与笔记。</p>
+                <p>上传一份 PDF / PPTX / DOCX / Markdown，系统会自动抽取章节、构建知识图谱，再驱动问答与笔记。</p>
                 <button className="btn-primary" onClick={onStartUpload}>上传第一个文档</button>
-                <p className="hint mono">回滚到旧课程：在 URL 末尾加 <code>?show_preset=1</code></p>
               </div>
             </div>
           )}
@@ -2119,8 +2096,6 @@ function App() {
               activeCourse={activeCourse}
               examAnalysis={examAnalysis}
               reportData={reportData}
-              masteryData={masteryData}
-              masteryView={masteryView}
               streaming={streaming}
               onRun={handleSkillEntry}
               onPractice={(topic) => handleGenerateQuiz(topic)}
@@ -2141,6 +2116,14 @@ function App() {
               hiddenCourseIds={hiddenCourseIds}
               onUnhideAll={unhideAllCourses}
               courses={courses}
+              theme={theme}
+              onCommitTheme={commitTheme}
+              autoResolved={autoResolved}
+              density={density}
+              onCommitDensity={commitDensity}
+              baseSize={baseSize}
+              onCommitBaseSize={commitBaseSize}
+              onStatusRefresh={() => API.getStatus().then(setBackendStatus).catch(() => {})}
             />
           )}
         </div>
@@ -2191,27 +2174,14 @@ function App() {
       </footer>
 
       {/* ========= Tweaks ========= */}
+      {/* 2026-05-20: Appearance section (theme / density / baseSize) moved
+          to the Settings page so end users can reach it. The dev-only
+          TweaksPanel still hosts Notes / KG layout knobs for the design
+          host. 2026-05-12 note about the `tweaks`/`tweakKey` wrapper-prop
+          interface mismatch still applies — these calls are inert under
+          TweakRadio's real `{label, value, options, onChange}` signature
+          and only render at all when __activate_edit_mode arrives. */}
       <TweaksPanel title="Tweaks">
-        <TweakSection title="Appearance">
-          <TweakRadio tweaks={tweaks} tweakKey="theme" label="Theme"
-            options={[
-              { value: "paper", label: "Paper" }, { value: "sepia", label: "Sepia" },
-              { value: "slate", label: "Slate" }, { value: "dark", label: "Dark" },
-            ]} />
-          <TweakRadio tweaks={tweaks} tweakKey="density" label="Density"
-            options={[
-              { value: "compact", label: "Compact" }, { value: "comfortable", label: "Comfortable" },
-              { value: "airy", label: "Airy" },
-            ]} />
-          <TweakSlider tweaks={tweaks} tweakKey="baseSize" label="Base font size" min={13} max={18} step={1} unit="px" />
-        </TweakSection>
-        {/* 2026-05-12: AI persona dropdown removed — superseded by the
-            user-visible 🎭 persona chip in the topbar (commitPersona +
-            nano-nlm:v1:persona). The Tweaks panel is dev-only (requires
-            __activate_edit_mode) and the wrapper-prop interface here
-            (`tweaks` / `tweakKey`) never matched TweakSelect's actual
-            ({label, value, options, onChange}) signature, so the
-            control was inert in production anyway. */}
         <TweakSection title="Notes layout">
           <TweakRadio tweaks={tweaks} tweakKey="noteStyle" label="Note style"
             options={[
@@ -2317,11 +2287,6 @@ function App() {
                       <span className="mono" style={{ fontSize: 12 }}>
                         {flag} {c.name}
                       </span>
-                      {c.auto_resurfaced && (
-                        <span className="mono" style={{ fontSize: 10, color: "var(--ink-4)", fontStyle: "italic" }}>
-                          (cached preset)
-                        </span>
-                      )}
                       <span className="mono" style={{ marginLeft: "auto", fontSize: 11, color: "var(--ink-3)" }}>
                         {c.chunks != null ? `${c.chunks} chunks` : ""}
                       </span>
@@ -3667,20 +3632,15 @@ function RealQuizView({ questions, activeCourse, onRegenerate, regenerating }) {
   );
 }
 
-function SkillsDashboard({ activeCourse, examAnalysis, reportData, masteryData, masteryView, streaming, onRun, onPractice }) {
+function SkillsDashboard({ activeCourse, examAnalysis, reportData, streaming, onRun, onPractice }) {
+  // 2026-05-20: Mastery card retired (the 2026-05-12 transition note above
+  // said "retire once Exam Prep covers everything" — that's now). Backend
+  // mastery_tracker + /api/mastery still wired; SkillsDashboard simply
+  // doesn't render it. Restore by re-adding a `{ id: "mastery", … }` entry
+  // and reviving the `card.id === "mastery"` branch below.
   const cards = [
     { id: "exam-analysis", title: "Exam Analysis", data: examAnalysis },
     { id: "report", title: "Course Report", data: reportData },
-    { id: "mastery", title: "Mastery", data: masteryData,
-      legacy: true,
-      // 2026-05-12: Mastery card and Exam Prep tab compute mastery from
-      // two separate sources (mastery_tracker reads session_log; Exam
-      // Prep owns its own exam_bank.json). They don't sync. UX policy:
-      // keep both for one release with a "legacy" hint pointing users to
-      // Exam Prep; retire this card once we're confident the new flow
-      // covers everything.
-      legacyHint: "本卡基于旧 quiz 历史 · 完整闭环见 ★ Exam Prep tab",
-    },
   ];
   return (
     <div className="reader-body" style={{ padding: "28px 40px" }}>
@@ -3699,21 +3659,7 @@ function SkillsDashboard({ activeCourse, examAnalysis, reportData, masteryData, 
             {card.legacyHint && (
               <p className="skill-legacy-hint">{card.legacyHint}</p>
             )}
-            {card.id === "mastery" && masteryData ? (
-              <div>
-                {masteryView.empty ? <p className="empty-state">{masteryView.text}</p> : (
-                  <div className="weak-list">
-                    {(masteryData.weak_areas || []).map(w => (
-                      <button key={w.concept} className="weak-row" onClick={() => onPractice(w.concept)}>
-                        <span>{w.concept}</span><b>{Math.round((w.score || 0) * 100)}%</b>
-                      </button>
-                    ))}
-                  </div>
-                )}
-              </div>
-            ) : (
-              <pre className="skill-output">{card.data ? (card.data.error || card.data.content || JSON.stringify(card.data, null, 2)) : "Not generated yet."}</pre>
-            )}
+            <pre className="skill-output">{card.data ? (card.data.error || card.data.content || JSON.stringify(card.data, null, 2)) : "Not generated yet."}</pre>
           </section>
         ))}
       </div>
