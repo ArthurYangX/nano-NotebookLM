@@ -1579,6 +1579,70 @@ def test_app_jsx_poll_failure_cutoff():
     assert "failures >= MAX_FAILURES" in src
 
 
+def test_app_jsx_upload_course_picker_replaces_prompt_and_confirm():
+    """review-swarm fix-all (2026-05-20): the upload course-name + engine +
+    file-picker chain must all flow through CoursePickerModal in a single
+    user-gesture window. The old chain `prompt()` → `confirm()` →
+    `document.createElement('input').click()` lost transient activation on
+    Chrome and silently dropped the file dialog. Negative-pin the
+    onStartUpload function body so the legitimate `window.prompt` in
+    handleDeleteCourse (destructive-action guard) doesn't accidentally
+    satisfy the check.
+    """
+    src = Path("frontend/app.jsx").read_text(encoding="utf-8")
+    assert "function CoursePickerModal(" in src
+    assert "function pickCourseAndFiles(" in src
+    assert "await pickCourseAndFiles()" in src
+    upload_fn = src.split("async function onStartUpload()", 1)[1]
+    upload_fn = upload_fn.split("\n  function ", 1)[0]
+    upload_fn = upload_fn.split("\n  async function ", 1)[0]
+    assert "window.prompt" not in upload_fn, (
+        "onStartUpload regressed to window.prompt — the picker modal is the "
+        "intended UI for course-name entry"
+    )
+    assert " prompt(" not in upload_fn
+    # The MinerU confirm() + document.createElement('input') chain must NOT
+    # come back — it loses Chrome's transient activation token in the await
+    # gap and silently drops the OS file dialog.
+    assert "window.confirm" not in upload_fn
+    assert "document.createElement(\"input\")" not in upload_fn
+    assert "document.createElement('input')" not in upload_fn
+
+
+def test_app_jsx_course_picker_duplicate_and_validation_guard():
+    """review-swarm fix-all #H2 + #M1: duplicate detection must be case-
+    and whitespace-insensitive over BOTH id and name; the new-name input
+    must mirror server-side COURSE_ID_PATTERN so RTL / zero-width / `..`
+    / oversized values are rejected before they pollute localStorage."""
+    src = Path("frontend/app.jsx").read_text(encoding="utf-8")
+    assert "COURSE_ID_RE" in src
+    assert "function isValidCourseId(" in src
+    assert "trim().toLowerCase()" in src
+    assert "existingKeys" in src
+    assert "duplicateNew" in src
+    assert "newInputValid" in src
+
+
+def test_app_jsx_course_picker_mount_uses_visible_courses_and_default_id():
+    """review-swarm fix-all #H1: modal must be fed the hidden-filtered
+    course list AND defaultId (not defaultName) so the chip highlight and
+    the resolved value both align with the course_id used by the upload
+    pipeline."""
+    src = Path("frontend/app.jsx").read_text(encoding="utf-8")
+    assert "<CoursePickerModal" in src
+    assert "courses={visibleCourses}" in src
+    assert "defaultId={activeCourse" in src
+    # Sanity: the legacy `defaultName=` prop must be gone, otherwise the
+    # chip highlight silently goes back to comparing against `activeCourse`
+    # under the wrong name.
+    assert "defaultName=" not in src
+    # Engine + files must be wired through the modal's onPick (the modal owns
+    # the OS file dialog now — picking files in `onStartUpload` post-await
+    # would lose user activation).
+    assert "defaultEngine={uploadEngine}" in src
+    assert "onPick={(courseId, files, engine)" in src
+
+
 def test_processing_jsx_handles_nested_progress_shape():
     """Background-task status returns `stages.chunking.progress` (object),
     not a flat number. Processing component must tolerate both."""

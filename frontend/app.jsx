@@ -100,8 +100,298 @@ function CitationPreviewModal({ preview, onClose, onOpenInReader }) {
   );
 }
 
+// fix-all #H2: mirror the server-side `COURSE_ID_PATTERN` from api/server.py
+// — alphanumeric + space + dot + dash + underscore + CJK Unified Ideographs
+// (U+4E00..U+9FFF), 1..128 chars, no `..`, no leading/trailing dot. Catching
+// invalid input at the picker is purely defence-in-depth (the server still
+// 422s), but it lets us surface a friendly inline error before we write the
+// localStorage resume-key (`nano-nlm:v1:upload-task:<id>`), which would
+// otherwise be poisoned by `:`, RTL marks, or zero-width chars.
+const COURSE_ID_RE = /^[A-Za-z0-9_\-. 一-鿿]{1,128}$/;
+function isValidCourseId(s) {
+  if (typeof s !== "string") return false;
+  if (s.length === 0 || s.length > 128) return false;
+  if (!COURSE_ID_RE.test(s)) return false;
+  if (s.includes("..") || s.startsWith(".") || s.endsWith(".")) return false;
+  return true;
+}
+
+// CoursePickerModal — replaces the legacy `prompt()` + `confirm()` + ad-hoc
+// `<input type=file>` chain for the upload flow. The modal owns ALL three
+// user decisions in one round trip:
+//   1) Which course (existing chip click vs. new-name input).
+//   2) Which PDF engine (PyMuPDF / MinerU radio).
+//   3) Which files (hidden `<input type=file>` triggered SYNCHRONOUSLY from
+//      the chip / new-form React click handler — this is the only way to
+//      keep transient user activation alive through the modal's interaction
+//      chain. The previous design `await pickCourseId()` → `confirm()` →
+//      `document.createElement('input').click()` lost the activation token
+//      somewhere along the await chain, and Chrome/Safari silently dropped
+//      the file picker — symptom: user picks course + clicks OK on the
+//      MinerU confirm, then nothing happens).
+// fix-all #H1: chips hand back `c.id` (directory key), NOT `c.name` (display
+// label) — a renamed course has `meta.name != cid` and `/api/upload/{course_id}`
+// is keyed on cid.
+function CoursePickerModal({ courses, defaultId, defaultEngine, onPick, onCancel }) {
+  const [newName, setNewName] = useState("");
+  const [engine, setEngine] = useState(defaultEngine === "mineru" ? "mineru" : "pymupdf");
+  // Hidden file input + the course id captured at chip / form-submit time.
+  // We can't pass the id through the event because the file dialog opens
+  // asynchronously and onChange fires later in its own task.
+  const fileInputRef = useRef(null);
+  const pendingIdRef = useRef(null);
+  const onCancelRef = useRef(onCancel);
+  // Keep ref pointed at the latest onCancel without re-binding the listener;
+  // see fix-all #H4 below.
+  useEffect(() => { onCancelRef.current = onCancel; });
+  // fix-all #H4: deps `[]` (not `[onCancel]`) so we bind the keydown listener
+  // exactly once per mount. The parent re-creates `onCancel` on every App
+  // render (App re-renders often during note streaming), and the previous
+  // `[onCancel]` caused a cleanup+rebind churn matching the exact anti-pattern
+  // CitationPreviewModal already documents at the top of this file. The ref
+  // bridges the closure so Esc still calls the latest onCancel.
+  useEffect(() => {
+    function onKey(e) { if (e.key === "Escape") onCancelRef.current(); }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
+  const trimmed = newName.trim();
+  // fix-all #M1: duplicate detection is case- and whitespace-insensitive over
+  // BOTH the course id and the course display name. " CS231N " or "cs231n"
+  // typed against an existing `id="CS231N"` previously slipped through the
+  // strict-equality guard and created a sibling course — the exact failure
+  // the picker is meant to prevent.
+  const existingKeys = new Set();
+  for (const c of courses) {
+    if (typeof c?.id === "string") existingKeys.add(c.id.trim().toLowerCase());
+    if (typeof c?.name === "string") existingKeys.add(c.name.trim().toLowerCase());
+  }
+  const trimmedKey = trimmed.toLowerCase();
+  const duplicateNew = trimmed.length > 0 && existingKeys.has(trimmedKey);
+  const newInputValid = trimmed.length === 0 || isValidCourseId(trimmed);
+  // Only block submit when the typed name actually fails validation. Empty
+  // input still disables submit via `!trimmed` below; `newInputValid` is
+  // there to surface the inline error for non-empty bad input.
+  const submitDisabled = !trimmed || duplicateNew || !newInputValid;
+
+  // User-gesture critical: this MUST be called synchronously inside the
+  // React onClick / onSubmit handler. Any `await` between the user's click
+  // and `fileInputRef.current.click()` invalidates transient activation
+  // and Chrome silently drops the file dialog. No setState / no
+  // microtask between here and the click.
+  function triggerFileChooser(courseId) {
+    pendingIdRef.current = courseId;
+    const el = fileInputRef.current;
+    if (el) {
+      el.value = "";  // allow re-picking the same files after a prior cancel
+      el.click();
+    }
+  }
+
+  function handleChipClick(cid) {
+    if (!isValidCourseId(cid)) return;
+    triggerFileChooser(cid);
+  }
+
+  function submitNew(e) {
+    if (e) e.preventDefault();
+    if (submitDisabled) return;
+    triggerFileChooser(trimmed);
+  }
+
+  function handleFileChange(e) {
+    const files = e.target.files;
+    // User cancelled the OS file dialog — modal stays open so they can try
+    // a different course / engine. Reset target.value so the same files
+    // can be picked again next time.
+    if (!files || !files.length) {
+      e.target.value = "";
+      return;
+    }
+    const cid = pendingIdRef.current;
+    if (!cid) return;
+    onPick(cid, files, engine);
+  }
+
+  return (
+    <div
+      className="course-picker-overlay"
+      role="dialog"
+      aria-modal="true"
+      onClick={e => { if (e.target === e.currentTarget) onCancel(); }}
+    >
+      <div className="course-picker-modal">
+        <div className="course-picker-head">
+          <div className="course-picker-title">上传到哪个课程？</div>
+          <button
+            className="course-picker-close"
+            onClick={onCancel}
+            aria-label="关闭"
+            title="关闭 (Esc)"
+          >✕</button>
+        </div>
+
+        {courses.length > 0 ? (
+          <div className="course-picker-section">
+            <div className="course-picker-label">添加到已有课程</div>
+            <div className="course-picker-existing">
+              {courses.map(c => {
+                // fix-all #M2: chip click is defence-in-depth — today the
+                // backend only ever serves ids that already passed
+                // `_ensure_safe_course_id`, but if a future endpoint adds
+                // user-supplied / imported / shared course metadata the chip
+                // would hand the raw value to localStorage + the URL path.
+                // A non-conforming id renders disabled with a tooltip.
+                const cid = typeof c?.id === "string" ? c.id : "";
+                const valid = isValidCourseId(cid);
+                const label = typeof c?.name === "string" && c.name ? c.name : cid;
+                return (
+                  <button
+                    key={cid || label}
+                    className={
+                      "course-picker-chip"
+                      + (valid && cid === defaultId ? " is-default" : "")
+                      + (valid ? "" : " is-invalid")
+                    }
+                    onClick={() => handleChipClick(cid)}
+                    disabled={!valid}
+                    title={valid ? label : `课程 id 不规范: ${cid}`}
+                  >
+                    <span className="course-picker-chip-name">{label}</span>
+                    {typeof c?.chunks === "number" && c.chunks > 0
+                      ? <span className="course-picker-chip-meta">{c.chunks} chunks</span>
+                      : null}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        ) : null}
+
+        <div className="course-picker-section">
+          <div className="course-picker-label">
+            {courses.length > 0 ? "或新建课程" : "新建课程"}
+          </div>
+          <form className="course-picker-newform" onSubmit={submitNew}>
+            <input
+              className="course-picker-input"
+              type="text"
+              value={newName}
+              onChange={e => setNewName(e.target.value)}
+              placeholder="输入新课程名称"
+              autoFocus
+            />
+            <button
+              type="submit"
+              className="course-picker-create"
+              disabled={submitDisabled}
+              title={
+                duplicateNew
+                  ? "已存在同名课程，请直接点上方按钮"
+                  : !newInputValid
+                  ? "名称含非法字符 — 仅支持字母 / 数字 / 中文 / 空格 / . - _"
+                  : ""
+              }
+            >新建并上传</button>
+          </form>
+          {duplicateNew ? (
+            <div className="course-picker-warn">
+              已存在同名课程「{trimmed}」 — 请直接点上方按钮，或换一个名字。
+            </div>
+          ) : !newInputValid ? (
+            <div className="course-picker-warn">
+              名称仅支持字母 / 数字 / 中文 / 空格以及 . - _，且不能含 ".." 或以 "." 开头结尾。
+            </div>
+          ) : null}
+        </div>
+
+        <div className="course-picker-section course-picker-engine-row">
+          <div className="course-picker-label">PDF 提取引擎</div>
+          <div className="course-picker-engine-choices">
+            <label className={"course-picker-engine-choice" + (engine === "pymupdf" ? " is-on" : "")}>
+              <input
+                type="radio"
+                name="course-picker-engine"
+                checked={engine === "pymupdf"}
+                onChange={() => setEngine("pymupdf")}
+              />
+              <span className="course-picker-engine-name">PyMuPDF</span>
+              <span className="course-picker-engine-meta">默认 · 毫秒级 · 不解析公式</span>
+            </label>
+            <label className={"course-picker-engine-choice" + (engine === "mineru" ? " is-on" : "")}>
+              <input
+                type="radio"
+                name="course-picker-engine"
+                checked={engine === "mineru"}
+                onChange={() => setEngine("mineru")}
+              />
+              <span className="course-picker-engine-name">MinerU</span>
+              <span className="course-picker-engine-meta">高质量 · ~10s/页 · LaTeX + 表格</span>
+            </label>
+          </div>
+        </div>
+
+        {/* Hidden file input — triggered synchronously by chip / submitNew
+            handlers so transient user activation is still valid when the OS
+            opens the picker. accept list mirrors the previous ad-hoc input. */}
+        <input
+          ref={fileInputRef}
+          type="file"
+          multiple
+          accept=".pdf,.pptx,.docx,.md,.txt"
+          onChange={handleFileChange}
+          style={{ display: "none" }}
+          aria-hidden="true"
+          tabIndex={-1}
+        />
+      </div>
+    </div>
+  );
+}
+
 function App() {
   const tweaks = useTweaks(TWEAK_DEFAULTS);
+
+  // 2026-05-20: TweaksPanel is dev-only (gated on parent-window postMessage
+  // from the design host) — never reaches end users. We hoist theme /
+  // density / base font size into App state with localStorage persistence
+  // so the Settings page can expose them. TWEAK_DEFAULTS still drives the
+  // initial value, keeping the EDITMODE block as the single source of
+  // defaults for both the design host and the runtime app.
+  const [theme, setTheme] = useState(() => {
+    try { return window.localStorage.getItem("nano-nlm:v1:theme") || APPEARANCE_DEFAULTS.theme; }
+    catch (e) { return APPEARANCE_DEFAULTS.theme; }
+  });
+  const [density, setDensity] = useState(() => {
+    try { return window.localStorage.getItem("nano-nlm:v1:density") || APPEARANCE_DEFAULTS.density; }
+    catch (e) { return APPEARANCE_DEFAULTS.density; }
+  });
+  const [baseSize, setBaseSize] = useState(() => {
+    try {
+      const v = parseInt(window.localStorage.getItem("nano-nlm:v1:base-size") || "", 10);
+      // Must match the Settings slider min/max (13–18) — a wider range here
+      // would let stale localStorage values survive hydration that the UI
+      // can't reproduce, locking the user out of fixing the size.
+      return Number.isFinite(v) && v >= 13 && v <= 18 ? v : APPEARANCE_DEFAULTS.baseSize;
+    } catch (e) { return APPEARANCE_DEFAULTS.baseSize; }
+  });
+  // For Auto mode: the resolved theme ("paper" or "dark") so Settings can
+  // show "Auto · 现在 = Dark". Updated by the theme effect below.
+  const [autoResolved, setAutoResolved] = useState("paper");
+  const commitTheme = React.useCallback((v) => {
+    setTheme(v);
+    try { window.localStorage.setItem("nano-nlm:v1:theme", v); } catch (e) {}
+  }, []);
+  const commitDensity = React.useCallback((v) => {
+    setDensity(v);
+    try { window.localStorage.setItem("nano-nlm:v1:density", v); } catch (e) {}
+  }, []);
+  const commitBaseSize = React.useCallback((v) => {
+    setBaseSize(v);
+    try { window.localStorage.setItem("nano-nlm:v1:base-size", String(v)); } catch (e) {}
+  }, []);
+
   const [mode, setMode] = useState("reader");
   const [sources, setSources] = useState([]);
   const [activeId, setActiveId] = useState(null);
@@ -121,6 +411,24 @@ function App() {
   // user is in the Notes view but no chip has been clicked, or the cited
   // source is non-PDF and fell back to the Reader-tab path).
   const [pdfPreview, setPdfPreview] = useState(null);
+  // Promise-resolver state for the course-picker modal. Holds the pending
+  // `resolve` function so `onStartUpload` can `await pickCourseId()` and the
+  // modal's chip / form callbacks can hand the chosen id back. `null` ↔
+  // modal closed. The ref below mirrors the same value so the App-unmount
+  // cleanup can settle a pending promise without keeping `coursePickerResolve`
+  // in its deps (which would re-fire on every set).
+  const [coursePickerResolve, setCoursePickerResolve] = useState(null);
+  const coursePickerResolveRef = useRef(null);
+  useEffect(() => { coursePickerResolveRef.current = coursePickerResolve; });
+  // fix-all #H3: if <App> unmounts (HMR, future Vite migration, hard route
+  // change) while the picker is open, the awaiting `onStartUpload` would
+  // otherwise hang forever — the resolver closure leaks and the file-input
+  // closure with it. Settle with null on unmount so the awaiter sees the
+  // same "user cancelled" branch.
+  useEffect(() => () => {
+    const fn = coursePickerResolveRef.current;
+    if (fn) fn(null);
+  }, []);
   const [uploading, setUploading] = useState(null);
   const [processing, setProcessing] = useState(null);
   const [streaming, setStreaming] = useState(false);
@@ -1314,7 +1622,31 @@ function App() {
     pollRef.current = { iv, task_id, courseName };
   }
 
-  function onStartUpload() {
+  // Promise-based wrapper around the course-picker modal — owns the entire
+  // user-interaction phase (course + engine + files) in a single round trip
+  // so transient user activation stays intact through to the OS file dialog.
+  // Resolves with `{ courseId, files, engine }` or null on Cancel/Esc/backdrop.
+  // fix-all #H1: returns the course_id (directory key), not the display name.
+  // 2026-05-20: rewired from the old `pickCourseId()` → `confirm()` →
+  // `document.createElement('input').click()` chain because that chain's
+  // post-await `input.click()` was being silently blocked by Chrome's
+  // transient-activation rule.
+  function pickCourseAndFiles() {
+    // Concurrent-call guard: if a picker is already open, resolve the new
+    // promise immediately with null instead of clobbering the stored
+    // resolver (which would leave the first promise pending forever). The
+    // outer `onStartUpload` guard already blocks the typical double-click,
+    // but a future caller could re-enter; cheap insurance.
+    if (coursePickerResolveRef.current) return Promise.resolve(null);
+    return new Promise(resolve => {
+      setCoursePickerResolve(() => (value) => {
+        setCoursePickerResolve(null);
+        resolve(value);
+      });
+    });
+  }
+
+  async function onStartUpload() {
     if (uploading) return;
     // review-swarm M1 (2026-05-16): a double-click on the upload button
     // would otherwise post a second upload immediately, overwrite the
@@ -1325,28 +1657,14 @@ function App() {
       try { console.warn("upload already in flight — ignoring duplicate trigger"); } catch {}
       return;
     }
-    // Ask for course name first
-    const existingNames = courses.map(c => c.name).join(", ");
-    const defaultName = activeCourse || "";
-    const courseName = prompt(
-      `Upload to which course?\n\nExisting: ${existingNames || "none"}\n\nEnter a course name (new or existing):`,
-      defaultName
-    );
-    if (!courseName) return;
-
-    // R5/MinerU: per-upload engine pick. Stored preference is the default;
-    // confirm() lets the user override for this upload only. The "OK ↔
-    // Cancel" framing is the only native dialog primitive available here,
-    // hence "OK = MinerU".
-    const currentEngine = uploadEngine === "mineru" ? "MinerU" : "PyMuPDF";
-    const wantMineru = window.confirm(
-      `Use MinerU for high-quality PDF extraction?\n\n` +
-      `• OK → MinerU (~10s/page on M4 CPU, recovers LaTeX equations + HTML tables + figures)\n` +
-      `• Cancel → PyMuPDF (ms-level, default, drops formulae)\n\n` +
-      `Current default: ${currentEngine}\n` +
-      `Only PDFs are affected; PPTX/DOCX/MD use their native extractors either way.`
-    );
-    const chosenEngine = wantMineru ? "mineru" : "pymupdf";
+    // Modal handles course + engine + file picking in one user-gesture
+    // window. Cancel / Esc / backdrop click resolves with null.
+    const picked = await pickCourseAndFiles();
+    if (!picked) return;
+    const { courseId, files, engine } = picked;
+    if (!courseId || !files || !files.length) return;
+    const courseName = courseId;
+    const chosenEngine = engine === "mineru" ? "mineru" : "pymupdf";
     if (chosenEngine !== uploadEngine) commitUploadEngine(chosenEngine);
 
     // Background-task upload (2026-05-16): POST returns {task_id} immediately,
@@ -1395,19 +1713,10 @@ function App() {
 
     // Expose runUpload to the Processing render via retryRef so the
     // retry button re-invokes the upload with the original `files`
-    // captured in this closure (preserves courseName too).
+    // captured in this closure (preserves courseName + chosenEngine too).
     retryRef.current = runUpload;
 
-    const input = document.createElement("input");
-    input.type = "file";
-    input.multiple = true;
-    input.accept = ".pdf,.pptx,.docx,.md,.txt";
-    input.onchange = (e) => {
-      const files = e.target.files;
-      if (!files.length) return;
-      runUpload(files);
-    };
-    input.click();
+    runUpload(files);
   }
 
   // R4-2: auto-dismiss the processing screen ~1.2s after `done` fires.
@@ -1924,6 +2233,17 @@ function App() {
         onClose={() => setPdfPreview(null)}
         onOpenInReader={handleOpenPreviewInReader}
       />
+
+      {/* ========= Upload course picker modal ========= */}
+      {coursePickerResolve && (
+        <CoursePickerModal
+          courses={visibleCourses}
+          defaultId={activeCourse || ""}
+          defaultEngine={uploadEngine}
+          onPick={(courseId, files, engine) => coursePickerResolve({ courseId, files, engine })}
+          onCancel={() => coursePickerResolve(null)}
+        />
+      )}
 
       {/* ========= R3-2 first-run / re-pick language modal ========= */}
       {showLangModal && (
