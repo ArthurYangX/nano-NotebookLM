@@ -16,7 +16,6 @@ Flow:
 from __future__ import annotations
 
 import asyncio
-import difflib
 import html
 import logging
 import os
@@ -24,33 +23,15 @@ import re
 from typing import Iterable
 
 from nano_notebooklm.ai import prompt_templates as prompts
-from nano_notebooklm.ai.qwen_raft_backend import QwenBackendError
 from nano_notebooklm.orchestrator import router_intent
 from nano_notebooklm.orchestrator.memory import add_interaction, get_context_prompt
 from nano_notebooklm.skills.base import Skill
 from nano_notebooklm.types import LLMResponse, SearchResult, SkillResult
 
-try:
-    import httpx as _httpx
-    _HTTP_ERROR_TYPE: type = _httpx.HTTPError
-except ImportError:  # pragma: no cover — httpx is a hard dependency, just defensive
-    _HTTP_ERROR_TYPE = Exception
-
-# fix-all v1 #V4 (R4-5 review v1): narrow `except Exception` in the qwen
-# fallback path so a genuine programming bug (KeyError/TypeError on a
-# malformed LLMResponse) surfaces as a 500 rather than getting masked
-# by `backend_fallback=True`. RuntimeError covers router.complete's
-# "all retries exhausted" + _resolve_backend's missing-backend raise.
-_QWEN_EXPECTED_ERRORS: tuple[type[BaseException], ...] = (
-    QwenBackendError,
-    RuntimeError,
-    _HTTP_ERROR_TYPE,
-)
-
 logger = logging.getLogger(__name__)
 
 # Wrap the translation LLM call so a stalled provider can't double our chat
-# latency budget. 5s is generous: codex GPT-5.5 typically translates in <1s.
+# latency budget. 5s is generous; frontier models typically translate in <1s.
 TRANSLATION_TIMEOUT_SECONDS = 5.0
 
 # 2026-05-16: multi-turn history rewrite — disambiguate follow-up questions
@@ -220,45 +201,7 @@ def _invalidate_courses_kg_cache(courses_root=None) -> None:
         return
     _COURSES_KG_CACHE.pop(str(courses_root), None)
 
-# R4-5 part 2 + fix-all v1 #V5: bound an explicit `backend="qwen_raft"`
-# LLM call. AutoDL Qwen2.5-7B-RAFT inference is typically 3-15s on warm
-# GPU; 30s catches a hung HTTP connection / cold-start anomaly while
-# leaving runway for legitimate slow responses. On timeout the chat
-# path silently degrades to the default routing backend and the response
-# carries `backend_fallback=True` so the frontend can chip-flag the
-# degradation. Operators tuning AutoDL cold-start budgets override via
-# `QWEN_BACKEND_TIMEOUT_SECONDS` env. The qwen client's own transport
-# timeout (`QWEN_RAFT_HTTP_TIMEOUT`, default 60s) is independent —
-# operators raising this above this constant will see chat still time
-# out at the chat-path budget.
-def _qwen_backend_timeout() -> float:
-    """Chat-path wall-clock budget for qwen_raft.
-
-    2026-05-13: raised default 30 → 60. Monitor run on 2026-05-12T17:23Z
-    showed 24/30 questions on test-slides timed out at 30s and silently
-    fell back to codex. AutoDL Qwen2.5-7B-RAFT under load consistently
-    answers in 35-50s; 60s gives qwen a real chance while still bounding
-    the worst case below the user's tolerance.
-    """
-    raw = os.getenv("QWEN_BACKEND_TIMEOUT_SECONDS")
-    if not raw:
-        return 60.0
-    try:
-        value = float(raw)
-    except ValueError:
-        logger.warning(
-            "QWEN_BACKEND_TIMEOUT_SECONDS=%r is not a float; using default 60.0",
-            raw,
-        )
-        return 60.0
-    if value <= 0 or value != value or value in (float("inf"), float("-inf")):
-        return 60.0
-    return value
-
-
-QWEN_BACKEND_TIMEOUT_SECONDS = _qwen_backend_timeout()
-
-# fix-all v1 #A3 / #B6 (R4-4 review-swarm): graphrag admission gate. Plain
+# Graphrag admission gate. Plain
 # cosine ranking against the KG concept embeddings yields api_scores roughly
 # in the [-1, 1] cosine range; 0.15 puts "moderate semantic overlap" as the
 # floor (rules out queries with no real conceptual overlap that nonetheless
@@ -380,177 +323,6 @@ def _serialize_sources(results: Iterable[SearchResult]) -> list[dict]:
         }
         for r in results
     ]
-
-
-_BLOCKQUOTE_RE = re.compile(r"(?:^|\n)((?:>[ \t]?.*(?:\n|$))+)", flags=re.MULTILINE)
-_QUOTE_SOURCE_MIN_RATIO = float(os.getenv("QWEN_QUOTE_SOURCE_MIN_RATIO", "0.25"))
-_QUOTE_NORMALIZE_WS_RE = re.compile(r"\s+")
-
-# Formula-block heuristics: detect blockquotes that are predominantly
-# math notation (e.g. `P(X=x|ωk)= P(ωk|x) P(ωk) P(x)` spread across PDF
-# lines) so we can rewrap them as `$$...$$` KaTeX blocks. The frontend
-# already renders `$$...$$` via KaTeX auto-render; without this step
-# PDF-extracted formulas show as raw broken-line text.
-_MATH_SYMBOL_RE = re.compile(r"[=≤≥≠≈±∑∫∂∇√×÷≡≅∈∉∪∩→↔]")
-_CJK_RUN_RE = re.compile(r"[一-鿿]{3,}")   # 3+ consecutive CJK = likely prose
-_ENGLISH_WORD_RE = re.compile(r"\b[A-Za-z]{4,}\b")  # 4+ char word = likely prose
-
-
-def _normalize_for_match(s: str) -> str:
-    """Collapse all whitespace runs to a single space for fuzzy / substring
-    matching. Quote text from RAFT models often preserves PDF line breaks
-    that don't appear in the original chunk text, killing exact-substring
-    matches; collapsing whitespace makes both sides directly comparable.
-    """
-    return _QUOTE_NORMALIZE_WS_RE.sub(" ", s).strip()
-
-
-def _looks_like_formula_block(quote_text: str) -> bool:
-    """True iff `quote_text` is dominantly math notation rather than
-    natural-language prose. Used by `_annotate_quote_sources` to decide
-    whether to rewrap a blockquote as a `$$...$$` KaTeX block.
-
-    Heuristic:
-      - reject anything containing `<`, `>`, or `&` to defeat the
-        frontend math-stash XSS vector: `renderMarkdown` lifts the
-        block between `$$...$$` into a math token BEFORE running
-        `_escapeHtml`, so `</div><img src=x onerror=alert(1)>=x` would
-        otherwise be auto-promoted into a math block and injected raw
-        into the DOM via `dangerouslySetInnerHTML`. Review-swarm fix-now
-        CRITICAL #2 (2026-05-13).
-      - must contain at least one canonical math operator/symbol
-      - rejected if any run of 3+ consecutive CJK chars (prose)
-      - rejected if 3+ ASCII words of length >= 4 (prose, ignoring
-        single-letter symbols like x, k, n)
-    """
-    stripped = quote_text.strip()
-    if not stripped:
-        return False
-    if any(c in stripped for c in "<>&"):
-        return False
-    if not _MATH_SYMBOL_RE.search(stripped):
-        return False
-    if _CJK_RUN_RE.search(stripped):
-        return False
-    eng_words = _ENGLISH_WORD_RE.findall(stripped)
-    if len(eng_words) >= 3:
-        return False
-    return True
-
-
-def _formula_block_to_math(quote_text: str) -> str:
-    """Collapse a multi-line PDF-extracted formula into a single
-    `$$ ... $$` block so KaTeX can render it. Multi-line is the common
-    pathology: PDF columnation splits `P(X=x|ωk)= P(ωk|x) P(ωk) P(x)`
-    across four lines; KaTeX needs them on one logical line. Unicode
-    Greek letters (`ω`) and operators pass through to KaTeX as-is.
-    """
-    one_line = _QUOTE_NORMALIZE_WS_RE.sub(" ", quote_text).strip()
-    return f"$${one_line}$$"
-
-
-def _annotate_quote_sources(answer: str, results: list[SearchResult]) -> str:
-    """Step 2 of qwen-raft integration: match each markdown blockquote in
-    the answer against the search results handed to the LLM as context,
-    and append a ``[Source: file, location]`` tag so the existing
-    citation chip pipeline can link the quote back to the PDF.
-
-    Markdown blockquotes (``> ...``) come from
-    ``qwen_raft_backend._strip_raft_preamble`` (it converts the RAFT
-    model's ``##begin_quote##...##end_quote##`` spans). Codex / other
-    backends don't emit this format, so this is a no-op on their output
-    (no blockquote regex match → unchanged).
-
-    Matching strategy (in order):
-      1. **Whitespace-normalized substring**: collapse spaces/newlines
-         on both sides and check whether quote is a contiguous substring
-         of chunk.text. This is the strongest signal — short symbolic
-         quotes (`P(X=x|ωk)= P(ωk|x) P(ωk) P(x)`) that fail
-         SequenceMatcher's character-level ratio score will succeed
-         here because the chunk text contains the same symbols just
-         with different line breaks.
-      2. **SequenceMatcher quick_ratio fallback**: `QWEN_QUOTE_SOURCE_MIN_RATIO`
-         floor (default 0.25, lowered from 0.4 because RAFT quotes are
-         often short and lose ratio quickly to PDF-extraction artifacts).
-      3. **Top-rank fallback**: if both methods fail but `results` is
-         non-empty, attribute to `results[0]` — the highest-ranked
-         chunk is the most plausible source for a quote the LLM
-         produced from a context window we built. Marked with a `?`
-         to signal lower confidence to the reader.
-    """
-    if not answer or not results:
-        return answer
-    # Pre-normalize each chunk text once. SequenceMatcher gets the raw
-    # text (its quick_ratio is whitespace-sensitive but the floor is
-    # low enough that it still matches).
-    candidates = [
-        (r.source_file, r.location, r.text, _normalize_for_match(r.text))
-        for r in results
-    ]
-
-    def _replace(m):
-        block = m.group(1).rstrip("\n")
-        quote_text = "\n".join(
-            re.sub(r"^>[ \t]?", "", line) for line in block.split("\n")
-        ).strip()
-        if len(quote_text) < 4:
-            return m.group(0)
-        quote_norm = _normalize_for_match(quote_text)
-
-        # Resolve source. Three-tier:
-        #   1. whitespace-normalized substring match → confident tag
-        #   2. SequenceMatcher quick_ratio ≥ floor → confident tag
-        #   3. neither matches → no tag (review-swarm fix-now HIGH #6,
-        #      2026-05-13). Previous code fell back to candidates[0]
-        #      and tagged it identically to a real match, producing
-        #      "phantom citations" that jumped users to a wrong page
-        #      with no visual cue that the link was a guess. Better to
-        #      ship an untagged blockquote than a misleading link.
-        source_tag = None
-        for i, (_sf, _loc, _txt, txt_norm) in enumerate(candidates):
-            if quote_norm in txt_norm:
-                sf, loc, _txt, _txt_norm = candidates[i]
-                source_tag = f"[Source: {sf}, {loc}]"
-                break
-        if source_tag is None:
-            best = (-1, 0.0)
-            for i, (_sf, _loc, txt, _txt_norm) in enumerate(candidates):
-                ratio = difflib.SequenceMatcher(
-                    None, quote_text, txt, autojunk=True,
-                ).quick_ratio()
-                if ratio > best[1]:
-                    best = (i, ratio)
-            if best[0] >= 0 and best[1] >= _QUOTE_SOURCE_MIN_RATIO:
-                sf, loc, _txt, _txt_norm = candidates[best[0]]
-                source_tag = f"[Source: {sf}, {loc}]"
-
-        # 2026-05-13: top-rank fallback REVERTED. Real-user test showed
-        # graphrag often retrieved a wrong-chapter top chunk (e.g. ch1
-        # for an HMM question), and the `?` tag still pointed users to
-        # the wrong PDF page. Better to ship a bare blockquote than a
-        # confidently-wrong link.
-
-        trailing_newline = "\n" if m.group(0).endswith("\n") else ""
-        # When source_tag is None (neither substring nor fuzzy match
-        # cleared the floor) we ship the blockquote / math block bare —
-        # no misleading link.
-        tag_suffix = f" {source_tag}" if source_tag else ""
-
-        # Formula-block rewrite: PDF-extracted formulas come out as
-        # multi-line raw unicode (`P(X=x|ωk)=` / `P(ωk|x)` / ...). Wrap
-        # the whole thing in `$$...$$` so KaTeX renders it as math.
-        # Drop the blockquote prefix — display math doesn't need it.
-        if _looks_like_formula_block(quote_text):
-            math = _formula_block_to_math(quote_text)
-            return f"\n{math}{tag_suffix}{trailing_newline}"
-
-        # Normal prose blockquote.
-        return f"\n{block}{tag_suffix}{trailing_newline}"
-
-    annotated = _BLOCKQUOTE_RE.sub(_replace, answer)
-    # Clean up the leading newline _replace adds for the first block
-    # if the original answer started directly with a blockquote.
-    return annotated.lstrip("\n") if not answer.startswith("\n") else annotated
 
 
 def _md_safe(text: str) -> str:
@@ -715,8 +487,8 @@ class QASkill(Skill):
         # than stripping arbitrary leading labels, because a jailbreak that
         # emits `Rewritten: <attacker payload>` would have had its prefix
         # dutifully removed by the old logic, laundering the attack into
-        # a clean retrieval query. With temperature=0.0 codex GPT-5.5
-        # reliably obeys the no-prefix instruction.
+        # a clean retrieval query. With temperature=0.0 frontier models
+        # reliably obey the no-prefix instruction.
         rewritten = (resp.content or "").strip().strip(_QUOTE_STRIP).strip()
         if not rewritten:
             return None
@@ -736,19 +508,16 @@ class QASkill(Skill):
         question = params.get("question", "")
         # fix-all v1 #M2 (2026-05-16 review-swarm): retrieval_query is
         # the history-rewritten search string when present; question is
-        # always the user's literal text. ALL retrieval call sites use
-        # retrieval_query; ALL `_answer_*` LLM prompts use `question`
-        # so a bad rewrite cannot drift the user-visible answer.
+        # always the user's literal text.
         retrieval_query = params.get("retrieval_query") or question
         course_filter = params.get("course_filter")
         top_k = params.get("top_k", 5)
         checked_files = params.get("checked_files")
         user_lang = params.get("user_lang")
-        # R4-5 part 2: optional per-request backend override
-        # ("codex" / "qwen_raft" / None). Threaded through _answer_rag /
-        # _answer_general; auxiliary calls (translate, cross-course
-        # routing) stay on the codex main path so the demo chip only
-        # affects the answer generation step, not retrieval helpers.
+        # Optional per-request backend override. Threaded through
+        # _answer_rag / _answer_general; auxiliary calls (translate,
+        # cross-course routing) stay on the default backend so the chip
+        # only affects the answer generation step, not retrieval helpers.
         backend = params.get("backend")
         # 2026-05-12: user-customisable assistant name. None / empty →
         # the renderer functions in prompt_templates fall back to
@@ -1382,7 +1151,7 @@ class QASkill(Skill):
             return None
         return translated, results
 
-    async def _complete_with_backend_fallback(
+    async def _complete_with_backend(
         self,
         prompt: str,
         task_type: str,
@@ -1390,90 +1159,15 @@ class QASkill(Skill):
         temperature: float,
         max_tokens: int = 4096,
         backend: str | None = None,
-    ) -> tuple[LLMResponse, bool]:
-        """R4-5 part 2 + fix-all v1: wrap router.complete with
-        qwen_raft → default fallback semantics.
-
-        When `backend="qwen_raft"`, the call is bounded by
-        `QWEN_BACKEND_TIMEOUT_SECONDS` and any failure (timeout, HTTP
-        error, transient 5xx) silently degrades. Returns
-        (response, fell_back) so the caller can surface
-        `backend_fallback=True` to the client.
-
-        **fix-all v1 #V1 (R4-5 review v1)**: `backend="codex"` is
-        treated as **default task routing** (same as `None`), NOT as
-        an explicit "openai" pin. The original v1 wired codex→openai
-        via alias + disabled router auto-fallback, which 500s on any
-        deployment without `OPENAI_API_KEY` set (claude-only +
-        qwen-only configs). codex is the chip's user-facing label for
-        "use the default backend", not a hard pin on the openai key.
-
-        **fix-all v1 #V4**: when qwen_raft is pinned, set
-        `max_retries=1` so the router's exponential-backoff retry
-        loop doesn't burn 3.3s before the outer `wait_for` catches a
-        fast-failing 5xx. The `wait_for(30s)` is the budget; retries
-        within it are wasted.
-
-        **fix-all v1 #V4**: narrow the broad `except Exception` to
-        `(httpx.HTTPError, RuntimeError, QwenBackendError)` so a
-        genuine programming bug (TypeError, KeyError) surfaces as 500
-        rather than getting silently masked by the fallback.
-
-        **fix-all v1 #V4 PII scrub**: log only `getattr(exc, "code",
-        type(exc).__name__)` — QwenBackendError carries a stable
-        `code` attribute designed for safe logging. Drop `str(exc)`
-        which may contain prompts / URLs.
+    ) -> LLMResponse:
+        """Thin wrapper around router.complete. `backend` is an optional
+        chip override (e.g. "openai" / "claude" / "local"). When None,
+        the router's task-type routing + cross-backend fallback applies.
         """
-        if backend == "qwen_raft":
-            try:
-                resp = await asyncio.wait_for(
-                    self.router.complete(
-                        prompt, task_type=task_type, system=system,
-                        temperature=temperature, max_tokens=max_tokens,
-                        backend="qwen_raft",
-                        max_retries=1,  # #V4: outer wait_for is the budget
-                    ),
-                    timeout=QWEN_BACKEND_TIMEOUT_SECONDS,
-                )
-                return resp, False
-            except asyncio.TimeoutError:
-                logger.warning(
-                    "qwen_raft backend timed out (>%ss); falling back to default routing",
-                    QWEN_BACKEND_TIMEOUT_SECONDS,
-                )
-            except _QWEN_EXPECTED_ERRORS as exc:
-                # #V4 PII scrub: prefer stable error code; never log exc body.
-                code = getattr(exc, "code", type(exc).__name__)
-                logger.warning(
-                    "qwen_raft backend failed (%s); falling back to default routing",
-                    code,
-                )
-            # 2026-05-13 hotfix: when qwen_raft fails, fall back to
-            # qwen_base (also Qwen, same RAG output style) instead of
-            # running default routing. Default routing on a codex-
-            # daily-exhausted day hits openai → 403 ×2 → router internal
-            # fallback to qwen_raft → another wrapper timeout → 7-min
-            # double-loop. Pinning qwen_base here makes the fallback
-            # deterministic and fast (~30s). #V1 originally pointed at
-            # default routing to support claude-only deployments; that
-            # path still works because qwen_base is configured iff the
-            # operator opted into the dual-Qwen setup.
-            resp = await self.router.complete(
-                prompt, task_type=task_type, system=system,
-                temperature=temperature, max_tokens=max_tokens,
-                backend="qwen_base",
-            )
-            return resp, True
-
-        # backend is None or "codex": default task-type routing.
-        # #V1: "codex" is the user-facing chip label; treat it as
-        # "use whatever backend the operator configured" rather than
-        # forcing openai. Operator's DEFAULT_BACKEND + TASK_ROUTES rule.
-        resp = await self.router.complete(
+        return await self.router.complete(
             prompt, task_type=task_type, system=system,
-            temperature=temperature, max_tokens=max_tokens,
+            temperature=temperature, max_tokens=max_tokens, backend=backend,
         )
-        return resp, False
 
     async def _answer_rag(
         self,
@@ -1521,47 +1215,13 @@ class QASkill(Skill):
                 "more helpful than a refusal."
             )
 
-        # 2026-05-13: Qwen-RAFT empirically weights user-message instructions
-        # more than system, AND tends to echo the prompt's own language.
-        # When user_lang=zh + backend=qwen_raft, swap the QA scaffolding
-        # to a Chinese version so the model sees Chinese instructions and
-        # naturally answers in Chinese. Codex follows the soft system-
-        # prompt binding fine, so we only flip the scaffolding for qwen.
-        if user_lang == "zh" and backend == "qwen_raft":
-            prompt = (
-                "参考资料：\n\n"
-                f"{context}\n\n"
-                "---\n\n"
-                f"问题：{question}\n\n"
-                "请根据上述参考资料用**中文**简洁作答；关键论断要标注引用 [Source: 文件名, 页码]。"
-                "即使参考资料是英文写的，你也必须输出中文翻译后的解释，不要直接照搬英文句子。"
-                "**重要**：如果参考资料中出现 PPT/OCR 抽取出的碎片化数学符号"
-                "（例如 `q1 k1 ρ1 α3,1 α3,2 ρ1, ρ2, ρ3` 这种零散字符），"
-                "请用标准 LaTeX 公式重新表达（例如 `$\\mathrm{Attention}(Q,K,V) = "
-                "\\mathrm{softmax}(QK^\\top/\\sqrt{d_k}) V$`），"
-                "**绝对不要**逐字复述这些碎片符号 — 复述会陷入 token 循环。"
-                "如果参考资料里没有完整公式，明确说"
-                "「资料中没有给出完整公式」即可，不要编造。"
-            )
-        elif user_lang == "en" and backend == "qwen_raft":
-            prompt = prompts.QA_PROMPT.format(context=context, question=question)
-            prompt += "\n\n[OUTPUT LANGUAGE — MANDATORY] Reply ONLY in English; do not echo Chinese verbatim."
-        else:
-            prompt = prompts.QA_PROMPT.format(context=context, question=question)
-        resp, fell_back = await self._complete_with_backend_fallback(
+        prompt = prompts.QA_PROMPT.format(context=context, question=question)
+        resp = await self._complete_with_backend(
             prompt, task_type="qa_answer", system=system, temperature=0.3,
             backend=backend,
         )
 
         answer = resp.content
-        # 2026-05-13 Step 2: qwen-raft Quote → citation. When the response
-        # came from the qwen backend, _strip_raft_preamble has already
-        # converted ##begin_quote##...##end_quote## spans into markdown
-        # blockquotes. Tag each blockquote with the best-matching source
-        # so the frontend citation pipeline can route clicks to the PDF.
-        # Idempotent on codex answers (no blockquotes to match).
-        if resp.model and "qwen" in resp.model.lower():
-            answer = _annotate_quote_sources(answer, results)
         if path == "translated" and original_query and translated_query:
             note = (
                 f"_(原问：「{_md_safe(original_query)}」在本课无直接资料；"
@@ -1601,11 +1261,6 @@ class QASkill(Skill):
             data["translated_query"] = translated_query
         if cross_course_origin is not None:
             data["cross_course_origin"] = cross_course_origin
-        # R4-5 part 2: surface qwen→codex fallback so the frontend chip
-        # can flag the degradation. Only set when fell_back is True;
-        # ChatResponse model treats False as no-fallback.
-        if fell_back:
-            data["backend_fallback"] = True
         return SkillResult(success=True, data=data)
 
     async def _answer_general(
@@ -1664,9 +1319,8 @@ class QASkill(Skill):
                     "the system prompt — short, calm, redirect to course help."
                 )
 
-        fell_back = False
         try:
-            resp, fell_back = await self._complete_with_backend_fallback(
+            resp = await self._complete_with_backend(
                 prompt,
                 task_type="qa_general",
                 system=system,
@@ -1696,7 +1350,4 @@ class QASkill(Skill):
             "path": "general",
             "general_reason": reason,
         }
-        # R4-5 part 2: surface qwen→codex fallback flag (general path).
-        if fell_back:
-            data["backend_fallback"] = True
         return SkillResult(success=True, data=data)

@@ -78,7 +78,7 @@ def chat_capture(monkeypatch, tmp_path, fake_embed_fn):
     captured = {"systems": []}
 
     async def stub(prompt, task_type="", system="", temperature=0.7,
-                   max_tokens=4096, max_retries=3):
+                   max_tokens=4096, max_retries=3, **kwargs):
         captured["systems"].append(system or "")
         if task_type == "translate_query":
             return LLMResponse(content=prompt[-40:], model="fake",
@@ -256,7 +256,7 @@ def test_quiz_with_user_lang_zh_question_text_constraint(chat_capture, monkeypat
     captured: list[str] = []
 
     async def stub_structured(prompt, task_type="", system="", temperature=0.7,
-                              max_tokens=4096, max_retries=3):
+                              max_tokens=4096, max_retries=3, **kwargs):
         captured.append(system or "")
         return [{"question": "什么是局部性?", "type": "short_answer",
                  "answer": "时间与空间局部性。", "difficulty": "easy",

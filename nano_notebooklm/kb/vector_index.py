@@ -1,8 +1,7 @@
 """FAISS-based vector index for semantic search.
 
-Adapted from NLPProject/server_scripts/rag_pipeline.py DocumentIndex class.
-Key changes: accepts embed_fn callable instead of hardcoded SentenceTransformer,
-supports incremental add_chunks(), stores full Chunk metadata.
+Accepts an `embed_fn` callable instead of a hardcoded SentenceTransformer,
+supports incremental `add_chunks()`, stores full Chunk metadata.
 """
 
 from __future__ import annotations
@@ -40,6 +39,7 @@ class VectorIndex:
         chunks: list[Chunk],
         batch_size: int = 64,
         cached_vectors: dict[str, np.ndarray] | None = None,
+        on_progress: Callable[[int, int], None] | None = None,
     ):
         """Build index from a list of chunks.
 
@@ -88,11 +88,32 @@ class VectorIndex:
 
         # Embed only the misses.
         if miss_texts:
-            for start in range(0, len(miss_texts), batch_size):
+            total_miss = len(miss_texts)
+            # Log the traceback once per build if the callback misbehaves —
+            # otherwise a broken callback would flood the log with the same
+            # stack ~160× for a 10k-chunk re-embed.
+            cb_failed = [False]
+
+            def _emit(done: int) -> None:
+                if not on_progress:
+                    return
+                try:
+                    on_progress(done, total_miss)
+                except Exception:
+                    if not cb_failed[0]:
+                        logger.warning(
+                            "on_progress raised; suppressing further tracebacks this build",
+                            exc_info=True,
+                        )
+                        cb_failed[0] = True
+
+            _emit(0)
+            for start in range(0, total_miss, batch_size):
                 batch = miss_texts[start : start + batch_size]
                 batch_emb = np.asarray(self.embed_fn(batch))
                 for j in range(batch_emb.shape[0]):
                     embeddings[miss_indices[start + j]] = batch_emb[j]
+                _emit(min(start + batch_size, total_miss))
 
         # Validate uniform dim. A model swap between builds (e.g. switching
         # EMBEDDING_MODEL) makes cached vectors dim-incompatible with fresh
@@ -104,7 +125,14 @@ class VectorIndex:
                 "— discarding cache and re-embedding all %d chunks",
                 shapes, len(chunks),
             )
-            return self.build(chunks, batch_size=batch_size, cached_vectors=None)
+            # Don't forward on_progress: the recursive call would emit
+            # `(0, all_chunks)` as a fresh denominator, which from the
+            # outer caller's monotonic counter looks like a backwards jump
+            # AND the new total (all chunks) likely exceeds the precomputed
+            # global denominator. Outer caller's last-known progress just
+            # stalls until the recursive build completes — acceptable for
+            # a rare dim-swap path.
+            return self.build(chunks, batch_size=batch_size, cached_vectors=None, on_progress=None)
 
         embeddings_arr = np.stack(
             [np.asarray(e, dtype=np.float32).reshape(-1) for e in embeddings],

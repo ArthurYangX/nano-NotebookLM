@@ -336,7 +336,7 @@ def test_status_surfaces_settings_readonly_fields(client, monkeypatch):
     from /api/status to render badges. Contract:
       - API key fields are booleans (configured / not), never the value
       - base URL + model names are strings
-      - qwen fields are gated on QWEN_RAFT_URL being set
+      - local_llm_* fields are gated on LOCAL_LLM_BASE_URL being set
     Critically: the real key string must NEVER appear in the JSON body.
     """
     sentinel_openai = "sk-test-openai-SHOULD-NOT-LEAK-1234"
@@ -370,47 +370,29 @@ def test_status_surfaces_settings_readonly_fields(client, monkeypatch):
     assert sentinel_anthropic not in raw, "ANTHROPIC_API_KEY leaked into /api/status body"
 
 
-def test_status_qwen_fields_gated_on_url(client, monkeypatch):
-    """Qwen-specific model name + host must be None when QWEN_RAFT_URL
-    is empty (= operator hasn't opted in). Avoids dangling 'qwen2.5-7b-raft'
-    label on the Settings page when no backend exists."""
-    from nano_notebooklm import config
-    monkeypatch.setattr(config, "QWEN_RAFT_URL", "")
+def test_status_lists_available_backends(client):
+    """The Settings UI and chip cycler read `available_backends` to pick
+    which backend chips to render. Pin the shape so a refactor that
+    renames this field breaks loudly."""
     r = client.get("/api/status")
     assert r.status_code == 200
     body = r.json()
-    assert body.get("qwen_raft_configured") is False
-    assert body.get("qwen_raft_model_name") is None
-    assert body.get("qwen_raft_url_host") is None
+    assert isinstance(body.get("available_backends"), list)
+    for name in body["available_backends"]:
+        assert name in {"openai", "claude", "local"}
 
 
-def test_status_qwen_url_host_strips_credentials_and_path(client, monkeypatch):
-    """review-swarm M2 (fix-all): host-only extraction must strip userinfo,
-    port, path, and query — these can carry credentials/tokens. The intent
-    of `qwen_raft_url_host` is to surface a recognizable host to the
-    Settings page badge, NOT the full URL with embedded credentials."""
-    creds_url = "https://leakuser:leakpass@host.example.com:48293/v1/chat?token=leaktoken"
+def test_status_local_llm_fields_gated_on_config(client, monkeypatch):
+    """Local-model fields surface only when LOCAL_LLM_BASE_URL is set."""
     from nano_notebooklm import config
-    monkeypatch.setattr(config, "QWEN_RAFT_URL", creds_url)
-
+    monkeypatch.setattr(config, "LOCAL_LLM_BASE_URL", "")
+    monkeypatch.setattr(config, "LOCAL_LLM_MODEL", "")
     r = client.get("/api/status")
     assert r.status_code == 200
     body = r.json()
-
-    # 正向：仅 hostname，剥光 scheme/userinfo/port/path/query
-    assert body["qwen_raft_url_host"] == "host.example.com"
-
-    # review-swarm v2 LOW-2: 同时守住 qwen_raft_model_name 的 positive
-    # 分支 —— server.py 是 `config.QWEN_RAFT_MODEL_NAME if qwen_configured
-    # else None`，原先只测了 else 分支（test_status_qwen_fields_gated_on_url）。
-    assert body["qwen_raft_model_name"] == config.QWEN_RAFT_MODEL_NAME
-
-    # 反向：凭据、端口、完整路径不得出现在响应中
-    raw = r.text
-    for sentinel in ["leakuser", "leakpass", "leaktoken", "48293", "/v1/chat", "https://leakuser"]:
-        assert sentinel not in raw, (
-            f"qwen URL component {sentinel!r} leaked into /api/status body"
-        )
+    assert body.get("local_llm_configured") is False
+    assert body.get("local_llm_model") is None
+    assert body.get("local_llm_base_url") is None
 
 
 def test_status_api_keys_unconfigured_when_env_empty(client, monkeypatch):

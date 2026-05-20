@@ -55,10 +55,7 @@ TOTAL_VARIANT_CAP = 20
 PER_TOPIC_VARIANT_CAP = 5
 DEFAULT_SEEDS_PER_TYPE = 2
 QUIZ_DEFAULT_SIZE = 8
-# fix-all v1 M9: env-tunable, matching QWEN_BACKEND_TIMEOUT_SECONDS /
-# GRAPHRAG_TIMEOUT_SECONDS / NANO_NLM_MAX_TECTONIC_CONCURRENCY conventions.
-# Without an env hook, operators on slow codex deployments can't raise the
-# 45 s ceiling without editing source.
+# Env-tunable so operators on slow providers can raise the ceiling.
 EXAM_PREP_LLM_TIMEOUT_S = float(os.getenv("EXAM_PREP_LLM_TIMEOUT_SECONDS", "120.0"))
 # fix-all v1 H3: cap concurrent variant-generation LLM calls. Notes pipeline
 # uses _FULL_COURSE_SEMAPHORE=2 for the analogous burst; here we sit at 4 to

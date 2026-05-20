@@ -79,8 +79,9 @@ class ExamAnalyzerSkill(Skill):
                 system="You are an expert at analyzing academic exam patterns. Output valid JSON only.",
                 temperature=0.3,
             )
-        except Exception as e:
-            return SkillResult(success=False, error=f"Analysis failed: {e}")
+        except Exception:
+            logger.exception("exam_analysis LLM call failed")
+            return SkillResult(success=False, error="exam_analysis_failed")
 
         # 3. Save analysis
         output_dir = config.ARTIFACTS_DIR / "courses" / course_id

@@ -32,7 +32,7 @@ class CheckpointManager:
         """Check if action should proceed or needs human approval.
 
         Args:
-            action: Description of the action (e.g. "Generate notes for CS231N")
+            action: Description of the action (e.g. "Generate notes for course-X")
             preview: Preview of what will happen
         """
         if self.mode == "auto":

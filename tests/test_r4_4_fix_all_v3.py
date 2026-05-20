@@ -387,7 +387,7 @@ def test_graphrag_zero_falls_through_to_cross_course(monkeypatch, tmp_path):
     from nano_notebooklm.types import LLMResponse
 
     async def stub(prompt, task_type="", system="", temperature=0.7,
-                   max_tokens=4096, max_retries=3):
+                   max_tokens=4096, max_retries=3, **kwargs):
         return LLMResponse(content="cross-course-answer", model="fake",
                            input_tokens=1, output_tokens=1, latency_ms=1.0)
 
@@ -440,7 +440,7 @@ def test_user_lang_zh_addendum_lands_in_graphrag_system_prompt(monkeypatch, tmp_
     from nano_notebooklm.types import LLMResponse
 
     async def stub(prompt, task_type="", system="", temperature=0.7,
-                   max_tokens=4096, max_retries=3):
+                   max_tokens=4096, max_retries=3, **kwargs):
         captured["systems"].append(system or "")
         return LLMResponse(content="ans", model="fake",
                            input_tokens=1, output_tokens=1, latency_ms=1.0)
@@ -504,7 +504,7 @@ def test_persona_reaches_graphrag_system_prompt(monkeypatch, tmp_path):
     from nano_notebooklm.types import LLMResponse
 
     async def stub(prompt, task_type="", system="", temperature=0.7,
-                   max_tokens=4096, max_retries=3):
+                   max_tokens=4096, max_retries=3, **kwargs):
         captured["systems"].append(system or "")
         return LLMResponse(content="ans", model="fake",
                            input_tokens=1, output_tokens=1, latency_ms=1.0)
@@ -575,7 +575,7 @@ def test_all_courses_graphrag_survives_partial_failure(monkeypatch, tmp_path):
     from nano_notebooklm.types import LLMResponse
 
     async def stub(prompt, task_type="", system="", temperature=0.7,
-                   max_tokens=4096, max_retries=3):
+                   max_tokens=4096, max_retries=3, **kwargs):
         return LLMResponse(content="ok", model="fake",
                            input_tokens=1, output_tokens=1, latency_ms=1.0)
     monkeypatch.setattr(server_mod.router, "complete", stub)
@@ -649,7 +649,7 @@ def test_all_courses_graphrag_skipped_when_kill_switch_off(monkeypatch, tmp_path
     from nano_notebooklm.types import LLMResponse
 
     async def stub(prompt, task_type="", system="", temperature=0.7,
-                   max_tokens=4096, max_retries=3):
+                   max_tokens=4096, max_retries=3, **kwargs):
         return LLMResponse(content="ok", model="fake",
                            input_tokens=1, output_tokens=1, latency_ms=1.0)
     monkeypatch.setattr(server_mod.router, "complete", stub)
@@ -708,7 +708,7 @@ def test_all_courses_graphrag_chat_source_carries_course_id(monkeypatch, tmp_pat
     from nano_notebooklm.types import LLMResponse
 
     async def stub(prompt, task_type="", system="", temperature=0.7,
-                   max_tokens=4096, max_retries=3):
+                   max_tokens=4096, max_retries=3, **kwargs):
         return LLMResponse(content="ok", model="fake",
                            input_tokens=1, output_tokens=1, latency_ms=1.0)
     monkeypatch.setattr(server_mod.router, "complete", stub)

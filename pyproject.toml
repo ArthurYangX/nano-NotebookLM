@@ -22,8 +22,6 @@ dependencies = [
     "pydantic>=2.7",
     "numpy>=1.26",
     "jieba>=0.42.1",
-    # UI
-    "gradio>=5.0",
     # Utilities
     "rich>=13.0",
     "python-dotenv>=1.0",
@@ -45,7 +43,7 @@ test = [
 nano-nlm = "nano_notebooklm.__main__:main"
 
 [tool.setuptools.packages.find]
-include = ["nano_notebooklm*", "ui*"]
+include = ["nano_notebooklm*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

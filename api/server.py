@@ -133,7 +133,12 @@ async def _warm_embed_fn() -> None:
                 exc_info=True,
             )
 
-    _aio.create_task(_do_warmup())
+    # Strong-ref pin: bare `create_task` only gets a weak reference from
+    # the asyncio loop; CPython may collect the task mid-`to_thread` and
+    # leave `embed_warm_ok = None` forever. Park the task on app.state.
+    task = _aio.create_task(_do_warmup())
+    app.state._embed_warm_task = task
+    task.add_done_callback(lambda _t: setattr(app.state, "_embed_warm_task", None))
 
 
 # LaTeX-refactor: probe `tectonic` once at boot. The PDF compile endpoint
@@ -4011,7 +4016,11 @@ async def switch_embedding_preset(req: EmbeddingSwitchRequest):
                             "embed_fn re-warm after switch failed", exc_info=True,
                         )
 
-                asyncio.create_task(_rewarm())
+                rewarm_task = asyncio.create_task(_rewarm())
+                app.state._embed_rewarm_task = rewarm_task
+                rewarm_task.add_done_callback(
+                    lambda _t: setattr(app.state, "_embed_rewarm_task", None)
+                )
             else:
                 app.state.embed_warm_ok = True
 

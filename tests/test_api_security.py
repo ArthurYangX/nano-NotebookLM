@@ -73,7 +73,7 @@ def secure_client(monkeypatch, tmp_path, fake_embed_fn):
     server_mod.kb.build_index(None)
 
     async def fake_complete(prompt, task_type="", system="", temperature=0.7,
-                            max_tokens=4096, max_retries=3):
+                            max_tokens=4096, max_retries=3, backend=None):
         return LLMResponse(
             content="offline security-test answer",
             model="fake",

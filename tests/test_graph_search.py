@@ -178,7 +178,7 @@ def graphrag_client(monkeypatch, tmp_path):
     from nano_notebooklm.types import LLMResponse
 
     async def stub(prompt, task_type="", system="", temperature=0.7,
-                   max_tokens=4096, max_retries=3):
+                   max_tokens=4096, max_retries=3, **kwargs):
         return LLMResponse(content="graph-rooted answer", model="fake",
                            input_tokens=1, output_tokens=1, latency_ms=1.0)
 

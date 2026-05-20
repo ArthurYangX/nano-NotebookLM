@@ -23,7 +23,7 @@ PARAMETERS = {
     "properties": {
         "course_id": {
             "type": "string",
-            "description": "Course id (e.g. 'CS231N').",
+            "description": "Course id.",
         },
         "topic": {
             "type": "string",

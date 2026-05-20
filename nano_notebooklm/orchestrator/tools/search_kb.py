@@ -24,7 +24,7 @@ PARAMETERS = {
         },
         "course_id": {
             "type": "string",
-            "description": "Optional course filter (e.g. 'CS231N'). Omit to search all courses.",
+            "description": "Optional course id to restrict the search to. Omit to search all courses.",
         },
         "top_k": {
             "type": "integer",

@@ -1,8 +1,4 @@
-"""Token-based text chunking with metadata preservation.
-
-Adapted from NLPProject/scripts/build_raft_dataset.py (token-based)
-and chunk_with_metadata.py (metadata tracking).
-"""
+"""Token-based text chunking with metadata preservation."""
 
 from __future__ import annotations
 
@@ -169,10 +165,7 @@ def chunk_pages(
 ) -> list[Chunk]:
     """Split pages/slides into token-based chunks with full metadata.
 
-    Uses token-based splitting (superior to character-based) from NLPProject's
-    build_raft_dataset.py, combined with metadata tracking from chunk_with_metadata.py.
-
-    R5/MinerU step ②: `$$...$$` LaTeX blocks are stashed to short
+    `$$...$$` LaTeX blocks are stashed to short
     placeholders before splitting, then restored. This guarantees no
     block ever ends up split across two chunks (a block that's itself
     larger than ``chunk_size`` lives in its own oversized chunk —

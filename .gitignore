@@ -1,39 +1,39 @@
 # Local environment
 .env
 .venv/
+venv/
+env/
 
 # Python caches / build output
 __pycache__/
 *.py[cod]
 *.pyo
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
 *.egg-info/
 dist/
 build/
-*.zip
 
-# Generated app data and personal study artifacts
+# Generated app data — uploaded files, indices, KGs, notes, sessions
 artifacts/
+
+# Tectonic / LaTeX build artefacts
+*.aux
+*.log
+*.out
+*.toc
 
 # OS / editor noise
 .DS_Store
+Thumbs.db
+.idea/
+.vscode/
 
-# Playwright MCP tool residue
-.playwright-mcp/
-
-# Unrelated sibling projects (kept here only locally)
-previous-agent/
-
-# Local Claude Code project config (per-machine)
+# Per-machine Claude Code project config
 .claude/
 
-# Local-only PDF fixtures for browser smoke tests
-test-pdf/
-
-# Local screenshots from browser smoke tests / UX demos (root only — keep
-# any frontend/docs PNG assets tracked under their respective dirs).
-/*.png
-
-# Local-only presentation materials
-slides/
-
+# Playwright / browser-automation residue
+.playwright-mcp/
+playwright-report/
+test-results/

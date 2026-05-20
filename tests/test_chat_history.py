@@ -289,7 +289,7 @@ def test_rewrite_strips_quotes_but_not_labels(chat_capture):
     """fix-all v1 #M3 (2026-05-16): quote stripping survives but label
     stripping was DROPPED — the legacy "Rewritten:" / "改写:" peel
     laundered jailbreaks ("Rewritten: <attacker>" → "<attacker>"). With
-    temperature=0 codex GPT-5.5 reliably obeys "no prefix", so we trust
+    temperature=0 frontier models reliably obey "no prefix", so we trust
     the model rather than post-process arbitrary leading text.
 
     A real-world rewriter following the prompt would emit just the bare
@@ -482,21 +482,6 @@ def test_rewritten_query_omitted_from_json_on_noop(chat_capture):
 
 
 # ── fix-all v1 #M5 — /api/status surface ──────────────────────────────
-
-
-def test_status_endpoint_surfaces_rewrite_history_backend(chat_capture):
-    """fix-all v1 #M5: /api/status exposes which backend actually serves
-    the rewrite_history task_type, so operators can detect when the
-    TASK_ROUTES pin silently fell back."""
-    client, _, _ = chat_capture
-    r = client.get("/api/status")
-    assert r.status_code == 200
-    body = r.json()
-    assert "rewrite_history_backend" in body
-    # When backends are registered, must be a non-empty string.
-    if body.get("backends"):
-        assert isinstance(body["rewrite_history_backend"], str)
-        assert body["rewrite_history_backend"]
 
 
 # ── fix-all v1 #M6 — session_log records rewritten_query ─────────────

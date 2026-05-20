@@ -401,34 +401,30 @@ def test_wrong_only_filter_uses_letter_for_multi_choice():
     assert run_node(script).strip() == "ok"
 
 
-def test_find_courses_with_cache_resurfaces_preset_work():
-    """R5-2 fix-all v2 #1: in default mode (?show_preset NOT set) the
-    backend hides preset courses, so localStorage cache the user built up
-    in ?show_preset=1 mode becomes invisible — they can't even navigate to
-    the course in the dropdown. `findCoursesWithCache` scans storage for
-    content-cache keys (notes/highlights/mindmap/quiz/latex-draft) so the
-    UI can resurface those preset courses with a "(cached)" label."""
+def test_find_courses_with_cache_lists_courses_with_real_content():
+    """`findCoursesWithCache` scans storage for content-cache keys
+    (notes/highlights/mindmap/quiz/latex-draft) so the UI can resurface
+    courses that have real user work but aren't on the backend list
+    yet. Config-only keys and global keys must NOT count."""
     script = textwrap.dedent(
         """
         const h = require('./frontend/study-state.js');
         const s = h.createMemoryStorage();
-        // Simulate work the user did in ?show_preset=1 mode on preset courses
-        s.setItem('nano-nlm:v1:CS231N:notes', '\\\\section{Backprop}');
-        s.setItem('nano-nlm:v1:CS231N:notes:highlights', '[]');
-        s.setItem('nano-nlm:v1:15-213:mindmap', '{"nodes":[]}');
-        s.setItem('nano-nlm:v1:uploaded-foo:quiz', '[]');
-        // Config-only keys MUST NOT count as "real work" — otherwise just
-        // visiting a preset course resurfaces it forever.
+        s.setItem('nano-nlm:v1:alpha:notes', '\\\\section{Backprop}');
+        s.setItem('nano-nlm:v1:alpha:notes:highlights', '[]');
+        s.setItem('nano-nlm:v1:beta:mindmap', '{"nodes":[]}');
+        s.setItem('nano-nlm:v1:gamma:quiz', '[]');
+        // Config-only keys MUST NOT count.
         s.setItem('nano-nlm:v1:noise-only:notes-toc-collapsed', '[]');
         s.setItem('nano-nlm:v1:noise-only:notes-scroll-y', '100');
         // Global keys (no course segment) MUST be skipped.
         s.setItem('nano-nlm:v1:hidden-courses', '[]');
-        s.setItem('nano-nlm:v1:backend', 'codex');
+        s.setItem('nano-nlm:v1:backend', 'openai');
         // Pseudo "_all_" sentinel from null-course paths MUST be skipped.
         s.setItem('nano-nlm:v1:_all_:notes', 'whatever');
 
         const found = h.findCoursesWithCache(s);
-        const want = ['15-213', 'CS231N', 'uploaded-foo'];
+        const want = ['alpha', 'beta', 'gamma'];
         if (JSON.stringify(found) !== JSON.stringify(want)) {
           throw new Error('expected ' + JSON.stringify(want) + ' got ' + JSON.stringify(found));
         }

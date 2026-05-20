@@ -107,7 +107,7 @@ def _get_course_cache_lock(course_id: str) -> asyncio.Lock:
 
 # Cap chunks fed into a single per-file prompt. Big PDF lectures can exceed
 # 100 chunks; at ~300 tokens each that's 30K+ input tokens before the
-# instructions, which starts to crowd codex GPT-5.4's context window. 60
+# instructions, which crowds out the model's context window. 60
 # captures the bulk of a typical 90-minute lecture without truncating
 # anything important — chunks are slide-order, so we keep the start of the
 # lecture (where the definitions live) and drop only the trailing exercises.
@@ -592,9 +592,9 @@ async def generate_file_stream(
     the same ``check()`` gate the non-stream path uses. Caller is
     responsible for caching the terminal result.
 
-    2026-05-13: ``max_retries`` (default 1 = total 2 attempts) covers
-    the proxy-side mid-stream TCP reset that codex.ysaikeji.cn issues
-    when its per-tenant SSE concurrency cap fires. The retry re-runs
+    ``max_retries`` (default 1 = total 2 attempts) covers proxy-side
+    mid-stream TCP resets that some providers issue when per-tenant SSE
+    concurrency caps fire. The retry re-runs
     ``router.complete_stream`` from scratch with a backoff and re-yields
     fresh deltas; the frontend's ``file_done.content`` overwrite
     invariant means the visible duplicate accumulated text gets

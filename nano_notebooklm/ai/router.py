@@ -4,29 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import time
 
 from nano_notebooklm import config
 from nano_notebooklm.ai.base import LLMBackend
 from nano_notebooklm.ai.claude_backend import ClaudeBackend
+from nano_notebooklm.ai.local_backend import LocalBackend
 from nano_notebooklm.ai.openai_backend import OpenAIBackend
-from nano_notebooklm.ai.qwen_raft_backend import QwenRaftBackend
 from nano_notebooklm.types import LLMResponse, TokenUsage
 
 logger = logging.getLogger(__name__)
-
-
-# R4-5 part 2: map user-facing backend names (ChatRequest.backend Literal)
-# to internal backends dict keys. "codex" is the GOAL.md user-visible name
-# for the OpenAI-compatible proxy backend; internally it's keyed "openai"
-# because that's the OpenAIBackend class registered in _init_backends.
-_BACKEND_NAME_ALIASES: dict[str, str] = {
-    "codex": "openai",
-    "qwen_raft": "qwen_raft",
-    # 2026-05-13: base Qwen2.5-7B-Instruct as a parallel option to the
-    # fine-tuned RAFT variant. Same backend class, different URL.
-    "qwen_base": "qwen_base",
-}
 
 
 class ModelRouter:
@@ -38,47 +24,33 @@ class ModelRouter:
         self._init_backends()
 
     def _init_backends(self):
-        if config.ANTHROPIC_API_KEY:
-            self.backends["claude"] = ClaudeBackend()
         if config.OPENAI_API_KEY:
             self.backends["openai"] = OpenAIBackend()
-        # R4-5 part 2: register Qwen-RAFT only when QWEN_RAFT_URL is set —
-        # the backend's `configured` property would otherwise be False and
-        # every call would raise. Operators enable Qwen by setting
-        # QWEN_RAFT_URL in .env; the chat endpoint then accepts
-        # `backend="qwen_raft"` requests.
-        if config.QWEN_RAFT_URL:
-            self.backends["qwen_raft"] = QwenRaftBackend()
-        # 2026-05-13: base Qwen2.5-7B-Instruct served on a parallel port.
-        # Reuse QwenRaftBackend class — the upstream API is the same
-        # OpenAI-compatible serve_openai.py, just bound to a different
-        # model path. Pass the base URL + model name explicitly so the
-        # backend's `.url` and `.model_name` point at the base service.
-        if config.QWEN_BASE_URL:
-            self.backends["qwen_base"] = QwenRaftBackend(
-                url=config.QWEN_BASE_URL,
-                model_name=config.QWEN_BASE_MODEL_NAME,
-            )
+        if config.ANTHROPIC_API_KEY:
+            self.backends["claude"] = ClaudeBackend()
+        if config.LOCAL_LLM_BASE_URL and config.LOCAL_LLM_MODEL:
+            self.backends["local"] = LocalBackend()
         if not self.backends:
-            logger.warning("No AI backends configured. Set API keys in .env")
+            logger.warning(
+                "No AI backends configured. Set at least one of "
+                "OPENAI_API_KEY / ANTHROPIC_API_KEY / LOCAL_LLM_BASE_URL in .env"
+            )
 
     def _resolve_backend(self, task_type: str, backend_override: str | None) -> LLMBackend:
-        """R4-5 part 2: resolve a backend for a single call. When the
-        caller passes an explicit `backend_override` (user-facing chip
-        value from ChatRequest.backend), it takes precedence over the
-        task-type routing. Aliases ("codex" → "openai") let the wire
-        contract stay decoupled from the internal backend key.
-        Unknown override or unconfigured target → RuntimeError so the
-        endpoint can translate to a 422 / fall back gracefully.
+        """Pick a backend for a single call.
+
+        Explicit `backend_override` (e.g. ChatRequest.backend from the
+        frontend chip) takes precedence over task-type routing. Unknown
+        or unconfigured target → RuntimeError so the endpoint can
+        translate to a 422.
         """
         if backend_override:
-            internal = _BACKEND_NAME_ALIASES.get(backend_override, backend_override)
-            if internal not in self.backends:
+            if backend_override not in self.backends:
                 raise RuntimeError(
                     f"backend {backend_override!r} not configured "
-                    f"(internal key {internal!r} missing from router.backends)"
+                    f"(available: {sorted(self.backends.keys())})"
                 )
-            return self.backends[internal]
+            return self.backends[backend_override]
         return self.get_backend(task_type)
 
     def get_backend(self, task_type: str = "") -> LLMBackend:
@@ -113,12 +85,9 @@ class ModelRouter:
     ) -> LLMResponse:
         """Complete with automatic fallback and retry.
 
-        R4-5 part 2: `backend` lets the caller override task-type routing
-        for a single call (e.g. ChatRequest.backend="qwen_raft"). When
-        the override is supplied, fallback to the task-type default
-        backend is also disabled inside the retry loop — the caller is
-        responsible for upstream timeout / fallback handling (see
-        QASkill._answer_rag for the qwen→codex chain).
+        When `backend` is explicitly pinned by the caller, cross-backend
+        fallback is disabled — only same-backend retries happen. The
+        caller is responsible for any upstream timeout/fallback chain.
         """
         backend_obj = self._resolve_backend(task_type, backend)
         last_error = None
@@ -136,10 +105,6 @@ class ModelRouter:
                 logger.warning(f"[{backend_obj.name}] attempt {attempt + 1} failed: {e}")
                 if attempt < max_retries - 1:
                     await asyncio.sleep(2 ** attempt)
-                    # Try fallback backend on last retry — but only if the
-                    # caller didn't pin a backend explicitly (R4-5 part 2:
-                    # qwen_raft override must not silently switch to codex
-                    # inside the router; that's the caller's call).
                     if allow_fallback and attempt == max_retries - 2:
                         fallback = self._get_fallback(backend_obj.name)
                         if fallback:
@@ -162,15 +127,8 @@ class ModelRouter:
         without genuine streaming fall back to single-chunk yield via the
         default `LLMBackend.complete_stream` implementation.
 
-        Truncation contract: yielded items are normally str content deltas,
-        but a backend MAY emit a trailing ``TruncationSignal`` (see
-        ``ai.base.TruncationSignal``) when the upstream stopped at
-        max_output_tokens / finish_reason='length'. The signal passes
-        through this router unchanged — opt-in callers ``isinstance``-guard
-        for it to surface a "⚠️ truncated" affordance to the user.
-
-        R4-5 part 2: optional `backend` override (same semantics as
-        `complete()`).
+        A trailing ``TruncationSignal`` may follow the last delta when
+        the upstream stopped at max_output_tokens / finish_reason='length'.
         """
         backend_obj = self._resolve_backend(task_type, backend)
         async for item in backend_obj.complete_stream(
@@ -187,11 +145,6 @@ class ModelRouter:
         max_tokens: int = 4096,
         backend: str | None = None,
     ) -> dict:
-        """Structured JSON completion with routing.
-
-        R4-5 part 2: optional `backend` override (same semantics as
-        `complete()`).
-        """
         backend_obj = self._resolve_backend(task_type, backend)
         result = await backend_obj.complete_structured(
             prompt, system=system, temperature=temperature, max_tokens=max_tokens

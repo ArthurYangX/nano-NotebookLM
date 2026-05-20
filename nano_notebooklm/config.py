@@ -33,7 +33,56 @@ CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-5")
 # OpenAI-compatible /v1 endpoint works. LOCAL_LLM_API_KEY is sent as
 # the Bearer token; most local servers ignore it but the OpenAI SDK
 # requires a non-empty string.
-LOCAL_LLM_BASE_URL = os.getenv("LOCAL_LLM_BASE_URL", "")
+import urllib.parse as _urllib_parse
+
+_BLOCKED_HOSTNAMES = frozenset({
+    # Cloud instance metadata services — supply-chain-tainted env
+    # values like `LOCAL_LLM_BASE_URL=http://169.254.169.254/latest/...`
+    # would otherwise let the openai SDK happily exfiltrate every
+    # prompt to the metadata endpoint.
+    "169.254.169.254",
+    "metadata.google.internal",
+    "metadata",
+    "100.100.100.200",
+})
+
+
+def _validate_local_url(raw: str) -> str:
+    """Sanity-check LOCAL_LLM_BASE_URL at config-load. Returns "" if
+    invalid so router._init_backends skips LocalBackend registration.
+    """
+    raw = (raw or "").strip().rstrip("/")
+    if not raw:
+        return ""
+    try:
+        parsed = _urllib_parse.urlparse(raw)
+    except Exception:
+        logger.warning("LOCAL_LLM_BASE_URL=%r failed to parse; disabling local backend", raw)
+        return ""
+    if parsed.scheme not in ("http", "https"):
+        logger.warning(
+            "LOCAL_LLM_BASE_URL must be http or https (got %r); disabling local backend",
+            parsed.scheme,
+        )
+        return ""
+    host = (parsed.hostname or "").lower()
+    if not host:
+        logger.warning("LOCAL_LLM_BASE_URL=%r missing hostname; disabling local backend", raw)
+        return ""
+    if host in _BLOCKED_HOSTNAMES:
+        logger.warning(
+            "LOCAL_LLM_BASE_URL host %r is a cloud metadata endpoint; refusing", host,
+        )
+        return ""
+    if parsed.scheme == "http" and host not in ("localhost", "127.0.0.1", "::1"):
+        logger.warning(
+            "LOCAL_LLM_BASE_URL uses http on non-loopback host %r; "
+            "prompts will travel in plaintext", host,
+        )
+    return raw
+
+
+LOCAL_LLM_BASE_URL = _validate_local_url(os.getenv("LOCAL_LLM_BASE_URL", ""))
 LOCAL_LLM_MODEL = os.getenv("LOCAL_LLM_MODEL", "")
 LOCAL_LLM_API_KEY = os.getenv("LOCAL_LLM_API_KEY", "local")
 
@@ -172,20 +221,13 @@ CHECKPOINT_MODE = os.getenv("CHECKPOINT_MODE", "auto")
 
 
 # ── Task → backend routing ──────────────────────────────────────────
-# Override per task type by editing this map. Unknown task types fall
-# back to DEFAULT_BACKEND. The router picks any available backend if
-# the requested one isn't configured.
+# Override per task type when you want a specific skill to go to a
+# specific backend (e.g. send `report_writing` to Claude while everything
+# else goes to a local model). Unknown / unmapped task types fall
+# through to DEFAULT_BACKEND. Keep this map empty by default so a
+# Claude-only or local-only deployment is honoured without surprise
+# fallbacks. The sentinel "alternate" returns the first non-default
+# backend, used by cross-review prompts when two backends are configured.
 TASK_ROUTES: dict[str, str] = {
-    "concept_extraction": "openai",
-    "note_generation": "openai",
-    "quiz_generation": "openai",
-    "qa_answer": "openai",
-    "qa_general": "openai",
-    "translate_query": "openai",
-    "rewrite_history": "openai",
-    "exam_analysis": "openai",
-    "exam_prep_plan": "openai",
-    "exam_prep_questions": "openai",
-    "report_writing": "openai",
     "cross_review": "alternate",
 }

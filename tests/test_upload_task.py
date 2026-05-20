@@ -190,7 +190,7 @@ def test_upload_extractor_failure_records_error(monkeypatch, upload_client):
                     progress_callback=None, embed_fn=None):
         if progress_callback is not None:
             progress_callback("kg_stage_a", 0)
-        raise RuntimeError("AuthenticationError sk-secretKey1234567890 ysaikeji.cn")
+        raise RuntimeError("AuthenticationError sk-secretKey1234567890 secret-host.example.com")
 
     from nano_notebooklm.kg import extractor as extractor_mod
     monkeypatch.setattr(extractor_mod, "extract_from_chunks", _boom)
@@ -210,9 +210,9 @@ def test_upload_extractor_failure_records_error(monkeypatch, upload_client):
     # PII scrub: vendor / key strings must not surface in the public state.
     blob = json.dumps(state)
     assert "sk-" not in blob
-    assert "ysaikeji" not in blob
+    assert "secret-host.example.com" not in blob
 
-    r2 = upload_client.get("/api/courses?mode=all")
+    r2 = upload_client.get("/api/courses")
     assert r2.status_code == 200
     ids = {c["id"] for c in r2.json()["courses"]}
     assert "ExtractorBoom" in ids
@@ -235,11 +235,11 @@ def test_upload_concurrent_same_course_serializes(monkeypatch, upload_client):
     call_count = {"n": 0}
     real_ingest = server_mod.kb.ingest_course
 
-    def _slow(course_dir, course_id=None, engine="pymupdf", lang="ch"):
+    def _slow(course_dir, course_id=None, engine="pymupdf", lang="ch", **kwargs):
         call_count["n"] += 1
         if call_count["n"] == 1:
             time.sleep(0.6)
-        return real_ingest(course_dir, course_id, engine, lang)
+        return real_ingest(course_dir, course_id, engine, lang, **kwargs)
 
     monkeypatch.setattr(server_mod.kb, "ingest_course", _slow)
 
@@ -504,11 +504,11 @@ def test_upload_engine_mineru_routes_through_extractor(monkeypatch, upload_clien
     from nano_notebooklm.kb.store import KBStore
     real_ingest = KBStore.ingest_course
 
-    def _spy(self, course_dir, course_id=None, engine="pymupdf", lang="ch"):
+    def _spy(self, course_dir, course_id=None, engine="pymupdf", lang="ch", **kwargs):
         captured["engine"] = engine
         captured["lang"] = lang
         # Fall back to real implementation so the rest of the pipeline runs.
-        return real_ingest(self, course_dir, course_id, engine="pymupdf", lang=lang)
+        return real_ingest(self, course_dir, course_id, engine="pymupdf", lang=lang, **kwargs)
 
     monkeypatch.setattr(KBStore, "ingest_course", _spy)
 
@@ -587,3 +587,131 @@ def test_extract_from_chunks_signature_accepts_progress_callback():
     sig = inspect.signature(extract_from_chunks)
     assert "progress_callback" in sig.parameters
     assert sig.parameters["progress_callback"].default is None
+
+
+# ── chunking / embedding progress callback contract ────────────────────
+
+
+def test_ingest_course_on_progress_monotonic(monkeypatch, tmp_path, fake_embed_fn):
+    """`on_progress(done, total)` fires once at start with done=0 then once
+    per file (via the `finally:`), ends at done==total, is non-decreasing,
+    and 0 <= done <= total throughout."""
+    art = tmp_path / "artifacts"
+    (art / "courses").mkdir(parents=True)
+    monkeypatch.setattr("nano_notebooklm.config.ARTIFACTS_DIR", art)
+    from nano_notebooklm.kb import store as kb_store
+    monkeypatch.setattr(kb_store, "_get_default_embed_fn", lambda: fake_embed_fn)
+
+    src = tmp_path / "src"
+    src.mkdir()
+    for name in ("a.md", "b.md", "c.md"):
+        (src / name).write_text(
+            f"# {name}\n\nLorem ipsum dolor sit amet consectetur adipiscing elit. " * 6,
+            encoding="utf-8",
+        )
+
+    emits: list[tuple[int, int]] = []
+    kb = kb_store.KBStore()
+    kb.ingest_course(str(src), "ProgCourse", on_progress=lambda d, t: emits.append((d, t)))
+
+    assert emits, "callback was never invoked"
+    assert emits[0] == (0, 3), emits
+    assert emits[-1] == (3, 3), emits
+    # Non-decreasing
+    for (a, _), (b, _) in zip(emits, emits[1:]):
+        assert b >= a, emits
+    # Bounded
+    for d, t in emits:
+        assert 0 <= d <= t == 3, (d, t)
+
+
+def test_ingest_course_on_progress_emits_even_on_extract_failure(monkeypatch, tmp_path, fake_embed_fn):
+    """If `extract_file` raises for one file, the `finally:` still emits
+    progress for that file — total emits cover all files."""
+    art = tmp_path / "artifacts"
+    (art / "courses").mkdir(parents=True)
+    monkeypatch.setattr("nano_notebooklm.config.ARTIFACTS_DIR", art)
+    from nano_notebooklm.kb import store as kb_store
+    monkeypatch.setattr(kb_store, "_get_default_embed_fn", lambda: fake_embed_fn)
+
+    src = tmp_path / "src"
+    src.mkdir()
+    for name in ("ok1.md", "broken.md", "ok2.md"):
+        (src / name).write_text("# t\n\nbody " * 30, encoding="utf-8")
+
+    real_extract = kb_store.extract_file
+
+    def _flaky(path, *args, **kwargs):
+        if path.name == "broken.md":
+            raise RuntimeError("synthetic extractor failure")
+        return real_extract(path, *args, **kwargs)
+
+    monkeypatch.setattr(kb_store, "extract_file", _flaky)
+
+    emits: list[tuple[int, int]] = []
+    kb = kb_store.KBStore()
+    kb.ingest_course(str(src), "FlakyCourse", on_progress=lambda d, t: emits.append((d, t)))
+
+    assert emits[0] == (0, 3)
+    assert emits[-1] == (3, 3), "finally: must emit even when extract_file raises"
+
+
+def test_build_index_on_embed_progress_monotonic_and_clamped(monkeypatch, tmp_path, fake_embed_fn):
+    """`on_embed_progress(done, total)` must use a single shared denominator
+    across per-course + global builds, be non-decreasing, end at done==total,
+    and stay within [0, total] throughout. Also exercises the full-cache-hit
+    path (re-running build_index immediately after a fresh build embeds
+    nothing → emits at most a `(1, 1)` kickoff)."""
+    art = tmp_path / "artifacts"
+    (art / "courses").mkdir(parents=True)
+    monkeypatch.setattr("nano_notebooklm.config.ARTIFACTS_DIR", art)
+    from nano_notebooklm.kb import store as kb_store
+    monkeypatch.setattr(kb_store, "_get_default_embed_fn", lambda: fake_embed_fn)
+
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "doc.md").write_text("# t\n\n" + ("body " * 40 + "\n\n") * 3, encoding="utf-8")
+
+    kb = kb_store.KBStore()
+    course_id = "EmbedProgCourse"
+    kb.ingest_course(str(src), course_id)
+
+    first: list[tuple[int, int]] = []
+    kb.build_index(course_id, on_embed_progress=lambda d, t: first.append((d, t)))
+    assert first, "callback never invoked on first build"
+    total = first[-1][1]
+    assert first[-1][0] == total, first
+    # Monotonic
+    for (a, _), (b, _) in zip(first, first[1:]):
+        assert b >= a, first
+    # Bounded
+    for d, t in first:
+        assert 0 <= d <= t and t == total, (d, t)
+
+    # Second build: cache fully hits, expect the (1, 1) kickoff (or nothing
+    # — depending on cache-miss precount). What we assert is the contract:
+    # if anything is emitted, it terminates at done==total without overshoot.
+    second: list[tuple[int, int]] = []
+    kb.build_index(course_id, on_embed_progress=lambda d, t: second.append((d, t)))
+    if second:
+        assert second[-1][0] == second[-1][1], second
+        for d, t in second:
+            assert 0 <= d <= t, (d, t)
+
+
+def test_set_stage_preserves_detail_on_progress_only_update():
+    """`_set_stage(state, stage, pct)` with no `detail` arg must carry the
+    previously-written detail forward. This is what keeps the pptx sidecar
+    render counts (set during pptx render) visible while ingest_course's
+    per-file progress callback bumps the percent."""
+    from api.server import _set_stage
+    state = {"stages": {}}
+    _set_stage(state, "chunking", 50, detail={"pptx_previews_rendered": 3})
+    assert state["stages"]["chunking"]["detail"] == {"pptx_previews_rendered": 3}
+    # Progress-only update — detail must persist
+    _set_stage(state, "chunking", 60)
+    assert state["stages"]["chunking"]["progress"] == 60
+    assert state["stages"]["chunking"]["detail"] == {"pptx_previews_rendered": 3}
+    # Explicit new detail overwrites
+    _set_stage(state, "chunking", 100, detail={"documents": 7})
+    assert state["stages"]["chunking"]["detail"] == {"documents": 7}

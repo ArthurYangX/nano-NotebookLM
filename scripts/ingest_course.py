@@ -19,12 +19,16 @@ def main():
     parser = argparse.ArgumentParser(description="Ingest course materials")
     parser.add_argument("course_dir", type=str, help="Path to course directory")
     parser.add_argument("--course-id", type=str, help="Course identifier (default: directory name)")
+    parser.add_argument("--engine", choices=["pymupdf", "mineru"], default="pymupdf",
+                        help="PDF extractor (pymupdf=fast/lossy, mineru=slow/lossless)")
+    parser.add_argument("--lang", choices=["ch", "en"], default="ch",
+                        help="MinerU OCR language (only used when --engine=mineru)")
     parser.add_argument("--build-index", action="store_true", help="Build search index after ingestion")
     args = parser.parse_args()
 
     kb = KBStore()
-    course = kb.ingest_course(args.course_dir, args.course_id)
-    print(f"Ingested course: {course.course_id}")
+    course = kb.ingest_course(args.course_dir, args.course_id, engine=args.engine, lang=args.lang)
+    print(f"Ingested course: {course.course_id} (engine={args.engine})")
 
     if args.build_index:
         print("Building search index...")

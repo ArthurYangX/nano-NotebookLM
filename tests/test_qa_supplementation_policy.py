@@ -41,6 +41,41 @@ def test_qa_system_allows_supplementation_with_general_knowledge():
     assert "课件覆盖" in body or "In the course materials" in body
 
 
+def test_qa_system_two_part_is_ALWAYS_not_conditional():
+    """2026-05-17 user report: GPT-RAG answered '维特比' / '贝叶斯公式'
+    as a single paragraph, never showing the **课件覆盖** / **补充背景**
+    headings. Rule 6 previously triggered only on 'partially covered'
+    documents, so GPT self-judged 'fully covered' → single paragraph.
+    The new contract: two headings ALWAYS appear (a 'no supplement
+    needed' filler is allowed for part b)."""
+    body = qa_system()
+    # The word ALWAYS (caps) is the load-bearing token in the new rule.
+    # A future loosening that drops ALWAYS / makes the schema conditional
+    # again would silently re-introduce the single-paragraph bug.
+    assert "ALWAYS" in body
+    # Both headings are MUST-appear.
+    assert "Both headings MUST appear" in body or "Both headings must appear" in body
+    # The "no supplement needed" filler must be specified — otherwise
+    # the model would pad part (b) with hallucinated background.
+    assert "无需补充" in body
+    # The zero-mention fallback inside part (a) must also be specified
+    # so the model knows to STILL keep the heading on zero-doc questions.
+    assert "资料中没有直接覆盖该主题" in body or "Not directly covered" in body
+
+
+def test_qa_prompt_user_template_repeats_always_schema():
+    """User template (sent on every turn) must also pin the ALWAYS
+    schema — otherwise the model can drift toward single-paragraph
+    output when the system message gets compressed by the backend."""
+    rendered = QA_PROMPT.format(context="(dummy)", question="什么是维特比")
+    assert "ALWAYS" in rendered
+    assert "课件覆盖" in rendered
+    assert "补充背景" in rendered
+    # No-supplement filler also pinned in the user template so the
+    # model has the literal phrase to fall back to.
+    assert "无需补充" in rendered
+
+
 def test_qa_system_refusal_only_when_zero_mention_AND_general_unhelpful():
     body = qa_system()
     # Refusal is gated by BOTH conditions (zero doc mention + general

@@ -191,7 +191,7 @@ def test_real_stream_error_event_carries_stable_code(monkeypatch, tmp_path, fake
     server_mod.kb.build_index(None)
 
     async def boom(*a, **kw):
-        raise RuntimeError("AuthenticationError https://codex.ysaikeji.cn/v1 sk-secretkey1234567890")
+        raise RuntimeError("AuthenticationError https://secret-host.example.com/v1 sk-secretkey1234567890")
         yield  # pragma: no cover
 
     monkeypatch.setattr(server_mod.router, "complete_stream", boom)
@@ -206,7 +206,7 @@ def test_real_stream_error_event_carries_stable_code(monkeypatch, tmp_path, fake
     assert err is not None
     assert err["error"] == "stream_failed"
     assert "sk-" not in json.dumps(err)
-    assert "ysaikeji" not in json.dumps(err)
+    assert "secret-host.example.com" not in json.dumps(err)
 
 
 # ── #A5: requestNodeDeepDive parser has a buffer cap ─────────────────────

@@ -47,7 +47,7 @@ _CANCEL_WATCHER_LIMIT = threading.BoundedSemaphore(
 # report) can override.
 #
 # 2026-05-12: default raised 120 → 600. This is the SSE *chunk-to-chunk*
-# read timeout, not the wall-clock cap. The codex GPT-5.4 reasoning phase
+# read timeout, not the wall-clock cap. Provider reasoning phases
 # regularly produces 2-3min of silence between deltas on dense per-file
 # note generations (NOTES_PER_FILE_MAX_TOKENS=12288 + concurrent fan-out),
 # and the proxy throttles concurrent SSE streams further. A 120s ceiling
@@ -74,6 +74,10 @@ class OpenAIBackend(LLMBackend):
         self.base_url = (base_url or config.OPENAI_BASE_URL).rstrip("/")
         self.model = model or config.OPENAI_MODEL
         self._is_codex = "codex" in self.base_url.lower()
+        # 2026-05-17: DeepSeek V4 默认走 thinking mode → 单次 5-15s
+        # 通用 chat / rewrite / summary 类不需要 reasoning，关掉省时间。
+        # 真要 thinking 可以在调用端 task_type 路由到别的 backend。
+        self._is_deepseek = "deepseek" in self.base_url.lower()
         # Use sync client for codex compatibility. Configure httpx timeout so a
         # stalled upstream actually aborts — `asyncio.wait_for` alone can't
         # cancel a sync call running in a thread executor.
@@ -159,12 +163,15 @@ class OpenAIBackend(LLMBackend):
             messages.append({"role": "system", "content": system})
         messages.append({"role": "user", "content": prompt})
 
-        resp = self.client.chat.completions.create(
-            model=self.model,
-            messages=messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-        )
+        kwargs = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        if self._is_deepseek:
+            kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+        resp = self.client.chat.completions.create(**kwargs)
         choice = resp.choices[0]
         usage = resp.usage
         return LLMResponse(
@@ -286,13 +293,16 @@ class OpenAIBackend(LLMBackend):
                     if system:
                         messages.append({"role": "system", "content": system})
                     messages.append({"role": "user", "content": prompt})
-                    stream = self.client.chat.completions.create(
-                        model=self.model,
-                        messages=messages,
-                        temperature=temperature,
-                        max_tokens=max_tokens,
-                        stream=True,
-                    )
+                    stream_kwargs = {
+                        "model": self.model,
+                        "messages": messages,
+                        "temperature": temperature,
+                        "max_tokens": max_tokens,
+                        "stream": True,
+                    }
+                    if self._is_deepseek:
+                        stream_kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+                    stream = self.client.chat.completions.create(**stream_kwargs)
                     active_stream["obj"] = stream
                     for event in stream:
                         if cancel_event.is_set():

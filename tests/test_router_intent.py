@@ -263,7 +263,7 @@ def _stub_complete_factory(answers: dict[str, str], default: str = "stubbed answ
     """Build an async stub for ModelRouter.complete that picks an answer based
     on a substring of the prompt."""
     async def _stub(prompt, task_type="", system="", temperature=0.7,
-                    max_tokens=4096, max_retries=3):
+                    max_tokens=4096, max_retries=3, **kwargs):
         for needle, ans in answers.items():
             if needle in prompt or needle in (system or ""):
                 return LLMResponse(content=ans, model="fake", input_tokens=1,
@@ -365,7 +365,7 @@ def test_chat_translation_retry_happy(chat_client, monkeypatch):
 
     # Stub: TRANSLATE prompt → return English. QA prompt → return answer.
     async def stub(prompt, task_type="", system="", temperature=0.7,
-                   max_tokens=4096, max_retries=3):
+                   max_tokens=4096, max_retries=3, **kwargs):
         captured_systems.append(system or "")
         if task_type == "translate_query" or "translate" in (system or "").lower():
             return LLMResponse(content="memory hierarchy", model="fake",
@@ -402,7 +402,7 @@ def test_chat_translation_failure_falls_through(chat_client, monkeypatch):
                         lambda q, top_k=5, course_id=None: [])  # always 0
 
     async def stub(prompt, task_type="", system="", temperature=0.7,
-                   max_tokens=4096, max_retries=3):
+                   max_tokens=4096, max_retries=3, **kwargs):
         if task_type == "translate_query" or "translate" in (system or "").lower():
             raise RuntimeError("LLM translation failed")
         return LLMResponse(content="generic fallback", model="fake",
@@ -432,7 +432,7 @@ def test_chat_translation_still_zero_falls_through(chat_client, monkeypatch):
                         lambda q, top_k=5, course_id=None: [])
 
     async def stub(prompt, task_type="", system="", temperature=0.7,
-                   max_tokens=4096, max_retries=3):
+                   max_tokens=4096, max_retries=3, **kwargs):
         if task_type == "translate_query":
             return LLMResponse(content="totally-unfindable-keyword", model="fake",
                                input_tokens=1, output_tokens=1, latency_ms=1.0)
@@ -458,7 +458,7 @@ def test_chat_mixed_query_does_not_translate(chat_client, monkeypatch):
     translate_called = {"n": 0}
 
     async def stub(prompt, task_type="", system="", temperature=0.7,
-                   max_tokens=4096, max_retries=3):
+                   max_tokens=4096, max_retries=3, **kwargs):
         if task_type == "translate_query" or "translate" in (system or "").lower():
             translate_called["n"] += 1
             return LLMResponse(content="x", model="fake",
@@ -493,7 +493,7 @@ def test_chat_all_courses_does_not_translate(chat_client, monkeypatch):
     translate_called = {"n": 0}
 
     async def stub(prompt, task_type="", system="", temperature=0.7,
-                   max_tokens=4096, max_retries=3):
+                   max_tokens=4096, max_retries=3, **kwargs):
         if task_type == "translate_query":
             translate_called["n"] += 1
         return LLMResponse(content="general response", model="fake",
@@ -526,7 +526,7 @@ def test_chat_mixed_course_lang_does_not_translate(chat_client, monkeypatch):
     translate_called = {"n": 0}
 
     async def stub(prompt, task_type="", system="", temperature=0.7,
-                   max_tokens=4096, max_retries=3):
+                   max_tokens=4096, max_retries=3, **kwargs):
         if task_type == "translate_query":
             translate_called["n"] += 1
         return LLMResponse(content="general response", model="fake",
@@ -549,7 +549,7 @@ def test_chat_path_value_is_in_union_for_all_branches(chat_client, monkeypatch):
     client, server_mod = chat_client
 
     async def stub(prompt, task_type="", system="", temperature=0.7,
-                   max_tokens=4096, max_retries=3):
+                   max_tokens=4096, max_retries=3, **kwargs):
         return LLMResponse(content="answer", model="fake",
                            input_tokens=1, output_tokens=1, latency_ms=1.0)
 
@@ -583,7 +583,7 @@ def test_chat_filter_empty_boilerplate_omits_path(chat_client, monkeypatch):
     client, server_mod = chat_client
 
     async def stub(prompt, task_type="", system="", temperature=0.7,
-                   max_tokens=4096, max_retries=3):
+                   max_tokens=4096, max_retries=3, **kwargs):
         return LLMResponse(content="should not be called", model="fake",
                            input_tokens=1, output_tokens=1, latency_ms=1.0)
 
@@ -766,7 +766,7 @@ def test_chat_translation_timeout_falls_through(chat_client, monkeypatch):
                         lambda q, top_k=5, course_id=None: [])
 
     async def stub(prompt, task_type="", system="", temperature=0.7,
-                   max_tokens=4096, max_retries=3):
+                   max_tokens=4096, max_retries=3, **kwargs):
         if task_type == "translate_query":
             # Raise TimeoutError directly — equivalent to wait_for elapsing.
             raise _asyncio.TimeoutError()
@@ -804,7 +804,7 @@ def test_chat_cross_course_fallback_happy(chat_client, monkeypatch):
     captured_systems: list[str] = []
 
     async def stub(prompt, task_type="", system="", temperature=0.7,
-                   max_tokens=4096, max_retries=3):
+                   max_tokens=4096, max_retries=3, **kwargs):
         captured_systems.append(system or "")
         if task_type == "translate_query":
             return LLMResponse(content="memory hierarchy", model="fake",
@@ -840,7 +840,7 @@ def test_chat_cross_course_fallback_also_empty(chat_client, monkeypatch):
                         lambda q, top_k=5, course_id=None: [])
 
     async def stub(prompt, task_type="", system="", temperature=0.7,
-                   max_tokens=4096, max_retries=3):
+                   max_tokens=4096, max_retries=3, **kwargs):
         if task_type == "translate_query":
             return LLMResponse(content="totally-unfindable", model="fake",
                                input_tokens=1, output_tokens=1, latency_ms=1.0)
@@ -870,7 +870,7 @@ def test_chat_cross_course_skipped_when_no_course_filter(chat_client, monkeypatc
     real_search = server_mod.kb.search
 
     async def stub(prompt, task_type="", system="", temperature=0.7,
-                   max_tokens=4096, max_retries=3):
+                   max_tokens=4096, max_retries=3, **kwargs):
         return LLMResponse(content="general", model="fake",
                            input_tokens=1, output_tokens=1, latency_ms=1.0)
     monkeypatch.setattr(server_mod.router, "complete", stub)
@@ -978,7 +978,7 @@ def test_chat_identity_returns_persona_blurb(chat_client, monkeypatch):
     captured = {}
 
     async def stub(prompt, task_type="", system="", temperature=0.7,
-                   max_tokens=4096, max_retries=3):
+                   max_tokens=4096, max_retries=3, **kwargs):
         captured["system"] = system
         captured["task_type"] = task_type
         return LLMResponse(content="I'm your Study Assistant.",
@@ -1008,7 +1008,7 @@ def test_chat_meta_course_does_not_short_circuit(chat_client, monkeypatch):
     client, server_mod = chat_client
 
     async def stub(prompt, task_type="", system="", temperature=0.7,
-                   max_tokens=4096, max_retries=3):
+                   max_tokens=4096, max_retries=3, **kwargs):
         return LLMResponse(content="本课是 en_course，可以问关于它的问题。",
                            model="fake", input_tokens=1, output_tokens=1, latency_ms=1.0)
 
@@ -1035,7 +1035,7 @@ def test_chat_bare_interrogative_no_fake_sources(chat_client, monkeypatch):
     captured_prompts = []
 
     async def stub(prompt, task_type="", system="", temperature=0.7,
-                   max_tokens=4096, max_retries=3):
+                   max_tokens=4096, max_retries=3, **kwargs):
         captured_prompts.append(prompt)
         return LLMResponse(content="What topic would you like to ask about?",
                            model="fake", input_tokens=1, output_tokens=1, latency_ms=1.0)
@@ -1068,7 +1068,7 @@ def test_chat_filter_empty_only_fires_when_raw_passes_gate(chat_client, monkeypa
     monkeypatch.setenv("RAG_SCORE_GATE_TOP1", "0.05")
 
     async def stub(prompt, task_type="", system="", temperature=0.7,
-                   max_tokens=4096, max_retries=3):
+                   max_tokens=4096, max_retries=3, **kwargs):
         return LLMResponse(content="general fallback",
                            model="fake", input_tokens=1, output_tokens=1, latency_ms=1.0)
 

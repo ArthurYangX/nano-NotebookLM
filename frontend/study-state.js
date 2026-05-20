@@ -1229,16 +1229,10 @@
     }
   }
 
-  // R5-2 fix-all v2 #1: in default mode (?show_preset NOT set), the
-  // backend hides preset courses, so any localStorage data the user built
-  // up in `?show_preset=1` mode (notes, highlights, KG cache, exam bank,
-  // ...) becomes unreachable through the UI — the dropdown doesn't list
-  // those courses. Scan storage for content-cache markers so the caller
-  // can resurface "preset courses with real work in them" while still
-  // hiding untouched preset slots. We deliberately do NOT count config-
-  // only keys (notes-toc-collapsed, notes-scroll-y) as a signal — those
-  // get written by reading even a preset course once, and would defeat
-  // the hide-by-default intent.
+  // Scan localStorage for courses that have real user-generated content
+  // (notes, highlights, KG cache, exam bank, ...) — useful when the
+  // backend course list is out of sync with cached client state.
+  // Config-only keys (notes-toc-collapsed, notes-scroll-y) don't count.
   //
   // Keys we treat as "user-generated content present":
   //   `${PREFIX}:<courseId>:notes`               (full LaTeX body)

@@ -1,7 +1,4 @@
-"""Document text extraction for PDF, PPTX, DOCX, and Markdown.
-
-Adapted from NLPProject/scripts/chunk_with_metadata.py with Pydantic models.
-"""
+"""Document text extraction for PDF, PPTX, DOCX, and Markdown."""
 
 from __future__ import annotations
 
