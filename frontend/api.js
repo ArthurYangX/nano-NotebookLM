@@ -356,6 +356,57 @@ const API = {
     return _post("/settings/embedding", { preset_id: presetId });
   },
 
+  // ── Providers (LLM provider matrix) ───────────────────────────────
+  // Backed by artifacts/providers.json. All responses are pre-redacted
+  // server-side; the frontend never sees a `literal:` api key value.
+
+  async listProviders() {
+    return _request("/providers");
+  },
+
+  async upsertProvider(providerId, row) {
+    // row: { kind, label, base_url, api_key_ref, model, enabled }
+    const res = await fetch(`${API_BASE}/providers/${encodeURIComponent(providerId)}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(row),
+    });
+    let body = null;
+    try { body = await res.json(); } catch {}
+    if (!res.ok) {
+      const detail = body && (body.detail || body.error) || `HTTP ${res.status}`;
+      const err = new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+      err.status = res.status;
+      err.body = body;
+      throw err;
+    }
+    return body;
+  },
+
+  async deleteProvider(providerId) {
+    const res = await fetch(`${API_BASE}/providers/${encodeURIComponent(providerId)}`, {
+      method: "DELETE",
+    });
+    let body = null;
+    try { body = await res.json(); } catch {}
+    if (!res.ok) {
+      const detail = body && (body.detail || body.error) || `HTTP ${res.status}`;
+      const err = new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+      err.status = res.status;
+      err.body = body;
+      throw err;
+    }
+    return body;
+  },
+
+  async testProvider(providerId) {
+    return _post(`/providers/${encodeURIComponent(providerId)}/test`, {});
+  },
+
+  async setDefaultProvider(providerId) {
+    return _post("/providers/default", { provider_id: providerId });
+  },
+
   async runSubagent(name, payload = {}) {
     return _post("/subagent", { name, payload });
   },

@@ -74,9 +74,12 @@ function Row({ label, value, mono }) {
 }
 
 function Badge({ ok, labelOk, labelBad }) {
+  const lang = (typeof window !== "undefined" && window.LangContext)
+    ? React.useContext(window.LangContext) : "en";
+  const T = (k) => window.I18N.t(k, lang || "en");
   return (
     <span className={"settings-badge " + (ok ? "ok" : "bad")}>
-      {ok ? (labelOk || "已配置") : (labelBad || "未配置")}
+      {ok ? (labelOk || T("settings.badge.configured")) : (labelBad || T("settings.badge.unconfigured"))}
     </span>
   );
 }
@@ -85,11 +88,308 @@ function Badge({ ok, labelOk, labelBad }) {
 // API key 都会 bool-coerce 成 false，badge 闪红"未配置"误导用户。loading
 // 时改用 warn 态"加载中"，与 embed_warm 三态约定一致。
 function LoadingBadge({ ready, ok, labelOk, labelBad }) {
+  const lang = (typeof window !== "undefined" && window.LangContext)
+    ? React.useContext(window.LangContext) : "en";
+  const T = (k) => window.I18N.t(k, lang || "en");
   if (!ready) {
-    return <span className="settings-badge warn">加载中…</span>;
+    return <span className="settings-badge warn">{T("settings.badge.loading")}</span>;
   }
   return <Badge ok={ok} labelOk={labelOk} labelBad={labelBad} />;
 }
+
+// Subform shared by "edit existing" and "add new" provider flows. Kept
+// at module scope (above Settings) so it can hold its own render state
+// without polluting the parent component. `isEdit=true` locks the id
+// field (router-dict key is immutable) and lets the api_key_ref blank
+// out to "keep current".
+function ProviderForm({ t, draft, setDraft, isEdit, onSave, onCancel, saving }) {
+  if (!draft) return null;
+  const upd = (k, v) => setDraft(prev => ({ ...prev, [k]: v }));
+  const showBaseUrl = draft.kind === "openai_compat" || draft.kind === "openai_compat_local";
+  return (
+    <div className="settings-prov-form">
+      <div className="settings-prov-form-row">
+        <label>
+          <span>{t("settings.providers.form.id")}</span>
+          <input
+            type="text" value={draft.id}
+            onChange={e => upd("id", e.target.value)}
+            disabled={isEdit}
+            placeholder="openai-alt"
+          />
+        </label>
+        <label>
+          <span>{t("settings.providers.col.kind")}</span>
+          <select value={draft.kind} onChange={e => upd("kind", e.target.value)}>
+            <option value="openai_compat">{t("settings.providers.kind.openai_compat")}</option>
+            <option value="openai_compat_local">{t("settings.providers.kind.openai_compat_local")}</option>
+            <option value="anthropic">{t("settings.providers.kind.anthropic")}</option>
+          </select>
+        </label>
+      </div>
+      <div className="settings-prov-form-row">
+        <label>
+          <span>{t("settings.providers.form.label")}</span>
+          <input type="text" value={draft.label} onChange={e => upd("label", e.target.value)} placeholder="OpenAI" />
+        </label>
+        <label>
+          <span>{t("settings.providers.col.model")}</span>
+          <input type="text" value={draft.model} onChange={e => upd("model", e.target.value)} placeholder="gpt-4o-mini" />
+        </label>
+      </div>
+      {showBaseUrl && (
+        <div className="settings-prov-form-row">
+          <label className="wide">
+            <span>{t("settings.providers.form.base_url")}</span>
+            <input type="text" value={draft.base_url || ""} onChange={e => upd("base_url", e.target.value)} placeholder="https://api.openai.com/v1" />
+          </label>
+        </div>
+      )}
+      <div className="settings-prov-form-row">
+        <label className="wide">
+          <span>
+            {t("settings.providers.form.api_key_ref")}
+            {isEdit && (
+              <em style={{ marginLeft: 6, fontStyle: "normal", opacity: 0.6 }}>
+                {t("settings.providers.api_key_ref_disabled_hint")}
+              </em>
+            )}
+          </span>
+          <input
+            type="text" value={draft.api_key_ref || ""}
+            onChange={e => upd("api_key_ref", e.target.value)}
+            placeholder="env:OPENAI_API_KEY"
+          />
+        </label>
+      </div>
+      <div className="settings-prov-form-row">
+        <label className="inline">
+          <input type="checkbox" checked={!!draft.enabled} onChange={e => upd("enabled", e.target.checked)} />
+          enabled
+        </label>
+        <div style={{ flex: 1 }} />
+        <button type="button" onClick={onCancel} disabled={saving}>{t("settings.providers.action.cancel")}</button>
+        <button type="button" className="primary" onClick={onSave} disabled={saving}>{t("settings.providers.action.save")}</button>
+      </div>
+    </div>
+  );
+}
+
+
+// Provider matrix — the editable table of LLM providers that lives in
+// the Settings page. Replaces the legacy "three fixed radios" block.
+// Mirrors open-notebook's provider matrix layout but scoped to LLM only
+// (embedding presets keep their own section). All mutation goes through
+// /api/providers; we do an `onStatusRefresh` after each successful op
+// so `available_backends` and the topbar chip stay in sync.
+function ProvidersMatrix({ t, status, onStatusRefresh, onCommitBackend }) {
+  const providersData = (status && status.providers) || { providers: [], default_backend_id: null };
+  const rows = providersData.providers || [];
+  const defaultId = providersData.default_backend_id;
+  const [editingId, setEditingId] = useS(null);
+  const [draft, setDraft] = useS(null);
+  const [testing, setTesting] = useS(null);
+  const [testResults, setTestResults] = useS({});
+  const [opError, setOpError] = useS(null);
+  const [saving, setSaving] = useS(false);
+
+  function startEdit(row) {
+    setOpError(null);
+    setEditingId(row.id);
+    setDraft({
+      id: row.id, kind: row.kind, label: row.label,
+      base_url: row.base_url || "",
+      // Blank on edit so the user can "keep current" without typing the
+      // env var name again. The save handler falls back to the stored
+      // value when this stays blank.
+      api_key_ref: "",
+      model: row.model, enabled: row.enabled,
+      _current_api_key_ref: row.api_key_ref,
+    });
+  }
+
+  function startAdd() {
+    setOpError(null);
+    setEditingId("__add__");
+    setDraft({
+      id: "", kind: "openai_compat", label: "",
+      base_url: "https://api.openai.com/v1",
+      api_key_ref: "env:OPENAI_API_KEY",
+      model: "", enabled: true,
+    });
+  }
+
+  function cancelEdit() {
+    setEditingId(null); setDraft(null); setOpError(null);
+  }
+
+  async function save() {
+    if (!draft) return;
+    const isEdit = editingId !== "__add__";
+    const targetId = isEdit ? editingId : (draft.id || "").trim();
+    if (!/^[A-Za-z0-9_\-]{1,80}$/.test(targetId)) {
+      setOpError(t("settings.providers.error", { msg: "ID must match [A-Za-z0-9_-]{1,80}" }));
+      return;
+    }
+    let apiKeyRef = (draft.api_key_ref || "").trim();
+    if (isEdit && !apiKeyRef) apiKeyRef = draft._current_api_key_ref || "";
+    const body = {
+      kind: draft.kind,
+      label: (draft.label || "").trim() || targetId,
+      base_url: (draft.base_url || "").trim() || null,
+      api_key_ref: apiKeyRef,
+      model: (draft.model || "").trim(),
+      enabled: !!draft.enabled,
+    };
+    setSaving(true);
+    try {
+      await window.API.upsertProvider(targetId, body);
+      cancelEdit();
+      if (onStatusRefresh) onStatusRefresh();
+    } catch (e) {
+      setOpError(t("settings.providers.error", { msg: (e && e.message) || String(e) }));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function doDelete(id) {
+    if (!window.confirm(t("settings.providers.confirm_delete", { id }))) return;
+    try {
+      await window.API.deleteProvider(id);
+      if (onStatusRefresh) onStatusRefresh();
+    } catch (e) {
+      setOpError(t("settings.providers.error", { msg: (e && e.message) || String(e) }));
+    }
+  }
+
+  async function doSetDefault(id) {
+    try {
+      await window.API.setDefaultProvider(id);
+      if (onStatusRefresh) onStatusRefresh();
+      if (onCommitBackend) onCommitBackend(id);
+    } catch (e) {
+      setOpError(t("settings.providers.error", { msg: (e && e.message) || String(e) }));
+    }
+  }
+
+  async function doTest(id) {
+    setTesting(id);
+    setTestResults(prev => ({ ...prev, [id]: null }));
+    try {
+      const result = await window.API.testProvider(id);
+      setTestResults(prev => ({ ...prev, [id]: result }));
+    } catch (e) {
+      setTestResults(prev => ({ ...prev, [id]: { ok: false, error_type: (e && e.message) || String(e) } }));
+    } finally {
+      setTesting(null);
+    }
+  }
+
+  return (
+    <div className="settings-providers">
+      {opError && <div className="settings-banner bad" style={{ marginBottom: 8 }}>{opError}</div>}
+      {rows.length === 0 && editingId !== "__add__" && (
+        <div className="settings-pref-hint" style={{ marginBottom: 8 }}>
+          {t("settings.providers.empty")}
+        </div>
+      )}
+      {rows.length > 0 && (
+        <table className="settings-providers-table">
+          <thead>
+            <tr>
+              <th>{t("settings.providers.col.label")}</th>
+              <th>{t("settings.providers.col.kind")}</th>
+              <th>{t("settings.providers.col.model")}</th>
+              <th>{t("settings.providers.col.base_url")}</th>
+              <th>{t("settings.providers.col.status")}</th>
+              <th>{t("settings.providers.col.actions")}</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map(row => {
+              const editing = editingId === row.id;
+              const isDefault = defaultId === row.id;
+              const test = testResults[row.id];
+              if (editing) {
+                return (
+                  <tr key={row.id} className="editing">
+                    <td colSpan={6}>
+                      <ProviderForm
+                        t={t}
+                        draft={draft} setDraft={setDraft}
+                        isEdit={true}
+                        onSave={save} onCancel={cancelEdit}
+                        saving={saving}
+                      />
+                    </td>
+                  </tr>
+                );
+              }
+              return (
+                <tr key={row.id} className={isDefault ? "is-default" : ""}>
+                  <td>
+                    <div className="settings-prov-label">
+                      <strong>{row.label}</strong>{" "}
+                      <code className="settings-prov-id">{row.id}</code>
+                      {isDefault && <span className="settings-tag" style={{ marginLeft: 4 }}>{t("settings.providers.badge.default")}</span>}
+                    </div>
+                  </td>
+                  <td>{t(`settings.providers.kind.${row.kind}`)}</td>
+                  <td><code>{row.model}</code></td>
+                  <td><code>{row.base_url || "—"}</code></td>
+                  <td>
+                    {!row.enabled && <span className="settings-badge warn" style={{ marginRight: 6 }}>{t("settings.providers.badge.disabled")}</span>}
+                    {row.api_key_configured
+                      ? <span className="settings-badge ok">{t("settings.providers.badge.key_ok")}</span>
+                      : <span className="settings-badge bad">{t("settings.providers.badge.key_missing")}</span>}
+                    {test && (
+                      <span
+                        className={"settings-badge " + (test.ok ? "ok" : "bad")}
+                        style={{ marginLeft: 6 }}
+                        title={test.detail || ""}
+                      >
+                        {test.ok
+                          ? t("settings.providers.test.ok", { ms: test.latency_ms })
+                          : t("settings.providers.test.fail", { err: test.error_type || "error" })}
+                      </span>
+                    )}
+                  </td>
+                  <td className="settings-prov-actions">
+                    <button type="button" onClick={() => doTest(row.id)} disabled={testing === row.id}>
+                      {testing === row.id ? t("settings.providers.test.running") : t("settings.providers.action.test")}
+                    </button>
+                    <button type="button" onClick={() => startEdit(row)}>{t("settings.providers.action.edit")}</button>
+                    <button type="button" disabled={isDefault} onClick={() => doSetDefault(row.id)}>
+                      {t("settings.providers.action.set_default")}
+                    </button>
+                    <button type="button" className="danger" disabled={isDefault} onClick={() => doDelete(row.id)}>
+                      {t("settings.providers.action.delete")}
+                    </button>
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      )}
+      {editingId === "__add__" ? (
+        <ProviderForm
+          t={t}
+          draft={draft} setDraft={setDraft}
+          isEdit={false}
+          onSave={save} onCancel={cancelEdit}
+          saving={saving}
+        />
+      ) : (
+        <button type="button" className="settings-prov-add" onClick={startAdd} style={{ marginTop: 8 }}>
+          {t("settings.providers.add")}
+        </button>
+      )}
+    </div>
+  );
+}
+
 
 function Settings({
   backendStatus,
@@ -103,6 +403,7 @@ function Settings({
   baseSize, onCommitBaseSize,
   onStatusRefresh,
 }) {
+  const t = (k, vars) => window.I18N.t(k, userLang || "en", vars);
   const [storageScan, setStorageScan] = useS(() => _scanLocalStorage());
   const [personaDraft, setPersonaDraft] = useS(persona || "");
   // Embedding preset switch UX: while the POST is in flight we set
@@ -135,7 +436,7 @@ function Settings({
 
   function clearCourseCache(courseId) {
     if (!courseId) return;
-    if (!window.confirm(`清空课程 ${courseId} 的全部前端缓存？\n（笔记草稿、KG 编辑视图状态、测验答题记录都会丢失，但服务端数据不受影响）`)) return;
+    if (!window.confirm(t("settings.clear_course_cache_confirm", { cid: courseId }))) return;
     try {
       const toDel = [];
       for (let i = 0; i < window.localStorage.length; i++) {
@@ -151,7 +452,7 @@ function Settings({
   }
 
   function clearAllAppCache() {
-    if (!window.confirm("清空所有前端缓存（不包括偏好：language / backend / persona）？")) return;
+    if (!window.confirm(t("settings.clear_cache_confirm"))) return;
     try {
       const toDel = [];
       for (let i = 0; i < window.localStorage.length; i++) {
@@ -183,7 +484,7 @@ function Settings({
   }
 
   function resetAllPrefs() {
-    if (!window.confirm("重置所有偏好（语言、backend、persona、KG 视图、隐藏课程）？\n下次进入需重新选择语言。")) return;
+    if (!window.confirm(t("settings.reset_prefs_confirm"))) return;
     [
       "nano-nlm:v1:backend",
       "nano-nlm:v1:persona",
@@ -207,15 +508,15 @@ function Settings({
   // ── 后端可用性 ──
   // review-swarm M1: 区分 "backendStatus 还没拉到" 与 "字段确实是 false/null"。
   // statusReady 用于驱动加载态 badge / 占位符，避免首屏闪红误导。
+  // The AI Backend & Models block is now driven by <ProvidersMatrix>;
+  // the legacy `available` / `claudeAvailable` / `localAvailable` /
+  // `loadingDash` derived state is no longer needed here.
   const s = backendStatus || {};
   const statusReady = !!backendStatus;
-  const available = new Set(s.available_backends || s.backends || []);
-  const claudeAvailable = available.has("claude");
-  const localConfigured = !!s.local_llm_configured;
-  const localAvailable = available.has("local");
   const embedWarm = s.embed_warm_ok;
-  const embedWarmLabel = embedWarm == null ? "warming…" : (embedWarm ? "ok" : "failed");
-  const loadingDash = statusReady ? "—" : "加载中…";
+  const embedWarmLabel = embedWarm == null
+    ? t("settings.warm.warming")
+    : (embedWarm ? t("settings.warm.ok") : t("settings.warm.failed"));
 
   // ── Embedding presets ──
   const presets = Array.isArray(s.embedding_presets) ? s.embedding_presets : [];
@@ -249,117 +550,38 @@ function Settings({
   return (
     <div className="settings-page">
       <header className="settings-head">
-        <h2>Settings</h2>
-        <p className="settings-sub">
-          应用偏好集中页。API key 与模型 ID 由后端 <code>.env</code> 管理 — 此处仅显示状态，请直接编辑 <code>.env</code> 修改密钥与默认模型。
-        </p>
+        <h2>{t("settings.title")}</h2>
+        <p className="settings-sub">{t("settings.head_sub")}</p>
       </header>
 
       <div className="settings-grid">
 
-        {/* ───────── AI Backend & Models ───────── */}
-        <Section title="AI Backend & Models" hint="只读 — 改 .env 后重启服务">
-          <div className="settings-radio-group">
-            {(() => {
-              const openaiLabel = (() => {
-                const url = (s.openai_base_url || "").toLowerCase();
-                if (url.includes("deepseek")) return "DeepSeek";
-                if (url.includes("moonshot")) return "Moonshot (Kimi)";
-                if (url.includes("zhipu") || url.includes("bigmodel")) return "Zhipu (GLM)";
-                if (url.includes("minimax")) return "MiniMax";
-                if (url.includes("groq")) return "Groq";
-                if (url.includes("together")) return "Together";
-                if (url.includes("googleapis") || url.includes("generativelanguage")) return "Gemini";
-                if (url.includes("openai.com")) return "OpenAI";
-                return "OpenAI-compatible";
-              })();
-              return (
-                <label className={"settings-radio" + (backend === "openai" ? " active" : "")}>
-                  <input
-                    type="radio"
-                    name="backend"
-                    value="openai"
-                    checked={backend === "openai"}
-                    disabled={!available.has("openai")}
-                    onChange={() => onCommitBackend && onCommitBackend("openai")}
-                  />
-                  <div>
-                    <div className="settings-radio-title">🤖 {openaiLabel} {s.openai_model || "—"} <span className="settings-tag">主路径</span></div>
-                    <div className="settings-radio-desc">
-                      模型: <code>{s.openai_model || loadingDash}</code>，base URL: <code>{s.openai_base_url || loadingDash}</code>
-                    </div>
-                  </div>
-                </label>
-              );
-            })()}
-
-            <label className={"settings-radio" + (backend === "claude" ? " active" : "") + (!claudeAvailable ? " disabled" : "")}>
-              <input
-                type="radio"
-                name="backend"
-                value="claude"
-                checked={backend === "claude"}
-                disabled={!claudeAvailable}
-                onChange={() => onCommitBackend && onCommitBackend("claude")}
-              />
-              <div>
-                <div className="settings-radio-title">
-                  🧠 Anthropic Claude
-                  {statusReady && !claudeAvailable && <Badge ok={false} labelBad="未配置 ANTHROPIC_API_KEY" />}
-                </div>
-                <div className="settings-radio-desc">
-                  模型: <code>{s.claude_model || loadingDash}</code>
-                </div>
-              </div>
-            </label>
-
-            <label className={"settings-radio" + (backend === "local" ? " active" : "") + (!localAvailable ? " disabled" : "")}>
-              <input
-                type="radio"
-                name="backend"
-                value="local"
-                checked={backend === "local"}
-                disabled={!localAvailable}
-                onChange={() => onCommitBackend && onCommitBackend("local")}
-              />
-              <div>
-                <div className="settings-radio-title">
-                  💻 Local model <span className="settings-tag">Ollama / vLLM / LM Studio</span>
-                  {statusReady && !localConfigured && <Badge ok={false} labelBad="未配置 LOCAL_LLM_BASE_URL" />}
-                </div>
-                <div className="settings-radio-desc">
-                  {localConfigured
-                    ? <>模型: <code>{s.local_llm_model || "—"}</code> · endpoint: <code>{s.local_llm_base_url || "—"}</code></>
-                    : <>在 <code>.env</code> 设置 <code>LOCAL_LLM_BASE_URL</code> + <code>LOCAL_LLM_MODEL</code> 启用本地模型</>}
-                </div>
-              </div>
-            </label>
-          </div>
-
-          <hr className="settings-divider" />
-
-          <Row label="Default backend (.env)" value={<code>{s.default_backend || loadingDash}</code>} />
-          <Row label="Main API model" value={<code>{s.openai_model || loadingDash}</code>} />
-          <Row label="Main API base URL" value={<code>{s.openai_base_url || loadingDash}</code>} />
-          <Row label="Main API key" value={<LoadingBadge ready={statusReady} ok={!!s.openai_api_key_configured} />} />
-          <Row label="Active backends" value={<code>{statusReady ? ((s.backends || []).join(", ") || "—") : "加载中…"}</code>} />
+        {/* ───────── AI Backend & Models (providers matrix) ───────── */}
+        <Section title={t("settings.section.ai")} hint={t("settings.section.ai_hint")}>
+          <ProvidersMatrix
+            t={t}
+            status={backendStatus}
+            onStatusRefresh={onStatusRefresh}
+            onCommitBackend={onCommitBackend}
+          />
         </Section>
 
         {/* ───────── Embedding Model ───────── */}
-        <Section title="Embedding Model" hint="切换会按需在后台重建索引 · 切回旧选项是秒切（每个预设保留独立索引）">
+        <Section title={t("settings.section.embedding")} hint={t("settings.section.embedding_hint")}>
           {/* Rebuild progress banner — surfaces after a switch while
               kb.build_index runs across all courses for the new preset. */}
           {rebuildState && rebuildState.status === "running" && (
             <div className="settings-banner warn" style={{ marginBottom: 10 }}>
-              <strong>正在重建索引</strong> · 预设 <code>{rebuildState.preset_id}</code> · 进度{" "}
-              {rebuildState.done_courses}/{rebuildState.total_courses}
-              {rebuildState.current_course ? <> · 当前 <code>{rebuildState.current_course}</code></> : null}
-              <div className="settings-pref-hint">期间问答可用，但未重建课程的语义检索会临时退化为 BM25-only。</div>
+              <strong>{t("settings.rebuild.running_title")}</strong>
+              {" · "}{t("settings.rebuild.preset")} <code>{rebuildState.preset_id}</code>
+              {" · "}{t("settings.rebuild.progress")} {rebuildState.done_courses}/{rebuildState.total_courses}
+              {rebuildState.current_course ? <> · {t("settings.rebuild.current_course")} <code>{rebuildState.current_course}</code></> : null}
+              <div className="settings-pref-hint">{t("settings.rebuild.running_hint")}</div>
             </div>
           )}
           {rebuildState && rebuildState.status === "done" && rebuildState.preset_id && (
             <div className="settings-banner ok" style={{ marginBottom: 10 }}>
-              ✓ 索引已重建至 <code>{rebuildState.preset_id}</code>（{rebuildState.done_courses} 门课程）
+              {t("settings.rebuild.done", { preset: rebuildState.preset_id, n: rebuildState.done_courses })}
             </div>
           )}
           {/* H5: some courses failed mid-build. Status is "partial" — render
@@ -367,24 +589,25 @@ function Settings({
               broken instead of seeing a misleading green "done" banner. */}
           {rebuildState && rebuildState.status === "partial" && (
             <div className="settings-banner bad" style={{ marginBottom: 10 }}>
-              ⚠ 部分重建失败 · 预设 <code>{rebuildState.preset_id}</code>
-              （{rebuildState.done_courses}/{rebuildState.total_courses} 完成）
+              {t("settings.rebuild.partial_title")}
+              {" · "}{t("settings.rebuild.preset")} <code>{rebuildState.preset_id}</code>
+              {" "}{t("settings.rebuild.partial_count", { done: rebuildState.done_courses, total: rebuildState.total_courses })}
               {Array.isArray(rebuildState.failed_courses) && rebuildState.failed_courses.length > 0 && (
                 <div className="settings-pref-hint">
-                  失败课程：{rebuildState.failed_courses.map(c => <code key={c} style={{ marginRight: 6 }}>{c}</code>)}
-                  <br />可重新选这个预设触发重试，或检查服务端日志。
+                  {t("settings.rebuild.failed_label")}{rebuildState.failed_courses.map(c => <code key={c} style={{ marginRight: 6 }}>{c}</code>)}
+                  <br />{t("settings.rebuild.partial_hint")}
                 </div>
               )}
             </div>
           )}
           {rebuildState && rebuildState.status === "error" && (
             <div className="settings-banner bad" style={{ marginBottom: 10 }}>
-              重建失败：<code>{rebuildState.error || "unknown"}</code>
+              {t("settings.rebuild.error", { msg: rebuildState.error || "unknown" })}
             </div>
           )}
           {embedSwitchError && (
             <div className="settings-banner bad" style={{ marginBottom: 10 }}>
-              切换失败：{embedSwitchError}
+              {t("settings.embed.switch_failed", { msg: embedSwitchError })}
             </div>
           )}
 
@@ -410,18 +633,25 @@ function Settings({
                   <div>
                     <div className="settings-radio-title">
                       {p.label}
-                      {" "}<span className="settings-tag">{p.mode === "api" ? "API" : "本地"} · {p.dim}d</span>
-                      {isSwitching && <span className="settings-badge warn" style={{ marginLeft: 8 }}>切换中…</span>}
-                      {statusReady && blockedByKey && <Badge ok={false} labelBad="未配置 EMBEDDING_API_KEY" />}
+                      {" "}<span className="settings-tag">{p.mode === "api" ? t("settings.preset.tag_api") : t("settings.preset.tag_local")} · {p.dim}d</span>
+                      {isSwitching && <span className="settings-badge warn" style={{ marginLeft: 8 }}>{t("settings.preset.switching")}</span>}
+                      {statusReady && blockedByKey && <Badge ok={false} labelBad={t("settings.preset.unconfigured")} />}
                     </div>
                     <div className="settings-radio-desc">
-                      {p.description}
+                      {/* Prefer the localized description (keyed by preset_id);
+                          fall back to the backend's `description` for custom /
+                          user-added presets that have no i18n entry. */}
+                      {(() => {
+                        const key = `settings.preset.desc.${p.id}`;
+                        const localized = window.I18N.STRINGS[key];
+                        return localized ? t(key) : p.description;
+                      })()}
                       {p.download_size_mb > 0 && (
-                        <> · 首次下载约 {(p.download_size_mb / 1024).toFixed(1)} GB</>
+                        <> · {t("settings.preset.first_download", { gb: (p.download_size_mb / 1024).toFixed(1) })}</>
                       )}
                       <br />
                       <span style={{ color: "var(--ink-3, #888)" }}>
-                        模型: <code>{p.model}</code>
+                        {t("settings.field.model")}: <code>{p.model}</code>
                       </span>
                     </div>
                   </div>
@@ -430,36 +660,33 @@ function Settings({
             })}
             {activePresetId === "custom" && (
               <div className="settings-pref-hint" style={{ marginTop: 6 }}>
-                ⚠ 当前 <code>EMBEDDING_MODEL</code> 是 env 自定义值（<code>{s.embedding_model || "—"}</code>），不属于任何预设。选一个预设后会持久化并覆盖 env 默认。
+                {t("settings.preset.custom_hint", { model: s.embedding_model || "—" })}
               </div>
             )}
           </div>
 
           <hr className="settings-divider" />
 
-          <Row label="Embedding mode" value={<code>{s.embedding_mode || loadingDash}</code>} />
-          <Row label="Embedding model" value={<code>{s.embedding_model || loadingDash}</code>} />
-          <Row label="Active preset" value={<code>{activePresetId || loadingDash}</code>} />
-          <Row label="Embed warm-up" value={
+          <Row label={t("settings.row.embed_warm")} value={
             <span className={"settings-badge " + (embedWarm === true ? "ok" : embedWarm === false ? "bad" : "warn")}>
               {embedWarmLabel}
             </span>
           } />
-          <Row label="Tectonic (PDF 编译)" value={<LoadingBadge ready={statusReady} ok={!!s.tectonic_available} labelOk="可用" labelBad="未安装" />} />
-          <Row label="PPTX → PDF (LibreOffice)" value={<LoadingBadge ready={statusReady} ok={!!s.pptx_pdf_available} labelOk="可用" labelBad="未安装" />} />
+          <Row label={t("settings.row.tectonic")} value={<LoadingBadge ready={statusReady} ok={!!s.tectonic_available} labelOk={t("settings.badge.available")} labelBad={t("settings.badge.unavailable")} />} />
+          <Row label={t("settings.row.pptx_pdf")} value={<LoadingBadge ready={statusReady} ok={!!s.pptx_pdf_available} labelOk={t("settings.badge.available")} labelBad={t("settings.badge.unavailable")} />} />
         </Section>
 
         {/* ───────── 外观 ───────── */}
-        <Section title="外观" hint="保存在本机浏览器">
+        <Section title={t("settings.section.appearance")} hint={t("settings.section.appearance_hint")}>
           <div className="settings-pref-row">
-            <div className="settings-pref-label">主题</div>
+            <div className="settings-pref-label">{t("settings.theme_label")}</div>
             <div className="settings-pref-ctrl">
               {[
-                { v: "paper",  label: "Paper",  hint: "默认浅色" },
-                { v: "sepia",  label: "Sepia",  hint: "暖纸色" },
-                { v: "slate",  label: "Slate",  hint: "石板灰" },
-                { v: "dark",   label: "Dark",   hint: "深色" },
-                { v: "auto",   label: "Auto",   hint: "跟随系统" },
+                { v: "paper",  label: t("settings.theme.paper"),  hint: t("settings.theme.paper_hint") },
+                { v: "sepia",  label: t("settings.theme.sepia"),  hint: t("settings.theme.sepia_hint") },
+                { v: "slate",  label: t("settings.theme.slate"),  hint: t("settings.theme.slate_hint") },
+                { v: "dark",   label: t("settings.theme.dark"),   hint: t("settings.theme.dark_hint") },
+                { v: "auto",   label: t("settings.theme.auto"),   hint: t("settings.theme.auto_hint") },
               ].map(o => (
                 <button
                   key={o.v}
@@ -470,19 +697,19 @@ function Settings({
               ))}
               <span className="settings-pref-hint">
                 {theme === "auto"
-                  ? `Auto · 现在 = ${autoResolved === "dark" ? "Dark" : "Paper"}（跟随系统 prefers-color-scheme）`
-                  : `当前：${theme}`}
+                  ? t("settings.theme_auto_current", { resolved: autoResolved === "dark" ? t("settings.theme.dark") : t("settings.theme.paper") })
+                  : t("settings.theme_current", { theme })}
               </span>
             </div>
           </div>
 
           <div className="settings-pref-row">
-            <div className="settings-pref-label">密度</div>
+            <div className="settings-pref-label">{t("settings.density_label")}</div>
             <div className="settings-pref-ctrl">
               {[
-                { v: "compact",     label: "Compact" },
-                { v: "comfortable", label: "Comfortable" },
-                { v: "airy",        label: "Airy" },
+                { v: "compact",     label: t("settings.density.compact") },
+                { v: "comfortable", label: t("settings.density.comfortable") },
+                { v: "airy",        label: t("settings.density.airy") },
               ].map(o => (
                 <button
                   key={o.v}
@@ -490,12 +717,12 @@ function Settings({
                   onClick={() => onCommitDensity && onCommitDensity(o.v)}
                 >{o.label}</button>
               ))}
-              <span className="settings-pref-hint">控制行高 / 卡片内边距倍率</span>
+              <span className="settings-pref-hint">{t("settings.density_hint")}</span>
             </div>
           </div>
 
           <div className="settings-pref-row">
-            <div className="settings-pref-label">基础字号</div>
+            <div className="settings-pref-label">{t("settings.basesize_label")}</div>
             <div className="settings-pref-ctrl">
               <input
                 type="range"
@@ -510,31 +737,33 @@ function Settings({
         </Section>
 
         {/* ───────── 用户偏好 ───────── */}
-        <Section title="用户偏好" hint="保存在本机浏览器">
+        <Section title={t("settings.section.user_prefs")} hint={t("settings.section.appearance_hint")}>
           <div className="settings-pref-row">
-            <div className="settings-pref-label">回答语言</div>
+            <div className="settings-pref-label">{t("settings.lang_row_label")}</div>
             <div className="settings-pref-ctrl">
               <button
                 className={"settings-chip" + (userLang === "zh" ? " active" : "")}
                 onClick={() => onPickLang && onPickLang("zh")}
-              >🇨🇳 中文</button>
+              >{t("settings.lang_zh_chip")}</button>
               <button
                 className={"settings-chip" + (userLang === "en" ? " active" : "")}
                 onClick={() => onPickLang && onPickLang("en")}
-              >🇺🇸 English</button>
+              >{t("settings.lang_en_chip")}</button>
               <span className="settings-pref-hint">
-                {userLang ? `当前：${userLang === "zh" ? "中文" : "English"}` : "未设置 — 启动时会弹窗询问"}
+                {userLang
+                  ? t("settings.lang_current", { label: t(userLang === "zh" ? "settings.lang_label_zh" : "settings.lang_label_en") })
+                  : t("settings.lang_unset")}
               </span>
             </div>
           </div>
 
           <div className="settings-pref-row">
-            <div className="settings-pref-label">Persona（助手名）</div>
+            <div className="settings-pref-label">{t("settings.persona_label")}</div>
             <div className="settings-pref-ctrl">
               <input
                 type="text"
                 maxLength={40}
-                placeholder="Study Assistant"
+                placeholder={t("assistant.default_persona")}
                 className="settings-input"
                 value={personaDraft}
                 onChange={e => setPersonaDraft(e.target.value)}
@@ -544,56 +773,56 @@ function Settings({
                   else if (e.key === "Escape") { setPersonaDraft(persona || ""); e.target.blur(); }
                 }}
               />
-              <span className="settings-pref-hint">{personaDraft.length}/40 字符 · 会出现在系统提示词里</span>
+              <span className="settings-pref-hint">{t("settings.persona_count_hint", { n: personaDraft.length })}</span>
               <span className="settings-pref-hint" style={{ color: "var(--ink-3, #888)" }}>
-                ⚠ 这个名字会随每次提问发送到 LLM 后端 · 不要填真名 / 邮箱 / 手机号等隐私信息
+                {t("settings.persona_privacy_warn")}
               </span>
             </div>
           </div>
 
           <div className="settings-pref-row">
-            <div className="settings-pref-label">隐藏的课程</div>
+            <div className="settings-pref-label">{t("settings.hidden_courses_label")}</div>
             <div className="settings-pref-ctrl">
               {hiddenCourseIds && hiddenCourseIds.length ? (
                 <>
-                  <span className="settings-pref-hint">{hiddenCourseIds.length} 门课程已隐藏（仅前端隐藏；后端数据保留）</span>
-                  <button className="settings-btn ghost" onClick={onUnhideAll}>全部恢复显示</button>
+                  <span className="settings-pref-hint">{t("settings.hidden_courses_count", { n: hiddenCourseIds.length })}</span>
+                  <button className="settings-btn ghost" onClick={onUnhideAll}>{t("settings.hidden_courses_unhide")}</button>
                 </>
               ) : (
-                <span className="settings-pref-hint">无</span>
+                <span className="settings-pref-hint">{t("settings.hidden_courses_none")}</span>
               )}
             </div>
           </div>
 
           <div className="settings-pref-row">
-            <div className="settings-pref-label">重置所有偏好</div>
+            <div className="settings-pref-label">{t("settings.reset_row_label")}</div>
             <div className="settings-pref-ctrl">
-              <button className="settings-btn danger" onClick={resetAllPrefs}>重置（含语言/backend/persona）</button>
-              <span className="settings-pref-hint">页面会刷新；下次进入会重新询问语言</span>
+              <button className="settings-btn danger" onClick={resetAllPrefs}>{t("settings.reset_btn")}</button>
+              <span className="settings-pref-hint">{t("settings.reset_hint")}</span>
             </div>
           </div>
         </Section>
 
         {/* ───────── 本机缓存 ───────── */}
-        <Section title="本机缓存（localStorage）" hint={`总占用 ${_formatBytes(totalCacheBytes)} · 浏览器上限约 5 MB`}>
+        <Section title={t("settings.section.cache")} hint={t("settings.section.cache_hint", { bytes: _formatBytes(totalCacheBytes) })}>
           <div className="settings-cache-summary">
             <div>
               <div className="settings-cache-num">{storageScan.global.length}</div>
-              <div className="settings-cache-num-label">全局偏好键</div>
+              <div className="settings-cache-num-label">{t("settings.cache.global_keys")}</div>
             </div>
             <div>
               <div className="settings-cache-num">{Object.keys(storageScan.course).length}</div>
-              <div className="settings-cache-num-label">课程缓存</div>
+              <div className="settings-cache-num-label">{t("settings.cache.course_cache")}</div>
             </div>
             <div>
               <div className="settings-cache-num">{storageScan.other.length}</div>
-              <div className="settings-cache-num-label">其它键</div>
+              <div className="settings-cache-num-label">{t("settings.cache.other_keys")}</div>
             </div>
           </div>
 
           {Object.keys(storageScan.course).length > 0 && (
             <table className="settings-cache-table">
-              <thead><tr><th>课程</th><th>键数</th><th>占用</th><th></th></tr></thead>
+              <thead><tr><th>{t("settings.cache.th_course")}</th><th>{t("settings.cache.th_keys")}</th><th>{t("settings.cache.th_bytes")}</th><th></th></tr></thead>
               <tbody>
                 {Object.entries(storageScan.course).map(([cid, arr]) => {
                   const sumBytes = arr.reduce((s, x) => s + x.bytes, 0);
@@ -603,7 +832,7 @@ function Settings({
                       <td><code>{cid}</code> <span className="settings-cache-course-name">{courseName !== cid ? courseName : ""}</span></td>
                       <td>{arr.length}</td>
                       <td>{_formatBytes(sumBytes)}</td>
-                      <td><button className="settings-btn ghost small" onClick={() => clearCourseCache(cid)}>清空</button></td>
+                      <td><button className="settings-btn ghost small" onClick={() => clearCourseCache(cid)}>{t("settings.cache.clear_one")}</button></td>
                     </tr>
                   );
                 })}
@@ -612,26 +841,26 @@ function Settings({
           )}
 
           <div className="settings-cache-actions">
-            <button className="settings-btn ghost" onClick={rescan}>重新扫描</button>
-            <button className="settings-btn danger" onClick={clearAllAppCache}>清空所有应用缓存（保留偏好）</button>
+            <button className="settings-btn ghost" onClick={rescan}>{t("settings.cache.rescan")}</button>
+            <button className="settings-btn danger" onClick={clearAllAppCache}>{t("settings.cache.clear_all")}</button>
           </div>
         </Section>
 
         {/* ───────── 系统状态 ───────── */}
-        <Section title="系统状态" hint={`v${s.version || "—"}`}>
-          <Row label="活跃课程数" value={s.courses ?? "—"} />
-          <Row label="索引 chunks 总数" value={(s.total_chunks ?? 0).toLocaleString()} />
-          <Row label="搜索 p50 (ms)" value={s.latency_ms?.search_p50 ?? "—"} mono />
-          <Row label="对话 p50 (ms)" value={s.latency_ms?.chat_p50 ?? "—"} mono />
+        <Section title={t("settings.section.system")} hint={`v${s.version || "—"}`}>
+          <Row label={t("settings.row.courses")} value={s.courses ?? "—"} />
+          <Row label={t("settings.row.chunks")} value={(s.total_chunks ?? 0).toLocaleString()} />
           {/* "累计成本" 行 2026-05-20 删除：router._track_usage 只累加 token
               数，从未接定价表，total_cost 一直返回 0.0。要恢复需为每个 backend
               加 $/1M-token 价目表 — 直到那时之前显示 0 只会误导。 */}
-          <Row label="累计 tokens" value={
+          <Row label={t("settings.row.tokens")} value={
             s.usage
-              ? `in ${(s.usage.input_tokens ?? 0).toLocaleString()} · out ${(s.usage.output_tokens ?? 0).toLocaleString()}`
+              ? t("settings.tokens_value", {
+                  in_: (s.usage.input_tokens ?? 0).toLocaleString(),
+                  out_: (s.usage.output_tokens ?? 0).toLocaleString(),
+                })
               : "—"
           } mono />
-          <Row label="后端版本" value={<code>{s.version || "—"}</code>} />
         </Section>
 
       </div>

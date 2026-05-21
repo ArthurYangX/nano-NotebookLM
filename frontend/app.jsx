@@ -25,6 +25,7 @@ const APPEARANCE_DEFAULTS = {
 // DocumentPdfFrame). Non-PDF sources and missing files fall through to the
 // legacy Reader-tab path before this component is rendered.
 function CitationPreviewModal({ preview, onClose, onOpenInReader }) {
+  const t = useT();
   // `preview` truthy/null is the only thing that gates the listener.
   // `onClose` is intentionally NOT in deps — including it would re-bind
   // the listener on every parent render (App re-renders ~10×/sec while
@@ -73,13 +74,13 @@ function CitationPreviewModal({ preview, onClose, onOpenInReader }) {
             <button
               className="pdf-preview-action mono"
               onClick={onOpenInReader}
-              title="切换到 Reader 标签页全屏查看"
-            >在 Reader 中打开 ↗</button>
+              title={t("reader.open_in_reader_tip")}
+            >{t("reader.open_in_reader")}</button>
             <button
               className="pdf-preview-close"
               onClick={onClose}
-              aria-label="关闭预览"
-              title="关闭 (Esc)"
+              aria-label={t("reader.preview_close_aria")}
+              title={t("reader.preview_close_title")}
             >✕</button>
           </div>
         </div>
@@ -140,23 +141,23 @@ function isValidCourseId(s) {
 // label) — a renamed course has `meta.name != cid` and `/api/upload/{course_id}`
 // is keyed on cid.
 function CoursePickerModal({ courses, defaultId, defaultEngine, onPick, onCancel }) {
+  const t = useT();
+  // Selected course: either an existing chip's id, or "__new__" when the
+  // user is creating a new course. Defaults to the active course (if any),
+  // otherwise to the first existing course. Empty → no choice yet.
+  const initialSelected =
+    defaultId && courses.some(c => c?.id === defaultId)
+      ? defaultId
+      : courses.length > 0 && typeof courses[0]?.id === "string"
+        ? courses[0].id
+        : "__new__";
+  const [selectedId, setSelectedId] = useState(initialSelected);
   const [newName, setNewName] = useState("");
   const [engine, setEngine] = useState(defaultEngine === "mineru" ? "mineru" : "pymupdf");
-  // Hidden file input + the course id captured at chip / form-submit time.
-  // We can't pass the id through the event because the file dialog opens
-  // asynchronously and onChange fires later in its own task.
+
   const fileInputRef = useRef(null);
-  const pendingIdRef = useRef(null);
   const onCancelRef = useRef(onCancel);
-  // Keep ref pointed at the latest onCancel without re-binding the listener;
-  // see fix-all #H4 below.
   useEffect(() => { onCancelRef.current = onCancel; });
-  // fix-all #H4: deps `[]` (not `[onCancel]`) so we bind the keydown listener
-  // exactly once per mount. The parent re-creates `onCancel` on every App
-  // render (App re-renders often during note streaming), and the previous
-  // `[onCancel]` caused a cleanup+rebind churn matching the exact anti-pattern
-  // CitationPreviewModal already documents at the top of this file. The ref
-  // bridges the closure so Esc still calls the latest onCancel.
   useEffect(() => {
     function onKey(e) { if (e.key === "Escape") onCancelRef.current(); }
     window.addEventListener("keydown", onKey);
@@ -164,9 +165,6 @@ function CoursePickerModal({ courses, defaultId, defaultEngine, onPick, onCancel
   }, []);
 
   const trimmed = newName.trim();
-  // Duplicate detection is case- and whitespace-insensitive over BOTH
-  // the course id and the course display name. " Foo " or "foo" typed
-  // against an existing `id="Foo"` must not create a sibling course.
   const existingKeys = new Set();
   for (const c of courses) {
     if (typeof c?.id === "string") existingKeys.add(c.id.trim().toLowerCase());
@@ -175,48 +173,47 @@ function CoursePickerModal({ courses, defaultId, defaultEngine, onPick, onCancel
   const trimmedKey = trimmed.toLowerCase();
   const duplicateNew = trimmed.length > 0 && existingKeys.has(trimmedKey);
   const newInputValid = trimmed.length === 0 || isValidCourseId(trimmed);
-  // Only block submit when the typed name actually fails validation. Empty
-  // input still disables submit via `!trimmed` below; `newInputValid` is
-  // there to surface the inline error for non-empty bad input.
-  const submitDisabled = !trimmed || duplicateNew || !newInputValid;
 
-  // User-gesture critical: this MUST be called synchronously inside the
-  // React onClick / onSubmit handler. Any `await` between the user's click
-  // and `fileInputRef.current.click()` invalidates transient activation
-  // and Chrome silently drops the file dialog. No setState / no
-  // microtask between here and the click.
-  function triggerFileChooser(courseId) {
-    pendingIdRef.current = courseId;
-    const el = fileInputRef.current;
-    if (el) {
-      el.value = "";  // allow re-picking the same files after a prior cancel
-      el.click();
+  // Resolve the effective course id from the current selection. When the
+  // user is creating a new course, the typed name must be valid + non-empty
+  // + not duplicate before the upload button enables.
+  const isCreating = selectedId === "__new__";
+  const effectiveCourseId = isCreating ? trimmed : selectedId;
+  const uploadDisabled =
+    !effectiveCourseId
+    || (isCreating && (duplicateNew || !newInputValid))
+    || (!isCreating && !isValidCourseId(effectiveCourseId));
+
+  // User-gesture critical: file picker MUST open synchronously inside the
+  // React onClick handler. No `await` between the click and `.click()` here.
+  function handleUploadClick() {
+    if (uploadDisabled) {
+      try {
+        console.warn("[CoursePickerModal] upload click ignored — disabled.", {
+          effectiveCourseId, isCreating, trimmed, duplicateNew, newInputValid,
+        });
+      } catch { /* nop */ }
+      return;
     }
-  }
-
-  function handleChipClick(cid) {
-    if (!isValidCourseId(cid)) return;
-    triggerFileChooser(cid);
-  }
-
-  function submitNew(e) {
-    if (e) e.preventDefault();
-    if (submitDisabled) return;
-    triggerFileChooser(trimmed);
+    const el = fileInputRef.current;
+    if (!el) {
+      try { console.error("[CoursePickerModal] fileInputRef.current is null"); } catch {}
+      return;
+    }
+    el.value = "";  // allow re-picking the same files after a cancel
+    try { el.click(); }
+    catch (e) {
+      try { console.error("[CoursePickerModal] file input .click() threw:", e); } catch {}
+    }
   }
 
   function handleFileChange(e) {
     const files = e.target.files;
-    // User cancelled the OS file dialog — modal stays open so they can try
-    // a different course / engine. Reset target.value so the same files
-    // can be picked again next time.
     if (!files || !files.length) {
       e.target.value = "";
       return;
     }
-    const cid = pendingIdRef.current;
-    if (!cid) return;
-    onPick(cid, files, engine);
+    onPick(effectiveCourseId, files, engine);
   }
 
   return (
@@ -228,91 +225,80 @@ function CoursePickerModal({ courses, defaultId, defaultEngine, onPick, onCancel
     >
       <div className="course-picker-modal">
         <div className="course-picker-head">
-          <div className="course-picker-title">上传到哪个课程？</div>
+          <div className="course-picker-title">{t("upload.modal_title")}</div>
           <button
             className="course-picker-close"
             onClick={onCancel}
-            aria-label="关闭"
-            title="关闭 (Esc)"
+            aria-label={t("upload.close_aria")}
+            title={t("upload.close_title")}
           >✕</button>
         </div>
 
-        {courses.length > 0 ? (
-          <div className="course-picker-section">
-            <div className="course-picker-label">添加到已有课程</div>
-            <div className="course-picker-existing">
-              {courses.map(c => {
-                // fix-all #M2: chip click is defence-in-depth — today the
-                // backend only ever serves ids that already passed
-                // `_ensure_safe_course_id`, but if a future endpoint adds
-                // user-supplied / imported / shared course metadata the chip
-                // would hand the raw value to localStorage + the URL path.
-                // A non-conforming id renders disabled with a tooltip.
-                const cid = typeof c?.id === "string" ? c.id : "";
-                const valid = isValidCourseId(cid);
-                const label = typeof c?.name === "string" && c.name ? c.name : cid;
-                return (
-                  <button
-                    key={cid || label}
-                    className={
-                      "course-picker-chip"
-                      + (valid && cid === defaultId ? " is-default" : "")
-                      + (valid ? "" : " is-invalid")
-                    }
-                    onClick={() => handleChipClick(cid)}
-                    disabled={!valid}
-                    title={valid ? label : `课程 id 不规范: ${cid}`}
-                  >
-                    <span className="course-picker-chip-name">{label}</span>
-                    {typeof c?.chunks === "number" && c.chunks > 0
-                      ? <span className="course-picker-chip-meta">{c.chunks} chunks</span>
-                      : null}
-                  </button>
-                );
-              })}
-            </div>
-          </div>
-        ) : null}
-
+        {/* Step 1: course selection. Existing chips + a "+ 新建课程" chip in
+            the same row. Selecting the new-course chip reveals an inline
+            input below it. Clicking ANY chip is a pure selection — it does
+            NOT trigger the file picker. */}
         <div className="course-picker-section">
-          <div className="course-picker-label">
-            {courses.length > 0 ? "或新建课程" : "新建课程"}
-          </div>
-          <form className="course-picker-newform" onSubmit={submitNew}>
-            <input
-              className="course-picker-input"
-              type="text"
-              value={newName}
-              onChange={e => setNewName(e.target.value)}
-              placeholder="输入新课程名称"
-              autoFocus
-            />
+          <div className="course-picker-label">{t("upload.target_course") || "选择课程"}</div>
+          <div className="course-picker-existing">
+            {courses.map(c => {
+              const cid = typeof c?.id === "string" ? c.id : "";
+              const valid = isValidCourseId(cid);
+              const label = typeof c?.name === "string" && c.name ? c.name : cid;
+              const isSelected = !isCreating && selectedId === cid;
+              return (
+                <button
+                  key={cid || label}
+                  className={
+                    "course-picker-chip"
+                    + (isSelected ? " is-selected" : "")
+                    + (valid ? "" : " is-invalid")
+                  }
+                  onClick={() => valid && setSelectedId(cid)}
+                  disabled={!valid}
+                  title={valid ? label : t("upload.invalid_id_title", { cid })}
+                >
+                  <span className="course-picker-chip-name">{label}</span>
+                  {typeof c?.chunks === "number" && c.chunks > 0
+                    ? <span className="course-picker-chip-meta">{c.chunks} chunks</span>
+                    : null}
+                </button>
+              );
+            })}
             <button
-              type="submit"
-              className="course-picker-create"
-              disabled={submitDisabled}
-              title={
-                duplicateNew
-                  ? "已存在同名课程，请直接点上方按钮"
-                  : !newInputValid
-                  ? "名称含非法字符 — 仅支持字母 / 数字 / 中文 / 空格 / . - _"
-                  : ""
-              }
-            >新建并上传</button>
-          </form>
-          {duplicateNew ? (
-            <div className="course-picker-warn">
-              已存在同名课程「{trimmed}」 — 请直接点上方按钮，或换一个名字。
+              className={"course-picker-chip course-picker-chip-new" + (isCreating ? " is-selected" : "")}
+              onClick={() => setSelectedId("__new__")}
+            >
+              <span className="course-picker-chip-name">➕ 新建课程</span>
+            </button>
+          </div>
+
+          {isCreating && (
+            <div className="course-picker-newform-wrap">
+              <input
+                className="course-picker-input"
+                type="text"
+                value={newName}
+                onChange={e => setNewName(e.target.value)}
+                placeholder={t("upload.new_placeholder")}
+                autoFocus
+              />
+              {duplicateNew ? (
+                <div className="course-picker-warn">
+                  {t("upload.dup_helper", { name: trimmed })}
+                </div>
+              ) : !newInputValid ? (
+                <div className="course-picker-warn">
+                  {t("upload.naming_hint")}
+                </div>
+              ) : null}
             </div>
-          ) : !newInputValid ? (
-            <div className="course-picker-warn">
-              名称仅支持字母 / 数字 / 中文 / 空格以及 . - _，且不能含 ".." 或以 "." 开头结尾。
-            </div>
-          ) : null}
+          )}
         </div>
 
+        {/* Step 2: PDF engine. */}
         <div className="course-picker-section course-picker-engine-row">
-          <div className="course-picker-label">PDF 提取引擎</div>
+          <div className="course-picker-label">{t("upload.engine_label")}</div>
           <div className="course-picker-engine-choices">
             <label className={"course-picker-engine-choice" + (engine === "pymupdf" ? " is-on" : "")}>
               <input
@@ -322,7 +308,7 @@ function CoursePickerModal({ courses, defaultId, defaultEngine, onPick, onCancel
                 onChange={() => setEngine("pymupdf")}
               />
               <span className="course-picker-engine-name">PyMuPDF</span>
-              <span className="course-picker-engine-meta">默认 · 毫秒级 · 不解析公式</span>
+              <span className="course-picker-engine-meta">{t("upload.engine_default")}</span>
             </label>
             <label className={"course-picker-engine-choice" + (engine === "mineru" ? " is-on" : "")}>
               <input
@@ -332,21 +318,41 @@ function CoursePickerModal({ courses, defaultId, defaultEngine, onPick, onCancel
                 onChange={() => setEngine("mineru")}
               />
               <span className="course-picker-engine-name">MinerU</span>
-              <span className="course-picker-engine-meta">高质量 · ~10s/页 · LaTeX + 表格</span>
+              <span className="course-picker-engine-meta">{t("upload.engine_mineru")}</span>
             </label>
           </div>
         </div>
 
-        {/* Hidden file input — triggered synchronously by chip / submitNew
-            handlers so transient user activation is still valid when the OS
-            opens the picker. accept list mirrors the previous ad-hoc input. */}
+        {/* Step 3: the single, obvious upload button. */}
+        <div className="course-picker-footer">
+          <button
+            className="course-picker-upload-btn"
+            onClick={handleUploadClick}
+            disabled={uploadDisabled}
+            title={uploadDisabled ? "请先选择或新建一个课程" : "选择文件并上传"}
+          >📤 上传文件</button>
+        </div>
+
+        {/* 2026-05-20: `display: none` blocks programmatic `.click()` in
+            Safari (silently — no dialog opens, no error). Use the
+            visually-hidden pattern instead: in DOM + focusable but
+            invisible + zero space. fileInputRef.current.click() now
+            reliably triggers the OS file dialog across Chrome / Safari
+            / Firefox. */}
         <input
           ref={fileInputRef}
           type="file"
           multiple
           accept=".pdf,.pptx,.docx,.md,.txt"
           onChange={handleFileChange}
-          style={{ display: "none" }}
+          style={{
+            position: "absolute",
+            left: "-9999px",
+            width: "1px",
+            height: "1px",
+            opacity: 0,
+            pointerEvents: "none",
+          }}
           aria-hidden="true"
           tabIndex={-1}
         />
@@ -470,21 +476,22 @@ function App() {
   // shows the current value and re-opens the modal so the choice is reversible.
   const [userLang, setUserLangState] = useState(() => StudyState.loadUserLang(window.localStorage));
   const [showLangModal, setShowLangModal] = useState(false);
+  // i18n: bind a `t(key, vars?)` that closes over the current userLang. Must
+  // live BEFORE `tabs = [...]` etc. since those reference t() at render time.
+  // Falls back to English when userLang is null (the first-run modal is open).
+  const t = (key, vars) => window.I18N.t(key, userLang || "en", vars);
   // ── Backend chip: openai / claude / local ──
-  // Default = openai (the configured main provider). Selection persists in
-  // localStorage; the chip greys out if the chosen backend isn't configured.
+  // Default = active default provider (resolved post-status). Selection
+  // persists in localStorage; provider IDs are dynamic (managed via
+  // /api/providers) so we accept any string here and let the
+  // post-/api/status rollback effect validate it against the actually-
+  // configured backends. A null state means "use the server default
+  // until status arrives".
   const [backend, setBackend] = useState(() => {
     try {
       const v = window.localStorage.getItem("nano-nlm:v1:backend");
-      if (v === "openai" || v === "claude" || v === "local") return v;
-      // Stale value from an older build (or unknown string). Reset
-      // storage so cross-tab listeners + the post-`/api/status`
-      // rollback effect agree on the new default.
-      if (v != null) {
-        try { window.localStorage.setItem("nano-nlm:v1:backend", "openai"); } catch (e) {}
-      }
-      return "openai";
-    } catch (e) { return "openai"; }
+      return (typeof v === "string" && v.length > 0) ? v : null;
+    } catch (e) { return null; }
   });
   function commitBackend(value) {
     setBackend(value);
@@ -623,21 +630,12 @@ function App() {
   //      back to the first remaining visible course (or null = All).
   async function handleDeleteCourse(courseId) {
     if (!courseId) return;
-    const step1 = window.confirm(
-      `彻底删除课程 "${courseId}"？\n\n` +
-      `这会移除：\n` +
-      ` - artifacts/courses/${courseId}/  (chunks / KG / notes / quizzes / exam bank)\n` +
-      ` - 该课程的 FAISS + BM25 索引\n` +
-      ` - 浏览器中该课程的所有 localStorage 缓存\n\n` +
-      `该操作不可撤销。若是预置课程，删除后无法回滚（rollback hatch 失效）。`
-    );
+    const step1 = window.confirm(t("confirm.delete_course", { cid: courseId }));
     if (!step1) return;
-    const typed = window.prompt(
-      `再次确认：请输入完整课程 ID（区分大小写）以执行删除：\n${courseId}`
-    );
+    const typed = window.prompt(t("confirm.delete_course_typeid", { cid: courseId }));
     if (typed == null) return;
     if (typed.trim() !== courseId) {
-      alert(`输入不匹配：你输入了 "${typed}" 但期望 "${courseId}"。已取消。`);
+      alert(t("confirm.delete_course_mismatch", { typed, cid: courseId }));
       return;
     }
     try {
@@ -669,15 +667,15 @@ function App() {
         setHiddenCourseIds(next);
       }
       const removedCount = (data.removed || []).length;
-      alert(`已删除课程 "${courseId}"（${removedCount} 个文件 / 目录）。`);
+      alert(t("confirm.delete_course_done", { cid: courseId, n: removedCount }));
     } catch (e) {
       const status = e && e.status;
       if (status === 404) {
-        alert(`课程 "${courseId}" 已不存在（可能在另一标签页已删除）。`);
+        alert(t("confirm.delete_course_gone", { cid: courseId }));
         // Best-effort refresh so the state catches up.
         setCourses(prev => prev.filter(c => c.id !== courseId));
       } else {
-        alert(`删除失败：${e.message || "未知错误"}`);
+        alert(t("confirm.delete_course_failed", { msg: e.message || t("common.unknown_error") }));
       }
     }
   }
@@ -787,6 +785,11 @@ function App() {
         errorMsg: s.error,
         done: false,
         retryPayload: null,
+        estimatedSeconds: s.estimated_seconds || 0,
+        totalPages: s.total_pages || 0,
+        // Use cand.started_at (ms epoch saved when the upload kicked off)
+        // so a tab reload still shows continuous elapsed time, not a reset.
+        startedAt: cand.started_at || Date.now(),
       });
       _startUploadPolling(cand.task_id, cand.courseId);
     }
@@ -829,17 +832,20 @@ function App() {
     return () => clearInterval(iv);
   }, []);
 
-  // Auto-rollback the chip when the selected backend isn't configured
-  // on the server (e.g. user picked "local" but operator removed
-  // LOCAL_LLM_BASE_URL from .env). Falls back to "openai", then to the
-  // first available backend, so the chip never points at a 422 path.
+  // Auto-rollback the chip when the selected provider isn't configured
+  // on the server (e.g. user deleted the provider via Settings, or
+  // localStorage carries an id from an older build). Falls back to the
+  // server's active default, then the first available provider, so the
+  // chip never points at a 422 path.
   useEffect(() => {
     if (!backendStatus) return;
     const available = new Set(backendStatus.available_backends || backendStatus.backends || []);
-    if (available.size && !available.has(backend)) {
-      const fallback = available.has("openai") ? "openai" : [...available][0];
-      if (fallback) commitBackend(fallback);
-    }
+    if (!available.size) return;
+    const defaultId = backendStatus.providers?.default_backend_id;
+    if (backend && available.has(backend)) return;
+    const fallback = (defaultId && available.has(defaultId))
+      ? defaultId : [...available][0];
+    if (fallback) commitBackend(fallback);
   }, [backendStatus, backend]);
 
   // ── Close the citation preview modal when the user navigates away from
@@ -1069,7 +1075,7 @@ function App() {
   const [noteReviewing, setNoteReviewing] = useState(false);
 
   async function handleGenerateNotes({ force = false } = {}) {
-    if (!activeCourse) { alert("Please select a specific course first (not 'All Courses')"); return; }
+    if (!activeCourse) { alert(t("alert.pick_course")); return; }
     // Force-regenerate confirm (review-swarm fix-all): the 🔄 button skips
     // the per-file cache and re-runs every section through the LLM. Guard
     // against accidental clicks — cache hits are cheap, force runs cost ~2
@@ -1369,7 +1375,7 @@ function App() {
 
   async function handleGenerateQuiz(topic = null) {
     if (topic && typeof topic !== "string") topic = null;
-    if (!activeCourse) { alert("Please select a specific course first"); return; }
+    if (!activeCourse) { alert(t("alert.pick_course")); return; }
     setMode("quiz");
     setStreaming(true);
     setStreamProgress(0);
@@ -1387,7 +1393,7 @@ function App() {
   }
 
   async function handleGenerateMindmap() {
-    if (!activeCourse) { alert("Please select a specific course first"); return; }
+    if (!activeCourse) { alert(t("alert.pick_course")); return; }
     setMode("mindmap");
     setStreaming(true);
     try {
@@ -1403,7 +1409,7 @@ function App() {
   }
 
   async function handleSkillEntry(kind) {
-    if (!activeCourse) { alert("Please select a specific course first"); return; }
+    if (!activeCourse) { alert(t("alert.pick_course")); return; }
     setStreaming(true);
     try {
       if (kind === "exam-analysis") {
@@ -1483,7 +1489,7 @@ function App() {
       const probeUrl = API.sourceFileUrl(source.courseId, source.docId, {});
       const head = await fetch(probeUrl, { method: "HEAD" });
       if (head.status === 404) {
-        dispatchNavToReader(nav, "源文件不在磁盘 · 在 Reader 文本视图查看");
+        dispatchNavToReader(nav, t("reader.source_missing"));
         return;
       }
     } catch {
@@ -1586,7 +1592,7 @@ function App() {
         if (failures >= MAX_FAILURES) {
           clearInterval(iv);
           pollRef.current = null;
-          setProcessing(p => p ? { ...p, errorStage: "transport", errorMsg: "状态轮询连续失败，请稍后重试" } : null);
+          setProcessing(p => p ? { ...p, errorStage: "transport", errorMsg: t("processing.poll_failed") } : null);
         }
         return;
       }
@@ -1597,7 +1603,7 @@ function App() {
         clearInterval(iv);
         pollRef.current = null;
         try { localStorage.removeItem(`nano-nlm:v1:upload-task:${courseName}`); } catch { /* nop */ }
-        setProcessing(p => p ? { ...p, errorStage: "transport", errorMsg: "上传任务已不可恢复，请重试" } : null);
+        setProcessing(p => p ? { ...p, errorStage: "transport", errorMsg: t("processing.unrecoverable") } : null);
         return;
       }
       warned = false;
@@ -1686,21 +1692,32 @@ function App() {
         else { setUploading(prev => prev ? { ...prev, pct } : null); }
       }, 200);
 
+      const startedAtMs = Date.now();
       try {
         setProcessing({
           file: files[0].name,
           step: 0,
-          stages: { chunking: { progress: 0 }, embedding: { progress: 0 }, kg_stage_a: { progress: 0 }, kg_stage_b: { progress: 0 } },
+          stages: { extracting: { progress: 0 }, chunking: { progress: 0 }, embedding: { progress: 0 }, kg_stage_a: { progress: 0 }, kg_stage_b: { progress: 0 } },
           errorStage: null,
           errorMsg: null,
           done: false,
           retryPayload: files,
+          estimatedSeconds: 0,
+          totalPages: 0,
+          startedAt: startedAtMs,
         });
-        const { task_id } = await API.startUpload(courseName, files, { engine: chosenEngine, lang: "ch" });
+        const uploadResp = await API.startUpload(courseName, files, { engine: chosenEngine, lang: "ch" });
+        const { task_id, estimated_seconds, total_pages } = uploadResp;
+        // Patch the freshly-mounted state with the backend ETA + page count.
+        setProcessing(p => p ? {
+          ...p,
+          estimatedSeconds: estimated_seconds || 0,
+          totalPages: total_pages || 0,
+        } : null);
         try {
           localStorage.setItem(
             `nano-nlm:v1:upload-task:${courseName}`,
-            JSON.stringify({ task_id, started_at: Date.now(), file_names: Array.from(files).map(f => f.name) })
+            JSON.stringify({ task_id, started_at: startedAtMs, file_names: Array.from(files).map(f => f.name) })
           );
         } catch { /* localStorage flaky / quota; in-memory state still drives the UI */ }
 
@@ -1746,10 +1763,10 @@ function App() {
   // /api/quiz endpoint, frontend/quiz.jsx, and tests stay in place as a
   // rollback hatch — only the entry point is removed from the nav.
   const tabs = [
-    { id: "reader", label: "Reader", num: activeCourse ? "§" : "—" },
-    { id: "notes", label: "Notes", num: realNotes ? "✓" : "—" },
-    { id: "mindmap", label: "Knowledge Graph", num: realMindmap ? "✓" : "—" },
-    { id: "exam-prep", label: "Exam Prep", num: "★" },
+    { id: "reader", label: t("tab.reader"), num: activeCourse ? "§" : "—" },
+    { id: "notes", label: t("tab.notes"), num: realNotes ? "✓" : "—" },
+    { id: "mindmap", label: t("tab.mindmap"), num: realMindmap ? "✓" : "—" },
+    { id: "exam-prep", label: t("tab.exam_prep"), num: "★" },
     // 2026-05-13: Skills tab hidden — its three cards (Exam Analysis /
     // Course Report / Mastery Dashboard) overlap conceptually with Exam
     // Prep, which has a clearer closed-loop UX. The view + handlers
@@ -1759,7 +1776,7 @@ function App() {
     // doesn't carry the slot anymore. Restore by uncommenting if you
     // want Skills back in the main nav.
     // { id: "skills", label: "Skills", num: [examAnalysis, reportData, masteryData].filter(Boolean).length || "—" },
-    { id: "history", label: "History", num: Object.keys(sessionDays || {}).length || "—" },
+    { id: "history", label: t("tab.history"), num: Object.keys(sessionDays || {}).length || "—" },
     // Settings tab retired 2026-05-12 — single entry point is the ⚙
     // icon-btn in the topbar. The Settings view (effectiveMode==="settings")
     // still renders normally; only the tab-bar trigger is gone.
@@ -1767,6 +1784,7 @@ function App() {
   const backendDegraded = !backendStatus || !Array.isArray(backendStatus.backends) || backendStatus.backends.length === 0;
 
   return (
+    <LangContext.Provider value={userLang || "en"}>
     <div className="app">
       {/* ========= Top bar ========= */}
       <header className="topbar">
@@ -1780,19 +1798,19 @@ function App() {
             onChange={e => setActiveCourse(e.target.value || null)}
             style={{ background: "transparent", border: "1px solid var(--paper-3)", borderRadius: 4, padding: "2px 8px", fontFamily: "var(--mono)", fontSize: 11, color: "var(--ink-2)", minWidth: 180 }}
           >
-            <option value="">🌐 All Courses ({totalChunks} chunks)</option>
+            <option value="">{t("topbar.all_courses", { n: totalChunks })}</option>
             {visibleCourses.map(c => {
               const flag = c.lang === "zh" ? "🇨🇳" : c.lang === "mixed" ? "🌐" : "🇺🇸";
               return (
                 <option key={c.id} value={c.id}>
-                  {flag} {c.name} ({c.chunks || 0} chunks)
+                  {t("topbar.course_option", { flag, name: c.name, n: c.chunks || 0 })}
                 </option>
               );
             })}
           </select>
           <button
             className="course-manage-btn mono"
-            title="管理课程显示 / Manage course visibility (frontend-only hide; backend data is preserved)"
+            title={t("topbar.manage_tooltip")}
             onClick={() => setShowCourseManager(true)}
             style={{
               marginLeft: 6, background: "transparent",
@@ -1801,40 +1819,61 @@ function App() {
               color: "var(--ink-2)", cursor: "pointer",
             }}
           >
-            管理{hiddenCourseIds.length ? ` · ${hiddenCourseIds.length} 已隐藏` : ""}
+            {hiddenCourseIds.length
+              ? t("topbar.manage_courses_count", { n: hiddenCourseIds.length })
+              : t("topbar.manage_courses")}
           </button>
         </div>
         <div className="spacer"></div>
         <div className="topbar-actions">
           <button
             className="lang-chip mono"
-            title={userLang ? "Reply language preference (click to change)" : "Pick reply language"}
+            title={userLang ? t("topbar.lang_chip_title") : t("topbar.lang_chip_title_unset")}
             onClick={() => setShowLangModal(true)}
             disabled={streaming}
           >
-            {userLang === "zh" ? "中" : userLang === "en" ? "EN" : "?"}
+            {userLang === "zh" ? t("topbar.lang_chip_zh") : userLang === "en" ? t("topbar.lang_chip_en") : "?"}
           </button>
-          {/* Backend chip — cycles through configured backends (openai /
-              claude / local). Each click moves to the next available one;
-              chip is disabled when only one backend is configured. */}
+          {/* Backend chip — cycles through registered providers from
+              `/api/providers`. Each click moves to the next provider id;
+              chip is disabled when only one provider is configured. The
+              fallback to the legacy `available_backends` list lets the
+              chip render before /api/status returns. */}
           {(() => {
-            const available = (backendStatus?.available_backends || backendStatus?.backends || []);
-            const cycle = ["openai", "claude", "local"].filter(b => available.includes(b));
+            const providersList = (backendStatus?.providers?.providers) || [];
+            const enabledRows = providersList.filter(p => p.enabled !== false);
+            const fallbackIds = (backendStatus?.available_backends || backendStatus?.backends || []);
+            const cycle = enabledRows.length
+              ? enabledRows.map(p => p.id)
+              : fallbackIds;
+            const rowFor = (id) => enabledRows.find(p => p.id === id);
             const next = () => {
               if (!cycle.length) return backend;
-              const i = cycle.indexOf(backend);
+              const i = backend ? cycle.indexOf(backend) : -1;
               return cycle[(i + 1) % cycle.length];
             };
-            const labelFor = (b) => {
-              if (b === "claude") return "🧠 " + ((backendStatus?.claude_model) || "Claude");
-              if (b === "local") return "💻 " + ((backendStatus?.local_llm_model) || "Local");
-              return "🤖 " + ((backendStatus?.openai_model) || "OpenAI");
+            const iconFor = (row) => {
+              if (!row) return "🤖";
+              if (row.kind === "anthropic") return "🧠";
+              if (row.kind === "openai_compat_local") return "💻";
+              return "🤖";
             };
-            const variant = backend === "claude" ? "claude" : backend === "local" ? "local" : "openai";
-            const tip = cycle.length > 1 ? "点击切换后端" : "唯一已配置后端";
+            const labelFor = (id) => {
+              const row = rowFor(id);
+              if (!row) return id ? `🤖 ${id}` : "🤖";
+              return `${iconFor(row)} ${row.model || row.label || id}`;
+            };
+            const variantFor = (id) => {
+              const row = rowFor(id);
+              if (!row) return "openai";
+              if (row.kind === "anthropic") return "claude";
+              if (row.kind === "openai_compat_local") return "local";
+              return "openai";
+            };
+            const tip = cycle.length > 1 ? t("topbar.backend_cycle") : t("topbar.backend_only");
             return (
               <button
-                className={"backend-chip mono backend-" + variant}
+                className={"backend-chip mono backend-" + variantFor(backend)}
                 title={tip}
                 onClick={() => commitBackend(next())}
                 disabled={streaming || cycle.length <= 1}
@@ -1861,9 +1900,9 @@ function App() {
           {noteReviewing && (
             <span
               className="cache-chip mono cache-reviewing"
-              title="第二轮：统一术语 / 加交叉引用 / 折叠重复定义。完成后会一次性替换为润色版。"
+              title={t("topbar.notes_polishing_tip")}
             >
-              ✨ 润色中
+              {t("topbar.notes_polishing")}
             </span>
           )}
           {notesTruncated && (notesTruncated.review || notesTruncated.files.length > 0) && (
@@ -1872,18 +1911,18 @@ function App() {
               title={(() => {
                 const lines = [];
                 if (notesTruncated.files.length > 0) {
-                  lines.push("以下文件因输出 token 上限被截断:");
+                  lines.push(t("topbar.notes_truncated_lines"));
                   lines.push(...notesTruncated.files.map(f => "  · " + f));
                 }
                 if (notesTruncated.review) {
-                  lines.push("review 阶段也被截断 — 笔记结尾可能不完整");
+                  lines.push(t("topbar.notes_truncated_review"));
                 }
                 lines.push("");
-                lines.push("提示: 设置 NOTES_PER_FILE_MAX_TOKENS / NOTES_REVIEW_MAX_TOKENS 提高上限后重试");
+                lines.push(t("topbar.notes_truncated_hint"));
                 return lines.join("\n");
               })()}
             >
-              ⚠️ {notesTruncated.files.length + (notesTruncated.review ? 1 : 0)} 截断
+              {t("topbar.notes_truncated", { n: notesTruncated.files.length + (notesTruncated.review ? 1 : 0) })}
             </span>
           )}
           {/* Quiz icon-btn hidden 2026-05-12: superseded by Exam Prep.
@@ -1964,7 +2003,7 @@ function App() {
             </button>
           ))}
           <div className="spacer"></div>
-          <button className="tool mono" style={{ fontSize: 11 }}>{activeSources.length}/{sources.length} sources</button>
+          <button className="tool mono" style={{ fontSize: 11 }}>{t("topbar.sources_btn", { n: activeSources.length, total: sources.length })}</button>
         </div>
         <div className="workspace">
           {/* 2026-05-13: the empty-courses CTA is `height/width:100%` and
@@ -1982,9 +2021,9 @@ function App() {
             <div className="empty-courses-cta" data-testid="empty-courses">
               <div className="empty-courses-card">
                 <div className="empty-courses-glyph">📂</div>
-                <h2>上传文档开始</h2>
-                <p>上传一份 PDF / PPTX / DOCX / Markdown，系统会自动抽取章节、构建知识图谱，再驱动问答与笔记。</p>
-                <button className="btn-primary" onClick={onStartUpload}>上传第一个文档</button>
+                <h2>{t("empty.title")}</h2>
+                <p>{t("empty.subtitle")}</p>
+                <button className="btn-primary" onClick={onStartUpload}>{t("empty.cta")}</button>
               </div>
             </div>
           )}
@@ -2070,6 +2109,9 @@ function App() {
               errorStage={processing.errorStage}
               errorMsg={processing.errorMsg}
               done={processing.done}
+              estimatedSeconds={processing.estimatedSeconds}
+              totalPages={processing.totalPages}
+              startedAt={processing.startedAt}
               onRetry={() => {
                 // fix-all v1 #A6: re-invoke upload with the SAME files
                 // captured at onStartUpload time. After a tab reload
@@ -2077,12 +2119,23 @@ function App() {
                 // File objects don't survive JSON serialization — fall
                 // through to a dismiss + user-facing toast so the user
                 // knows they need to re-pick files.
+                //
+                // H5 (2026-05-20): retry naturally resets the elapsed
+                // timer because retryRef.current === runUpload, and
+                // runUpload re-executes `const startedAtMs =
+                // Date.now()` + `setProcessing({..., startedAt:
+                // startedAtMs })` on every invocation. After the POST
+                // returns it also patches estimatedSeconds + totalPages
+                // from the fresh response. So the "剩余 ~0s" forever
+                // bug from a prior implementation is already fixed by
+                // construction — DO NOT extract startedAtMs above this
+                // closure or the retry will inherit the original ts.
                 if (retryRef.current && processing.retryPayload) {
                   retryRef.current(processing.retryPayload);
                 } else {
                   setProcessing(null);
                   try {
-                    alert("原始文件已不在内存中（页面已刷新）。请重新选择文件并上传。");
+                    alert(t("upload.refresh_lost"));
                   } catch { /* nop */ }
                 }
               }}
@@ -2158,16 +2211,13 @@ function App() {
       <footer className="statusbar">
         <div className="item">
           <span className="dot"></span>
-          <span>Indexed</span><b>{visibleCourses.length} courses · {totalChunks} chunks</b>
-        </div>
-        <div className={"item" + (backendDegraded ? " degraded" : "")}>
-          <span>Backend</span><b>{backendStatus ? backendStatus.backends.join(", ") || "none" : "..."}</b>
+          <span>{t("status.indexed")}</span><b>{t("status.indexed_value", { n: visibleCourses.length, chunks: totalChunks })}</b>
         </div>
         <div className="item">
-          <span>Active</span><b>{activeCourse || "—"}</b>
+          <span>{t("status.active")}</span><b>{activeCourse || "—"}</b>
         </div>
         <div className="item">
-          <span>Context</span><b>{activeSources.length} / {sources.length} sources</b>
+          <span>{t("status.context")}</span><b>{t("status.context_value", { n: activeSources.length, total: sources.length })}</b>
         </div>
         <div className="spacer"></div>
         <div className="item"><span>v0.1.0</span></div>
@@ -2219,11 +2269,9 @@ function App() {
       {showLangModal && (
         <div className="lang-modal-overlay" role="dialog" aria-modal="true">
           <div className="lang-modal">
-            <h3 className="lang-modal-title">Choose your reply language</h3>
-            <p className="lang-modal-hint">
-              The assistant will reply ONLY in this language for chat, notes,
-              quiz, and report generations. You can change this anytime via
-              the topbar chip.
+            <h3 className="lang-modal-title">{t("lang_modal.title_bi")}</h3>
+            <p className="lang-modal-hint" style={{ whiteSpace: "pre-line" }}>
+              {t("lang_modal.hint_bi")}
             </p>
             <div className="lang-modal-choices">
               {StudyState.DEFAULT_LANG_CHOICES.map(c => (
@@ -2241,7 +2289,7 @@ function App() {
               <button
                 className="lang-modal-close mono"
                 onClick={() => setShowLangModal(false)}
-              >Cancel</button>
+              >{t("common.cancel")}</button>
             )}
           </div>
         </div>
@@ -2252,17 +2300,14 @@ function App() {
         <div className="lang-modal-overlay" role="dialog" aria-modal="true"
              onClick={e => { if (e.target === e.currentTarget) setShowCourseManager(false); }}>
           <div className="lang-modal" style={{ maxWidth: 480, maxHeight: "70vh", overflowY: "auto" }}>
-            <h3 className="lang-modal-title">课程显示管理</h3>
-            <p className="lang-modal-hint">
-              勾掉的课程会从顶栏下拉里隐藏 —
-              <b>仅前端</b>过滤，后端 <code>artifacts/courses/</code> 下的数据完整保留。
-              换浏览器或清 localStorage 后会重置。<br />
-              红色 <b>🗑 删除</b> 按钮则是<b>彻底删除</b>：移除磁盘文件 + 索引 + 浏览器缓存，不可撤销。
+            <h3 className="lang-modal-title">{t("course_mgr.title")}</h3>
+            <p className="lang-modal-hint" style={{ whiteSpace: "pre-line" }}>
+              {t("course_mgr.hint")}
             </p>
             <div style={{ display: "flex", flexDirection: "column", gap: 6, margin: "12px 0" }}>
               {courses.length === 0 && (
                 <div className="mono" style={{ color: "var(--ink-3)", fontSize: 12 }}>
-                  没有课程可管理。
+                  {t("course_mgr.empty")}
                 </div>
               )}
               {courses.map(c => {
@@ -2294,9 +2339,9 @@ function App() {
                     <button
                       className="mono course-delete-btn"
                       onClick={() => handleDeleteCourse(c.id)}
-                      title={`彻底删除课程 ${c.id}（磁盘 + 索引 + 浏览器缓存）`}
+                      title={t("course_mgr.delete_tooltip", { cid: c.id })}
                     >
-                      🗑 删除
+                      {t("course_mgr.delete_btn")}
                     </button>
                   </div>
                 );
@@ -2307,17 +2352,18 @@ function App() {
                 <button
                   className="lang-modal-close mono"
                   onClick={unhideAllCourses}
-                >全部显示 ({hiddenCourseIds.length})</button>
+                >{t("course_mgr.show_all", { n: hiddenCourseIds.length })}</button>
               )}
               <button
                 className="lang-modal-close mono"
                 onClick={() => setShowCourseManager(false)}
-              >完成</button>
+              >{t("common.done")}</button>
             </div>
           </div>
         </div>
       )}
     </div>
+    </LangContext.Provider>
   );
 }
 
@@ -2771,6 +2817,7 @@ function HighlightDrawer({ highlights, onJump, onRemove, onClose }) {
 }
 
 function RealNotesView({ content, streaming, activeCourse, sources, onContentChange, generationState, onRetry, onCitation }) {
+  const t = useT();
   const [draft, setDraft] = React.useState(content || "");
   const [editing, setEditing] = React.useState(false);
   const [highlights, setHighlights] = React.useState([]);
@@ -3165,20 +3212,20 @@ function RealNotesView({ content, streaming, activeCourse, sources, onContentCha
         try { body = await resp.json(); } catch (e) {}
         if (body && body.error === "tectonic_unavailable") {
           setTectonicAvailable(false);
-          setCompileError("Tectonic 不可用：服务器未安装 LaTeX 编译器。");
+          setCompileError(t("notes.compile_tectonic_missing"));
           return;
         }
         if (body && body.error === "latex_unsafe") {
-          setCompileError(`安全检查拦截：${body.reason || "包含禁止的 LaTeX 命令"}`);
+          setCompileError(t("notes.compile_blocked", { reason: body.reason || t("notes.compile_blocked_reason_default") }));
           return;
         }
         if (body && body.error === "latex_compile_failed") {
           const tail = (body.log || "").slice(-800);
-          setCompileError(`LaTeX 编译失败 (exit ${body.exit_code || "?"})：\n${tail}`);
+          setCompileError(t("notes.compile_failed", { exit: body.exit_code || "?", tail }));
           return;
         }
         if (body && body.error === "latex_compile_timeout") {
-          setCompileError("编译超时（>60s）。文档可能含死循环或复杂的图。");
+          setCompileError(t("notes.compile_timeout"));
           return;
         }
         setCompileError(`Compile failed: HTTP ${resp.status}`);
@@ -3193,7 +3240,7 @@ function RealNotesView({ content, streaming, activeCourse, sources, onContentCha
       a.click();
       URL.revokeObjectURL(url);
     } catch (e) {
-      setCompileError(`网络错误：${e.message || e}`);
+      setCompileError(t("notes.compile_network_err", { msg: e.message || e }));
     }
   }
 
@@ -3381,8 +3428,8 @@ function RealNotesView({ content, streaming, activeCourse, sources, onContentCha
           onClick={() => setToolbarCollapsed(v => !v)}
           disabled={editing}
           title={editing
-            ? "Edit 模式下工具栏始终展开"
-            : (effectiveCollapsed ? "展开工具栏" : "隐藏工具栏")}
+            ? t("notes.toolbar_locked_edit")
+            : (effectiveCollapsed ? t("notes.toolbar_expand") : t("notes.toolbar_collapse"))}
           aria-expanded={!effectiveCollapsed}
         >{effectiveCollapsed ? "▸ Tools" : "▾ Tools"}</button>
         {!effectiveCollapsed && (
@@ -3392,16 +3439,16 @@ function RealNotesView({ content, streaming, activeCourse, sources, onContentCha
                 place — if you want it back, restore this button. The
                 Preview rendering, highlights, TOC, and export paths
                 are all independent of editing mode. */}
-            <button className="btn ghost" onClick={downloadLatex} title="下载 .tex 源文件">.tex</button>
-            <button className="btn ghost" onClick={printPdfFromBrowser} title="浏览器打印（快速预览）">PDF (print)</button>
+            <button className="btn ghost" onClick={downloadLatex} title={t("notes.download_tex_tip")}>{t("notes.download_tex")}</button>
+            <button className="btn ghost" onClick={printPdfFromBrowser} title={t("notes.print_pdf_tip")}>{t("notes.print_pdf")}</button>
             {tectonicAvailable !== false && (
               <button
                 className="btn ghost"
                 onClick={compilePdfWithTectonic}
                 disabled={tectonicAvailable === null}
                 title={tectonicAvailable === null
-                  ? "检查 tectonic 状态中…"
-                  : "服务端 LaTeX 编译（学术排版）"}
+                  ? t("notes.tectonic_checking")
+                  : t("notes.tectonic_compile")}
               >PDF (compile)</button>
             )}
             <button className="btn ghost" onClick={() => setShowToc(v => !v)} disabled={editing}>{showToc ? "Hide TOC" : "Show TOC"}</button>

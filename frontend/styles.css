@@ -2377,8 +2377,24 @@ mark.hl-flash, .hl-jump.hl-flash { animation: hl-flash 0.9s ease-out; }
   font-family: var(--mono);
   font-size: 12px;
   color: var(--ink-3);
-  margin-bottom: 28px;
+  margin-bottom: 14px;
 }
+/* 2026-05-20: ETA + elapsed timer above the stage list. Sits between
+   the filename and the stage rows. Slightly emphasized via background +
+   border so users notice it as a single readable cluster, not a stray
+   line of text. */
+.processing-eta {
+  font-size: 12px;
+  color: var(--ink-2);
+  background: var(--paper-2, rgba(0, 0, 0, 0.03));
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  padding: 8px 12px;
+  margin-bottom: 18px;
+  line-height: 1.6;
+}
+.processing-eta strong { color: var(--ink-1); font-weight: 600; }
+.processing-eta-sep { color: var(--ink-3); }
 .processing-steps { display: flex; flex-direction: column; gap: 14px; }
 .pstep {
   display: grid;
@@ -2685,6 +2701,7 @@ mark.hl-flash, .hl-jump.hl-flash { animation: hl-flash 0.9s ease-out; }
 .lang-chip:hover { background: var(--paper-2); border-color: var(--ink-4); }
 .lang-chip:disabled { opacity: 0.4; cursor: default; }
 
+
 .lang-modal-overlay {
   position: fixed;
   inset: 0;
@@ -2964,6 +2981,41 @@ mark.hl-flash, .hl-jump.hl-flash { animation: hl-flash 0.9s ease-out; }
   border-color: var(--accent);
   color: var(--ink);
 }
+.course-picker-chip.is-selected {
+  background: var(--accent);
+  color: var(--paper);
+  border-color: var(--accent);
+}
+.course-picker-chip.is-selected:hover {
+  background: var(--accent-ink);
+  color: var(--paper);
+  border-color: var(--accent-ink);
+}
+.course-picker-chip-new {
+  border-style: dashed;
+}
+.course-picker-newform-wrap {
+  margin-top: 10px;
+}
+.course-picker-footer {
+  margin-top: 16px;
+  display: flex;
+  justify-content: flex-end;
+}
+.course-picker-upload-btn {
+  background: var(--accent);
+  color: var(--paper);
+  border: none;
+  border-radius: 8px;
+  padding: 11px 24px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.12s ease, opacity 0.12s ease, transform 0.08s ease;
+}
+.course-picker-upload-btn:hover:not(:disabled) { background: var(--accent-ink); }
+.course-picker-upload-btn:active:not(:disabled) { transform: scale(0.98); }
+.course-picker-upload-btn:disabled { opacity: 0.4; cursor: not-allowed; }
 .course-picker-chip.is-invalid,
 .course-picker-chip:disabled {
   opacity: 0.5;
@@ -3814,6 +3866,81 @@ mark.hl-flash, .hl-jump.hl-flash { animation: hl-flash 0.9s ease-out; }
   display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
 }
 .settings-pref-hint { font-size: 11px; color: var(--ink-4); font-family: var(--mono); }
+
+/* ── Providers matrix (LLM provider table in Settings) ── */
+.settings-providers-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+  margin-bottom: 8px;
+}
+.settings-providers-table th {
+  text-align: left; font-weight: 600; font-size: 11px;
+  color: var(--ink-3); text-transform: uppercase; letter-spacing: 0.04em;
+  padding: 6px 8px; border-bottom: 1px solid var(--paper-3);
+}
+.settings-providers-table td {
+  padding: 8px; border-bottom: 1px solid var(--paper-2);
+  vertical-align: middle;
+}
+.settings-providers-table tr.is-default td:first-child {
+  border-left: 3px solid oklch(0.70 0.12 260);
+}
+.settings-providers-table tr.editing td { padding: 0; }
+.settings-prov-label code.settings-prov-id {
+  font-size: 11px; color: var(--ink-4); padding: 1px 5px;
+  background: var(--paper-2); border-radius: 3px;
+}
+.settings-prov-actions {
+  display: flex; gap: 4px; flex-wrap: wrap;
+}
+.settings-prov-actions button {
+  font-size: 12px; padding: 4px 8px;
+  border: 1px solid var(--paper-3); border-radius: 4px;
+  background: var(--paper); color: var(--ink); cursor: pointer;
+}
+.settings-prov-actions button:hover:not(:disabled) { background: var(--paper-2); }
+.settings-prov-actions button:disabled { opacity: 0.5; cursor: not-allowed; }
+.settings-prov-actions button.danger:not(:disabled) { color: oklch(0.45 0.15 25); }
+.settings-prov-add {
+  font-size: 13px; padding: 6px 14px;
+  border: 1px dashed var(--paper-3); border-radius: 6px;
+  background: transparent; color: var(--ink-2); cursor: pointer;
+}
+.settings-prov-add:hover { background: var(--paper-2); }
+.settings-prov-form {
+  padding: 12px; background: var(--paper-2);
+  border: 1px solid var(--paper-3); border-radius: 6px;
+  margin-top: 6px;
+}
+.settings-prov-form-row {
+  display: flex; gap: 10px; margin-bottom: 8px; align-items: flex-end;
+}
+.settings-prov-form-row label {
+  display: flex; flex-direction: column; flex: 1; gap: 3px;
+  font-size: 12px; color: var(--ink-3);
+}
+.settings-prov-form-row label.wide { flex: 2; }
+.settings-prov-form-row label.inline {
+  flex: 0 0 auto; flex-direction: row; align-items: center; gap: 5px;
+  font-size: 13px; color: var(--ink-2);
+}
+.settings-prov-form-row input[type="text"],
+.settings-prov-form-row select {
+  font-family: var(--mono); font-size: 13px;
+  padding: 5px 8px; border: 1px solid var(--paper-3); border-radius: 4px;
+  background: var(--paper); color: var(--ink);
+}
+.settings-prov-form-row input[type="text"]:disabled { opacity: 0.6; }
+.settings-prov-form-row button {
+  font-size: 13px; padding: 5px 14px;
+  border: 1px solid var(--paper-3); border-radius: 4px;
+  background: var(--paper); color: var(--ink); cursor: pointer;
+}
+.settings-prov-form-row button.primary {
+  background: oklch(0.70 0.12 260); color: white; border-color: oklch(0.65 0.14 260);
+}
+.settings-prov-form-row button:disabled { opacity: 0.5; cursor: not-allowed; }
 
 .settings-chip {
   font-family: var(--mono); font-size: 12px;

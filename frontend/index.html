@@ -63,6 +63,9 @@
   <!-- API bridge (plain JS, no Babel needed) -->
   <script src="/static/api.js"></script>
   <script src="/static/study-state.js"></script>
+  <!-- i18n: pure JS dictionary + t() helper. Must load AFTER React UMD (for
+       React.createContext) and BEFORE any text/babel .jsx that calls window.I18N. -->
+  <script src="/static/i18n.js"></script>
   <!-- Shared markdown + KaTeX helpers (used by chat bubbles and the Notes
        preview). Plain JS; loads before any Babel-transpiled component. -->
   <script src="/static/markdown.js"></script>

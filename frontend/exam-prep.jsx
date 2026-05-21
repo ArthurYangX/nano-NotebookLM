@@ -14,6 +14,7 @@
 const { useState: useEP, useEffect: useEPEffect, useCallback: useEPCallback, useRef: useEPRef } = React;
 
 function ExamPrep({ activeCourse, userLang }) {
+  const t = (k, vars) => window.I18N.t(k, userLang || "en", vars);
   const [view, setView] = useEP("topics"); // topics | quiz | result
   const [loading, setLoading] = useEP(false);
   const [loadingLabel, setLoadingLabel] = useEP("");
@@ -464,10 +465,10 @@ function ExamPrepResult({ graded, questions, answers, onContinue, onAgain }) {
         {variantCount === 0 && variantsPending && expectedVariants > 0 && (
           <div
             className="exam-result-stat variants"
-            title="新题目在后台生成（不阻塞当前页面）。下次开 quiz 时会出现。"
+            title={t("exam.variant_brewing_tip")}
           >
             <b>~{expectedVariants}</b>
-            <span>变体生成中…</span>
+            <span>{t("exam.variant_brewing")}</span>
           </div>
         )}
       </div>

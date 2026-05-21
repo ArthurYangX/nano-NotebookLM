@@ -608,15 +608,20 @@ class ChatRequest(BaseModel):
     # rejected at the Pydantic layer so a stale localStorage value can't
     # smuggle a bogus instruction into the prompt.
     user_lang: Literal["zh", "en"] | None = None
-    # Optional backend override surfaced via the topbar chip. One of the
-    # configured backend keys ("openai" / "claude" / "local"). None falls
-    # back to task-type routing. Unknown / unconfigured target 422s.
-    backend: Literal["openai", "claude", "local"] | None = Field(
+    # Optional backend override surfaced via the topbar chip. Value is a
+    # provider id from providers.json (e.g. "openai-main", "claude-main",
+    # or a user-added "openai-alt"). None falls back to task-type routing.
+    # Previously this was a Literal["openai","claude","local"]; relaxed to
+    # `str` so the dynamic provider matrix isn't bound to compile-time
+    # enum values. Validation against router.backends.keys() still happens
+    # in the chat handler (line ~1416) so unknown values still 422.
+    backend: str | None = Field(
         default=None,
+        min_length=1,
+        max_length=120,
         description=(
-            "Optional backend override surfaced via the topbar chip. "
-            "One of 'openai', 'claude', 'local'. None uses the default "
-            "task-type routing."
+            "Optional provider id (from /api/providers) to pin this "
+            "chat call to. None uses the default task-type routing."
         ),
     )
     # 2026-05-12: user-customisable assistant name surfaced via the
@@ -1410,14 +1415,22 @@ async def get_source_file(course_id: str, doc_id: str):
           summary="RAG chat with source citations",
           response_model=ChatResponse, response_model_exclude_none=True)
 async def chat(req: ChatRequest):
-    # Validate the chip selection against the actually-configured
-    # backends (router-level) before queueing the skill so a stale
-    # localStorage chip value surfaces as 422 instead of 502.
+    # fix-all v1 M5: previously an unknown `req.backend` 422'd. That
+    # surfaces a cold-load race — the frontend chip starts with whatever
+    # localStorage holds, including ids that were valid in an earlier
+    # session but have since been deleted/renamed via the providers UI.
+    # The rollback effect in app.jsx eventually corrects the chip from
+    # `/api/status`, but a user who types fast hits chat() with the
+    # stale id and sees a hard 422 mid-conversation. The chip is a hint,
+    # not a security boundary — drop the override and fall through to
+    # task-type routing instead. Log warn for observability.
     if req.backend and req.backend not in orchestrator.router.backends:
-        raise HTTPException(
-            422,
-            detail=f"backend {req.backend!r} is not configured on this server",
+        logger.warning(
+            "chat: unknown backend %r requested by client; falling back to "
+            "task-type default (available: %s)",
+            req.backend, sorted(orchestrator.router.backends.keys()),
         )
+        req.backend = None
     # multi-turn — serialise ChatTurn[] to plain dicts so the
     # skill layer stays Pydantic-free. Empty / None history threads through
     # as None (qa_skill short-circuits the rewrite step).
@@ -2294,7 +2307,7 @@ _AGENT_REGISTRY = build_default_registry(kb, orchestrator)
 @app.post("/api/agent/stream", tags=["agents"],
           summary="Multi-turn tool-calling agent (NDJSON event stream)")
 async def agent_stream(req: AgentRequest, request: Request):
-    backend = router.backends.get("openai")
+    backend = router.get_openai_compat()
     if backend is None:
         raise HTTPException(
             status_code=503,
@@ -2898,7 +2911,7 @@ async def explain_mindmap_node(course_id: str, req: NodeExplainRequest, request:
     if target_node is None:
         raise HTTPException(404, f"node_id {req.node_id!r} not found in mindmap")
 
-    backend = router.backends.get("openai")
+    backend = router.get_openai_compat()
     if backend is None:
         raise HTTPException(
             status_code=503,
@@ -4085,6 +4098,10 @@ _EMBEDDING_REBUILD_TASK: "set[asyncio.Task]" = set()
 # loop's preset_id capture. Plain asyncio.Lock is enough because there's
 # one event loop per process and uvicorn is single-worker for this app.
 _EMBEDDING_SWITCH_LOCK = asyncio.Lock()
+# Serialises providers.json mutation + router.reload(). Plain asyncio.Lock
+# is enough — uvicorn is single-worker for this app, so one event loop
+# is the only writer.
+_PROVIDERS_LOCK = asyncio.Lock()
 # How long a finished rebuild's terminal state remains visible on
 # /api/status before being translated to idle (M1). Keeps the green
 # "done" banner up just long enough for the user who clicked switch to
@@ -4200,6 +4217,84 @@ def _kick_embedding_rebuild(preset_id: str) -> str:
     _EMBEDDING_REBUILD_TASK.add(t)
     t.add_done_callback(_EMBEDDING_REBUILD_TASK.discard)
     return task_id
+
+
+def _redact_provider_row(row: dict) -> dict:
+    """Project a providers.json row into the shape served to the UI.
+
+    Critical invariant: `literal:<value>` api_key_refs MUST never leave
+    the process. Any response that includes provider rows must go through
+    this helper — that includes `/api/providers`, `/api/status`, and any
+    future debug endpoint. The redacted view replaces `literal:*` with
+    `literal:***` so the UI can distinguish "stored as env" from "stored
+    inline" without ever seeing the secret material.
+    """
+    ref = row.get("api_key_ref", "") or ""
+    safe_ref = ref if ref.startswith("env:") else (
+        "literal:***" if ref.startswith("literal:") else ""
+    )
+    resolved_key = config._resolve_api_key_ref(ref)
+    return {
+        "id": row.get("id"),
+        "kind": row.get("kind"),
+        "label": row.get("label"),
+        "base_url": _redact_url(row.get("base_url") or "") if row.get("base_url") else None,
+        "api_key_ref": safe_ref,
+        "api_key_configured": bool(resolved_key),
+        "model": row.get("model"),
+        "enabled": bool(row.get("enabled", True)),
+    }
+
+
+_MALFORMED_ROW_PLACEHOLDER = {
+    "id": None, "kind": None, "label": None, "base_url": None,
+    "api_key_ref": "", "api_key_configured": False, "model": None,
+    "enabled": False, "registered": False, "build_error": "malformed row",
+}
+
+
+def _providers_payload() -> dict:
+    """Shape `providers.json` for /api/status + /api/providers.
+
+    fix-all v1 H4: each row is redacted under its own try/except so a
+    single malformed entry (e.g. a hand-edit that set `api_key_ref` to
+    `null`) can't crash `/api/status` and brick the entire frontend
+    (chip, heartbeat, rollback effect all share that endpoint).
+
+    fix-all v1 M4: each row also carries `registered` + `build_error`
+    so the UI can show a red dot on rows that survived JSON validation
+    but failed at backend-construction time (env var unset, invalid
+    base_url, etc.) instead of silently going stale.
+    """
+    data = config.load_providers()
+    out_rows: list[dict] = []
+    # Late-import to avoid circular: router is constructed in this same
+    # module. By the time _providers_payload is called, `router` exists.
+    live_ids = set(router.backends.keys())
+    for r in data.get("providers", []):
+        try:
+            redacted = _redact_provider_row(r)
+        except Exception as exc:  # noqa: BLE001 — malformed row must not 500
+            logger.warning(
+                "providers.json contains malformed row (%s); surfacing as placeholder",
+                type(exc).__name__,
+            )
+            placeholder = dict(_MALFORMED_ROW_PLACEHOLDER)
+            placeholder["id"] = r.get("id") if isinstance(r, dict) else None
+            out_rows.append(placeholder)
+            continue
+        try:
+            reason = router.diagnose_row(r) if isinstance(r, dict) else "non-dict row"
+        except Exception as exc:  # noqa: BLE001 — diagnosis is best-effort
+            reason = f"diagnose raised {type(exc).__name__}"
+        redacted["registered"] = redacted["id"] in live_ids
+        redacted["build_error"] = reason if reason and not redacted["registered"] else None
+        out_rows.append(redacted)
+    return {
+        "version": data.get("version", config.PROVIDERS_SCHEMA_VERSION),
+        "providers": out_rows,
+        "default_backend_id": data.get("default_backend_id"),
+    }
 
 
 def _embedding_presets_payload() -> list[dict]:
@@ -4359,6 +4454,222 @@ async def switch_embedding_preset(req: EmbeddingSwitchRequest):
     }
 
 
+# ── Providers (LLM provider matrix) ─────────────────────────────────
+class ProviderUpsertRequest(BaseModel):
+    """Body for `PUT /api/providers/{id}`. `id` comes from the path.
+
+    `api_key_ref` must use the env: or literal: prefix — see the
+    inline `api_key_ref` form in the Settings UI for the helper text
+    users see. `base_url` is required for openai_compat[_local].
+    """
+    kind: Literal["openai_compat", "openai_compat_local", "anthropic"]
+    label: str = Field(..., min_length=1, max_length=80)
+    base_url: str | None = Field(None, max_length=512)
+    api_key_ref: str = Field(..., min_length=1, max_length=512)
+    model: str = Field(..., min_length=1, max_length=200)
+    enabled: bool = True
+    model_config = {"extra": "forbid"}
+
+
+class ProviderDefaultRequest(BaseModel):
+    provider_id: str = Field(..., min_length=1, max_length=120)
+    model_config = {"extra": "forbid"}
+
+
+_PROVIDER_ID_RE = re.compile(r"^[A-Za-z0-9_\-]{1,80}$")
+# fix-all v2 L6: hard cap on total provider rows. /api/providers is
+# unauthenticated; without this, anyone who can reach the API can PUT
+# 10k rows → a 13MB providers.json that's loaded on every router.reload
+# and re-redacted on every /api/status poll. 32 is generous (typical
+# operator deploys 1-3 providers) and below any plausible legitimate
+# ceiling. Existing rows can update freely; only new-row PUTs over
+# the cap return 409.
+_PROVIDER_MAX_ROWS = 32
+
+
+def _validate_provider_id(pid: str) -> None:
+    """Provider IDs are used as router-dict keys and as path segments in
+    `/api/providers/{id}` — keep them strict to avoid surprise quoting.
+    """
+    if not _PROVIDER_ID_RE.match(pid):
+        raise HTTPException(
+            422, f"provider id must match {_PROVIDER_ID_RE.pattern!r}, got {pid!r}",
+        )
+
+
+@app.get("/api/providers", tags=["system"], summary="List configured LLM providers")
+async def list_providers():
+    return _providers_payload()
+
+
+@app.put("/api/providers/{provider_id}", tags=["system"],
+         summary="Create or update an LLM provider")
+async def upsert_provider(provider_id: str, req: ProviderUpsertRequest):
+    _validate_provider_id(provider_id)
+    row = {
+        "id": provider_id,
+        "kind": req.kind,
+        "label": req.label,
+        "base_url": req.base_url,
+        "api_key_ref": req.api_key_ref,
+        "model": req.model,
+        "enabled": req.enabled,
+    }
+    ok, err = config._validate_provider_dict(row)
+    if not ok:
+        raise HTTPException(422, f"provider row rejected: {err}")
+    if req.api_key_ref.startswith("literal:"):
+        logger.warning(
+            "provider %r upserted with literal: api_key_ref — "
+            "consider env:VAR instead so the key stays out of artifacts/providers.json",
+            provider_id,
+        )
+
+    async with _PROVIDERS_LOCK:
+        data = config.load_providers()
+        existing = data.get("providers", [])
+        is_update = any(r.get("id") == provider_id for r in existing)
+        if not is_update and len(existing) >= _PROVIDER_MAX_ROWS:
+            raise HTTPException(
+                409,
+                f"provider row cap reached ({_PROVIDER_MAX_ROWS}); "
+                f"delete an unused row before adding a new one",
+            )
+        rows = [r for r in existing if r.get("id") != provider_id]
+        rows.append(row)
+        data["providers"] = rows
+        # If this is the only enabled row, auto-promote it to default —
+        # otherwise we'd have a registered backend with no way to be
+        # picked by `get_backend` for unmapped task_types.
+        enabled_ids = [r["id"] for r in rows if r.get("enabled", True)]
+        if data.get("default_backend_id") not in enabled_ids:
+            data["default_backend_id"] = enabled_ids[0] if enabled_ids else None
+        try:
+            config.save_providers(data)
+        except OSError as exc:
+            raise HTTPException(500, f"failed to persist providers.json: {exc}") from exc
+        router.reload()
+
+    return {
+        "ok": True,
+        "provider_id": provider_id,
+        "registered": provider_id in router.backends,
+        "providers": _providers_payload(),
+    }
+
+
+@app.delete("/api/providers/{provider_id}", tags=["system"],
+            summary="Remove an LLM provider")
+async def delete_provider(provider_id: str):
+    _validate_provider_id(provider_id)
+    async with _PROVIDERS_LOCK:
+        data = config.load_providers()
+        rows = data.get("providers", [])
+        match = next((r for r in rows if r.get("id") == provider_id), None)
+        if match is None:
+            raise HTTPException(404, f"provider {provider_id!r} not found")
+        if data.get("default_backend_id") == provider_id:
+            raise HTTPException(
+                409,
+                f"provider {provider_id!r} is the default backend; "
+                f"POST /api/providers/default to reassign before deleting",
+            )
+        enabled_rows = [r for r in rows if r.get("enabled", True) and r.get("id") != provider_id]
+        if not enabled_rows:
+            raise HTTPException(
+                409,
+                f"provider {provider_id!r} is the only enabled provider; "
+                f"add another before deleting (or the router would have no backends)",
+            )
+        data["providers"] = [r for r in rows if r.get("id") != provider_id]
+        try:
+            config.save_providers(data)
+        except OSError as exc:
+            raise HTTPException(500, f"failed to persist providers.json: {exc}") from exc
+        router.reload()
+    return {"ok": True, "providers": _providers_payload()}
+
+
+@app.post("/api/providers/{provider_id}/test", tags=["system"],
+          summary="Ping an LLM provider with a 1-token probe")
+async def test_provider(provider_id: str):
+    """Build a transient backend from the saved row and run a 5-token
+    `ping` completion with a 5s wall-clock cap. The transient instance
+    is GC'd at the end of the request — no side effect on
+    `router.backends`, so this endpoint is safe to call against a row
+    the user is still drafting.
+
+    fix-all v1 H2: the transient instance is constructed with
+    http_timeout=5.0 so the SDK's underlying httpx client aborts at the
+    same boundary as our asyncio.wait_for. Without this, asyncio.wait_for
+    would cancel the awaitable while the sync executor thread kept
+    running until OPENAI_HTTP_TIMEOUT_SECONDS (default 600s), pinning
+    one of 24 worker slots per stalled /test call.
+
+    fix-all v1 M1+M4: failure responses no longer echo `detail` or
+    `str(exc)`. The openai SDK's APIError.__str__ can include parts of
+    the request body, the upstream response body, and (depending on
+    base_url) IMDS / RFC1918 reflected content — combined with the H1
+    SSRF guard rollback, dropping the field closes the exfil channel.
+    The reason from `_build_backend` is surfaced as `error_type` so the
+    UI still has a diagnostic signal.
+    """
+    _validate_provider_id(provider_id)
+    data = config.load_providers()
+    row = next((r for r in data.get("providers", []) if r.get("id") == provider_id), None)
+    if row is None:
+        raise HTTPException(404, f"provider {provider_id!r} not found")
+    inst, reason = router._build_backend(row, http_timeout=5.0)
+    if inst is None:
+        return {"ok": False, "error_type": "build_failed", "reason": reason}
+    start = time.time()
+    try:
+        resp = await asyncio.wait_for(
+            inst.complete("ping", max_tokens=5, temperature=0.0),
+            timeout=5.0,
+        )
+    except asyncio.TimeoutError:
+        return {"ok": False, "error_type": "TimeoutError", "latency_ms": 5000}
+    except Exception as exc:  # noqa: BLE001 — surface upstream errors as data
+        return {
+            "ok": False,
+            "error_type": type(exc).__name__,
+            "latency_ms": int((time.time() - start) * 1000),
+        }
+    return {
+        "ok": True,
+        "latency_ms": int((time.time() - start) * 1000),
+        "model_echo": getattr(resp, "model", "") or row.get("model"),
+        "output_tokens": getattr(resp, "output_tokens", 0),
+    }
+
+
+@app.post("/api/providers/default", tags=["system"],
+          summary="Set the active default LLM provider")
+async def set_default_provider(req: ProviderDefaultRequest):
+    _validate_provider_id(req.provider_id)
+    async with _PROVIDERS_LOCK:
+        data = config.load_providers()
+        rows = data.get("providers", [])
+        match = next((r for r in rows if r.get("id") == req.provider_id), None)
+        if match is None:
+            raise HTTPException(404, f"provider {req.provider_id!r} not found")
+        if not match.get("enabled", True):
+            raise HTTPException(
+                409, f"provider {req.provider_id!r} is disabled; enable it before setting as default",
+            )
+        data["default_backend_id"] = req.provider_id
+        try:
+            config.save_providers(data)
+        except OSError as exc:
+            raise HTTPException(500, f"failed to persist providers.json: {exc}") from exc
+        # reload() rebuilds the dict; not strictly required (default_id
+        # resolution reads providers.json fresh on each call), but keeps
+        # the contract uniform — every mutation goes through reload().
+        router.reload()
+    return {"ok": True, "default_backend_id": req.provider_id, "providers": _providers_payload()}
+
+
 # ── Status / health ──────────────────────────────────────────────────
 @app.get("/api/status", tags=["system"], summary="System status and model usage")
 async def status_endpoint():
@@ -4399,7 +4710,18 @@ async def status_endpoint():
         # un-attempted; otherwise a short reason string (e.g.
         # "mineru-api CLI not found", "health check timed out").
         "mineru_server_disabled_reason": _mineru_server_disabled_reason(),
-        "default_backend": config.DEFAULT_BACKEND,
+        # Providers matrix: redacted view of the runtime-editable provider
+        # table. The legacy {default_backend, openai_*, claude_*, local_*}
+        # keys below are retained for older frontend code paths.
+        "providers": _providers_payload(),
+        # fix-all v1 M2: previously this returned `config.DEFAULT_BACKEND`
+        # (the env-source value, ignored by routing once a UI default is
+        # set). External scripts reading `.default_backend` were getting
+        # stale data the moment the operator switched defaults via the
+        # UI. Now mirrors the actual routing decision; the legacy
+        # `*_model` fields below still reflect env-source values and are
+        # kept only for compat with pre-providers-matrix consumers.
+        "default_backend": router._active_default_id() or config.DEFAULT_BACKEND,
         "openai_model": config.OPENAI_MODEL,
         "openai_base_url": _redact_url(config.OPENAI_BASE_URL),
         "openai_api_key_configured": bool(config.OPENAI_API_KEY),

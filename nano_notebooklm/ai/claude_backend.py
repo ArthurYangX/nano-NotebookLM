@@ -16,10 +16,16 @@ from nano_notebooklm.types import LLMResponse
 class ClaudeBackend(LLMBackend):
     name = "claude"
 
-    def __init__(self, api_key: str = "", model: str = ""):
+    def __init__(self, api_key: str = "", model: str = "", http_timeout: float | None = None):
         self.api_key = api_key or config.ANTHROPIC_API_KEY
         self.model = model or config.CLAUDE_MODEL
-        self.client = anthropic.AsyncAnthropic(api_key=self.api_key)
+        # `http_timeout` is honoured for parity with OpenAIBackend so the
+        # `/api/providers/{id}/test` endpoint can drop the ceiling on a
+        # misconfigured row. None → SDK default.
+        if http_timeout is not None:
+            self.client = anthropic.AsyncAnthropic(api_key=self.api_key, timeout=http_timeout)
+        else:
+            self.client = anthropic.AsyncAnthropic(api_key=self.api_key)
 
     async def complete(
         self,

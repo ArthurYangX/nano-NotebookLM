@@ -1,36 +1,103 @@
 /* global React */
 
-// R4-2: Processing now consumes the NDJSON upload stream from
-// /api/upload/{cid}, rendering one row per stage with a real percent
-// progress bar that ticks as `{type:"stage", stage, progress}` events
-// arrive. On `error` the row keeps its last percent and shows a retry
-// button. On `done` all rows flip to ✓.
+// R4-2: Processing consumes the status snapshot from
+// /api/upload/status/{task_id}, rendering one row per stage with a real
+// percent progress bar that ticks as the bg task mutates state.
+// On error the row keeps its last percent and shows a retry button.
+// On done all rows flip to ✓.
+//
+// 2026-05-20: ETA countdown + per-stage sub copy folds in total_pages
+// so users see "0 / 69 页" during extracting. ETA sourced from backend's
+// _estimate_upload_duration_seconds (page-count × engine baseline +
+// mineru cold start). The 5 rendered stages mirror UPLOAD_STAGES on
+// the backend 1:1 — no UI-only synthesis. A briefly-considered
+// "Preparing" UI-only step was dropped because the ETA row above
+// already conveys "files saved, awaiting first event" via the elapsed
+// timer + estimate, making the extra row pure noise.
 //
 // Props (all optional except `fileName`):
 //   - fileName: the uploaded file's display name
-//   - stages: { chunking: number, embedding: number, kg_stage_a: number, kg_stage_b: number }
+//   - stages: { chunking: {progress,detail?}, embedding: ..., kg_stage_a: ..., kg_stage_b: ... }
 //   - errorStage: which stage errored (string) — null when ok
 //   - errorMsg: caller-supplied summary
-//   - done: boolean — true when the {type:"done"} event arrived
+//   - done: boolean — true when the task hit terminal "done" state
 //   - onRetry: optional callback when the retry button is clicked
+//   - estimatedSeconds: backend-provided ETA for the whole pipeline
+//   - totalPages: total PDF pages + PPTX slides across uploaded files
+//   - startedAt: client-side ms epoch the upload was initiated (for the
+//                live elapsed timer); falls back to now() on first paint
 //
 // Backwards compat: when `stages` / `done` aren't provided, falls back
 // to the legacy `activeStep` integer that app.jsx still emits during
 // the brief 0-event window before the first stream tick.
 const STAGE_DEFS = [
-  { key: "chunking",     lbl: "Chunking",       sub: "Extracting text + segmenting" },
+  { key: "extracting",   lbl: "Extracting",     sub: "MinerU / PyMuPDF · pages → text" },
+  { key: "chunking",     lbl: "Chunking",       sub: "Segmenting into 1.5KB chunks" },
   { key: "embedding",    lbl: "Embedding",      sub: "FAISS vector + BM25 index" },
   { key: "kg_stage_a",   lbl: "KG Stage A",     sub: "Macro topics + course overview" },
   { key: "kg_stage_b",   lbl: "KG Stage B",     sub: "Per-chunk concepts + relations" },
 ];
 
-function Processing({ fileName, activeStep, stages, errorStage, errorMsg, done, onRetry }) {
+// Locale-aware clock formatter. Suffixes follow the user's UI language: CN uses
+// the all-CJK form (5秒 / 3分2秒 / 1小时), EN uses compact (5s / 3m2s / 1h).
+function _fmtClock(secs, lang) {
+  if (!Number.isFinite(secs) || secs < 0) return "—";
+  const cn = (lang || "en") === "zh";
+  const S = cn ? "秒" : "s";
+  const M = cn ? "分" : "m";
+  const H = cn ? "小时" : "h";
+  const s = Math.floor(secs);
+  if (s < 60) return `${s}${S}`;
+  const m = Math.floor(s / 60);
+  const r = s % 60;
+  if (m < 60) return r === 0 ? `${m}${M}` : `${m}${M}${r}${S}`;
+  const h = Math.floor(m / 60);
+  const mm = m % 60;
+  return mm === 0 ? `${h}${H}` : `${h}${H}${mm}${M}`;
+}
+
+// fix-all v2 LOW F6: scope the per-second re-render to just the clock display
+// so the parent <Processing/> tree (6 stage rows + bars + status icons) does
+// not re-render once per second for 5-15 min per upload.
+function ElapsedClock({ startedAt, estimatedSeconds, done, errorStage }) {
+  const t = useT();
+  const lang = React.useContext(window.LangContext) || "en";
+  const [now, setNow] = React.useState(() => Date.now());
+  React.useEffect(() => {
+    if (done || errorStage) return undefined;
+    const iv = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(iv);
+  }, [done, errorStage]);
+  const startedMs = Number.isFinite(startedAt) ? startedAt : now;
+  const elapsedSecs = Math.max(0, Math.floor((now - startedMs) / 1000));
+  const remainingSecs = Number.isFinite(estimatedSeconds)
+    ? Math.max(0, estimatedSeconds - elapsedSecs)
+    : null;
+  return (
+    <span>
+      {t("processing.elapsed")} <strong>{_fmtClock(elapsedSecs, lang)}</strong>
+      {remainingSecs != null && remainingSecs > 0 && !done && !errorStage && (
+        <span> · {t("processing.remaining", { t: _fmtClock(remainingSecs, lang) })}</span>
+      )}
+    </span>
+  );
+}
+
+function Processing({
+  fileName, activeStep, stages, errorStage, errorMsg, done, onRetry,
+  estimatedSeconds, totalPages, startedAt,
+}) {
+  const t = useT();
+  const lang = React.useContext(window.LangContext) || "en";
   const useStream = stages && typeof stages === "object";
 
-  // 2026-05-16: stage shape is now `{progress, detail}` (background-task
-  // status endpoint) instead of a flat percent number. Tolerate both
-  // shapes so a stale serialized state from before the refactor doesn't
-  // throw.
+  // fix-all v2 LOW F6: per-second timer state lives in <ElapsedClock/>
+  // so the parent tree (stage rows + bars) doesn't re-render every
+  // second.
+
+  // 2026-05-16: stage shape is `{progress, detail}` (background-task
+  // status endpoint). Tolerate the flat-number shape too for legacy
+  // serialized state from before the refactor.
   function pctOf(key) {
     if (!useStream) return 0;
     const v = stages[key];
@@ -60,12 +127,61 @@ function Processing({ fileName, activeStep, stages, errorStage, errorMsg, done, 
     return pctOf(key);
   }
 
+  // Sub-line per step. Extracting gets the page count when available.
+  function stageSub(s) {
+    if (s.key === "extracting" && totalPages > 0) {
+      const pct = pctOf("extracting");
+      // H2 fix (2026-05-20): when a pptx file is present, the backend
+      // carves extracting 0-50% for the LibreOffice sidecar render
+      // (which does NOT extract any pages — it just converts pptx →
+      // pdf) and 50-99% for the real text extraction. Previously the
+      // displayed "done" pages ramped linearly 0→N across 0-100%, so
+      // mid-render the user saw e.g. "17 / 69 页" when in fact 0 pages
+      // had been extracted. Fix: clamp displayed `done` to 0 while
+      // pct < 50, then remap done across [50, 99] → [0, N]. For
+      // pptx-free uploads extracting jumps from 0 → high% within the
+      // first per-file callback tick, so the counter only sits at
+      // "0 / N" for a brief instant before catching up.
+      let done;
+      if (pct < 50) {
+        done = 0;
+        return `MinerU / PyMuPDF · ${t("processing.pages_progress", { done, total: totalPages })} · ${t("processing.with_pptx_render")}`;
+      } else {
+        const realPct = (pct - 50) / 49;  // 0..1 over [50, 99]
+        done = Math.min(totalPages, Math.round(totalPages * realPct));
+      }
+      return `MinerU / PyMuPDF · ${t("processing.pages_progress", { done, total: totalPages })}`;
+    }
+    return s.sub;
+  }
+
   return (
     <div className="processing">
       <div className="processing-card">
         <div className="eye mono">Ingesting new source</div>
         <h2 className="serif">Preparing your document</h2>
         <div className="fname mono">{fileName}</div>
+        {useStream && (estimatedSeconds > 0 || totalPages > 0) && (
+          <div className="processing-eta mono">
+            {estimatedSeconds > 0 && (
+              <span>
+                {t("processing.estimate_about")} <strong>{_fmtClock(estimatedSeconds, lang)}</strong>
+                {totalPages > 0 && <span> · {t("processing.pages_total", { n: totalPages })}</span>}
+              </span>
+            )}
+            {estimatedSeconds <= 0 && totalPages > 0 && (
+              <span>{t("processing.pages_total", { n: totalPages })}</span>
+            )}
+            <span className="processing-eta-sep"> · </span>
+            {/* fix-all v2 LOW F6: clock isolated in its own component */}
+            <ElapsedClock
+              startedAt={startedAt}
+              estimatedSeconds={estimatedSeconds}
+              done={done}
+              errorStage={errorStage}
+            />
+          </div>
+        )}
         <div className="processing-steps">
           {STAGE_DEFS.map((s, i) => {
             const cls = stageCls(i, s.key);
@@ -78,7 +194,7 @@ function Processing({ fileName, activeStep, stages, errorStage, errorMsg, done, 
                 <span className="idx">{glyph}</span>
                 <span style={{ flex: 1 }}>
                   <span className="lbl">{s.lbl}</span>
-                  <div className="sub mono">{s.sub}</div>
+                  <div className="sub mono">{stageSub(s)}</div>
                   {pct !== null && (
                     <div className="pstep-bar" aria-label={`${s.lbl} ${pct}%`}>
                       <div className="pstep-bar-fill" style={{ width: `${pct}%` }}></div>
@@ -93,7 +209,7 @@ function Processing({ fileName, activeStep, stages, errorStage, errorMsg, done, 
         {errorStage && (
           <div className="processing-error">
             <div className="processing-error-msg">
-              {errorMsg || "上传管道在 " + errorStage + " 阶段失败"}
+              {errorMsg || t("processing.failed_at", { stage: errorStage })}
             </div>
             {onRetry && (
               <button className="processing-retry mono" onClick={onRetry}>retry</button>

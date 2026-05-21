@@ -48,9 +48,27 @@ StreamItem = Union[str, TruncationSignal]
 
 
 class LLMBackend(ABC):
-    """Base class for all LLM backends."""
+    """Base class for all LLM backends.
 
-    name: str
+    ``name`` is the routing key — set to the class-family default
+    ("openai" / "claude") at the class level, then overridden to the
+    provider id ("openai-main", "claude-main", or a user-added id) by
+    ``ModelRouter._build_backend`` at construction time so log lines
+    and cross-review's "alternate" lookup track the provider id
+    instead of the class family.
+
+    ``kind`` is the providers-matrix shape ("openai_compat",
+    "openai_compat_local", "anthropic"). Default is "" so any future
+    code path that instantiates a backend without going through
+    ``_build_backend`` (e.g. unit tests, direct construction in a CLI
+    helper) doesn't ``AttributeError`` on ``getattr(b, "kind", "")``
+    — but callers that need to filter by kind (``get_openai_compat``,
+    the agent-stream endpoint) must still go through
+    ``_build_backend`` so the value is populated correctly.
+    """
+
+    name: str = ""
+    kind: str = ""
 
     @abstractmethod
     async def complete(

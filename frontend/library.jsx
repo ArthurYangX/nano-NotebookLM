@@ -7,13 +7,14 @@ function FileIcon({ type }) {
 }
 
 function SourceItem({ s, active, onPick, onCheckboxClick }) {
+  const t = useT();
   return (
     <div className={"source-item" + (active ? " active" : "")} onClick={() => onPick(s.id)}>
       <FileIcon type={s.type} />
       <div className="title">{s.title}</div>
       <div
         className={"check" + (s.checked ? " on" : "")}
-        title="Click to toggle · Shift+Click to range-select"
+        title={t("library.row_toggle_tip")}
         onClick={(e) => { e.stopPropagation(); onCheckboxClick(e, s.id); }}
       ></div>
       <div className="meta mono">{s.meta}</div>
@@ -22,6 +23,7 @@ function SourceItem({ s, active, onPick, onCheckboxClick }) {
 }
 
 function Library({ sources, collections, activeId, onPick, onToggle, onToggleMany, onStartUpload, uploading }) {
+  const t = useT();
   // Collections list — prefer the explicit prop (lifted to React state
   // in App by review-swarm v2 fix-soon #8). Fall back to the legacy
   // window global for any host that hasn't migrated yet (e.g. demo
@@ -104,8 +106,8 @@ function Library({ sources, collections, activeId, onPick, onToggle, onToggleMan
   return (
     <aside className="library" data-screen-label="Library">
       <div className="lib-section">
-        <h3>Sources</h3>
-        <span className="count mono">{checkedCount} / {total} in context</span>
+        <h3>{t("library.sources")}</h3>
+        <span className="count mono">{t("library.in_context", { n: checkedCount, total })}</span>
       </div>
 
       {total > 0 && (
@@ -117,21 +119,21 @@ function Library({ sources, collections, activeId, onPick, onToggle, onToggleMan
             className="lib-bulk-btn"
             onClick={selectAll}
             disabled={allChecked}
-            title="勾选全部 sources / Select all"
-          >全选</button>
+            title={t("library.select_all_tip")}
+          >{t("library.select_all")}</button>
           <button
             className="lib-bulk-btn"
             onClick={selectNone}
             disabled={noneChecked}
-            title="清空所有勾选 / Select none"
-          >全不选</button>
+            title={t("library.select_none_tip")}
+          >{t("library.select_none")}</button>
           <button
             className="lib-bulk-btn"
             onClick={invertSelection}
-            title="反选 / Invert selection"
-          >反选</button>
+            title={t("library.invert_tip")}
+          >{t("library.invert")}</button>
           <span style={{ marginLeft: "auto", color: "var(--ink-3)" }}>
-            Shift+Click 区间选
+            {t("library.shift_hint")}
           </span>
         </div>
       )}
@@ -144,7 +146,7 @@ function Library({ sources, collections, activeId, onPick, onToggle, onToggleMan
         onClick={onStartUpload}
       >
         <div className="plus">+</div>
-        <div>Drop files or click to upload</div>
+        <div>{t("library.drop")}</div>
         <div className="hint">pdf · pptx · docx · png · md</div>
       </div>
 
@@ -170,7 +172,7 @@ function Library({ sources, collections, activeId, onPick, onToggle, onToggleMan
 
       <div className="collections">
         <div className="lib-section" style={{ padding: "4px 4px 6px" }}>
-          <h3>Collections</h3>
+          <h3>{t("library.collections")}</h3>
         </div>
         {collectionsList.map(c => (
           <div key={c.id} className="collection-row">

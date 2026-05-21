@@ -170,6 +170,7 @@ function DocumentPdfFrame({ courseId, docId, sourceFile, activePage, navEpoch, o
 }
 
 function Reader({ sources, activeCourse, activeId, activePage, onHighlight, highlightedId, onCite, notice, navEpoch }) {
+  const t = useT();
   // Persisted global preference: collapse PDFium's bookmarks/thumbnails
   // side panel (default hidden — see StudyState.loadPdfOutlineHidden).
   const [pdfOutlineHidden, setPdfOutlineHiddenRaw] = useStateR(
@@ -328,11 +329,9 @@ function Reader({ sources, activeCourse, activeId, activePage, onHighlight, high
             <button
               className="pdf-outline-toggle mono"
               onClick={togglePdfOutline}
-              title={pdfOutlineHidden
-                ? "显示 PDF 书签 / 缩略图侧栏"
-                : "隐藏 PDF 书签 / 缩略图侧栏"}
+              title={pdfOutlineHidden ? t("reader.show_outline_tip") : t("reader.hide_outline_tip")}
             >
-              {pdfOutlineHidden ? "📑 显示索引" : "📑 隐藏索引"}
+              {pdfOutlineHidden ? t("reader.show_outline") : t("reader.hide_outline")}
             </button>
             <DocumentPdfFrame
               courseId={activeCourse}

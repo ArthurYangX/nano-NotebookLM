@@ -69,7 +69,13 @@ _REASONING_EFFORT_VALID = _REASONING_EFFORT in {"low", "medium", "high"}
 class OpenAIBackend(LLMBackend):
     name = "openai"
 
-    def __init__(self, api_key: str = "", base_url: str = "", model: str = ""):
+    def __init__(
+        self,
+        api_key: str = "",
+        base_url: str = "",
+        model: str = "",
+        http_timeout: float | None = None,
+    ):
         self.api_key = api_key or config.OPENAI_API_KEY
         self.base_url = (base_url or config.OPENAI_BASE_URL).rstrip("/")
         self.model = model or config.OPENAI_MODEL
@@ -80,11 +86,16 @@ class OpenAIBackend(LLMBackend):
         self._is_deepseek = "deepseek" in self.base_url.lower()
         # Use sync client for codex compatibility. Configure httpx timeout so a
         # stalled upstream actually aborts — `asyncio.wait_for` alone can't
-        # cancel a sync call running in a thread executor.
+        # cancel a sync call running in a thread executor (the executor thread
+        # keeps running until httpx's own timeout fires, occupying a worker
+        # slot). The `http_timeout` kwarg lets callers (specifically the
+        # `/api/providers/{id}/test` endpoint) drop the ceiling so a misconfig
+        # row can't pin 24 executor threads for the full 600s default.
+        effective_timeout = http_timeout if http_timeout is not None else _DEFAULT_HTTP_TIMEOUT
         self.client = openai.OpenAI(
             api_key=self.api_key,
             base_url=self.base_url,
-            timeout=httpx.Timeout(_DEFAULT_HTTP_TIMEOUT, connect=10.0),
+            timeout=httpx.Timeout(effective_timeout, connect=10.0),
         )
 
     async def complete(

@@ -26,6 +26,7 @@ const KG_ZOOM_MAX = 3;
 // deep-dive affordances remain on the same DOM nodes.
 
 function MindMap({ data, layout, courseId, highlightedId, onNodeClick, onSourceClick, onPractice, onDataChange }) {
+  const t = useT();
   // fix-all v1 #A10: per-instance marker IDs so two MindMap subtrees
   // (e.g. course-compare view, split-pane) don't fight over global
   // SVG <marker> ids. React.useId returns a stable, unique identifier
@@ -414,7 +415,7 @@ function MindMap({ data, layout, courseId, highlightedId, onNodeClick, onSourceC
     const newId = StudyState.newMindmapNodeId();
     commitOps([{
       op: "add_node", id: newId,
-      label: "新节点", parent_id: parentId,
+      label: t("mindmap.new_node"), parent_id: parentId,
     }]);
     // Auto-select + edit the new node so the student types the label immediately.
     setSelectedId(newId);
@@ -899,11 +900,18 @@ function MindMap({ data, layout, courseId, highlightedId, onNodeClick, onSourceC
           transition: isDraggingSomething ? "none" : "transform 200ms ease-out"
         }}
       >
-        {/* SVG edges */}
+        {/* SVG edges. overflow="visible": SVG by default clips children to
+            its viewport (2400×1800 here). Big graphs push leaves past that
+            box → edges silently disappear while node divs (outside the SVG)
+            still render. overflow="visible" lifts the clip so a path with
+            an endpoint at e.g. x=3000 still draws. The width/height +
+            negative left/top are kept so the SVG's coord origin stays
+            aligned with the +1200/+900 translation in the path d="" below. */}
         <svg
           className="mm-edge"
           width="2400"
           height="1800"
+          overflow="visible"
           style={{ left: -1200, top: -900 }}
         >
           <defs>
@@ -1081,7 +1089,7 @@ function MindMap({ data, layout, courseId, highlightedId, onNodeClick, onSourceC
 
       {allRelationsFiltered && (
         <div className="kg-filter-empty" role="status">
-          已过滤所有关系 · isolated nodes remain
+          {t("mindmap.filtered_all")}
         </div>
       )}
 
@@ -1089,8 +1097,8 @@ function MindMap({ data, layout, courseId, highlightedId, onNodeClick, onSourceC
         <button
           type="button"
           className="mindmap-legend-toggle"
-          title="Show legend"
-          aria-label="显示图例"
+          title={t("mindmap.show_legend")}
+          aria-label={t("mindmap.show_legend")}
           onClick={toggleLegend}
         >▤</button>
       ) : (
@@ -1098,9 +1106,9 @@ function MindMap({ data, layout, courseId, highlightedId, onNodeClick, onSourceC
           <button
             type="button"
             className="mindmap-legend-close"
-            title="Hide legend"
+            title={t("mindmap.hide_legend")}
             onClick={toggleLegend}
-            aria-label="隐藏图例"
+            aria-label={t("mindmap.hide_legend")}
           >×</button>
           <div className="row"><div className="sw" style={{ background: "var(--ink)", borderColor: "var(--ink)" }}></div>Chapter · {(prepared.rootIds || []).length || visNodes.filter(n => n.kind === "root").length}</div>
           <div className="row"><div className="sw" style={{ background: "var(--accent-soft)", borderColor: "var(--accent)" }}></div>Topic · {visNodes.filter(n => n.kind === "branch").length}</div>
@@ -1144,7 +1152,14 @@ function MindMap({ data, layout, courseId, highlightedId, onNodeClick, onSourceC
         );
       })()}
       {selected && selected.kind !== "root" && (
-        <aside className="mindmap-detail">
+        // stopPropagation: without it, mousedown on a source-link button
+        // bubbles to .mindmap-wrap → startCanvasPan sets dragRef as "pan",
+        // and the window-level mouseup handler hits the "tap on canvas
+        // background" branch (line ~668) → setSelectedId(null) unmounts
+        // this aside *before* React dispatches the button's click, so the
+        // citation modal never opens. Mirrors the same guard on the
+        // .mindmap-toolbar and the pendingEdge picker.
+        <aside className="mindmap-detail" onMouseDown={(e) => e.stopPropagation()}>
           <h3>{selected.label}</h3>
           <p>{selected.definition || "No definition captured yet."}</p>
           {onPractice && (
