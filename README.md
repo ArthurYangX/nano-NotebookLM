@@ -42,15 +42,16 @@ LM Studio / llama.cpp**).
 [ React 18 (CDN, no build) ]
             ↓
 [ FastAPI on :8000 ]
-   ├── /api/chat     ── intent router → graphrag → RAG → translate → cross-course → general
-   ├── /api/notes    ── per-file streaming LaTeX + review pass + tectonic PDF
-   ├── /api/quiz     ── practice quiz generation
-   ├── /api/exam-prep── self-evolving topic bank
-   ├── /api/mindmap  ── KG read/write with edit overlay
-   ├── /api/upload   ── background-task pipeline (chunking → embedding → KG)
-   └── /api/status   ── available backends, embedding mode, health
+   ├── /api/chat       ── intent router → graphrag → RAG → translate → cross-course → general
+   ├── /api/notes      ── per-file streaming LaTeX + review pass + tectonic PDF
+   ├── /api/quiz       ── practice quiz generation
+   ├── /api/exam-prep  ── self-evolving topic bank
+   ├── /api/mindmap    ── KG read/write with edit overlay
+   ├── /api/upload     ── background-task pipeline (extracting → chunking → embedding → KG)
+   ├── /api/providers  ── add / edit / delete / test / set-default LLM providers
+   └── /api/status     ── available backends, embedding mode, health
             ↓
-[ LLM router ] ─── openai / claude / local (any combination)
+[ LLM router ] ─── any N providers (OpenAI-compatible + Anthropic), hot-swappable via UI
 [ Embeddings ] ─── sentence-transformers (offline) or OpenAI-compatible API
 [ Storage    ] ─── FAISS + BM25 + NetworkX KG  (under ./artifacts/)
 ```
@@ -91,6 +92,27 @@ pytest                         # unit + API smoke tests; no LLM keys required
 You need **at least one** of: `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or
 `LOCAL_LLM_BASE_URL + LOCAL_LLM_MODEL`. All three can coexist — the
 frontend chip in the topbar cycles between them.
+
+### Editing providers from the UI (no restart)
+
+`.env` is **just the first-boot seed**. On first start the server
+synthesises `artifacts/providers.json` from your env vars and from then
+on the Settings page is the source of truth: add a second OpenAI-compat
+endpoint, swap a model, set the active default, or one-click
+**Test → 5s ping** — all without restarting. Keys can stay in `.env`
+(`api_key_ref: env:VAR`) or be stored inline if you prefer
+(`api_key_ref: literal:sk-…`; written 0o600, never echoed in any
+response).
+
+See the `Settings → AI Backend & Models` table or the new endpoints:
+
+| Endpoint                                    | Purpose                              |
+|---------------------------------------------|--------------------------------------|
+| `GET    /api/providers`                     | List configured providers (redacted) |
+| `PUT    /api/providers/{id}`                | Create or update                     |
+| `DELETE /api/providers/{id}`                | Remove (refuses default / last row)  |
+| `POST   /api/providers/{id}/test`           | 5-token ping with 5s timeout         |
+| `POST   /api/providers/default`             | Switch active default                |
 
 ### Cloud providers (OpenAI-compatible)
 
@@ -176,9 +198,11 @@ curl -X POST http://localhost:8000/api/chat \
   -d '{"question": "What is a receptive field?", "course_id": null, "backend": "openai"}'
 ```
 
-`backend` is optional — set it to `"openai"`, `"claude"`, or `"local"` to
-override the default routing for a single call. Omit it to use whichever
-one is configured as `DEFAULT_BACKEND`.
+`backend` is optional — set it to any provider id from
+`GET /api/providers` (e.g. `"openai-main"`, `"claude-main"`, or a
+user-added `"openai-alt"`) to override the default routing for a single
+call. Unknown ids fall back to the active default with a server-side
+warn log, so a stale localStorage chip value won't 422 mid-conversation.
 
 ---
 

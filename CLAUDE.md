@@ -42,14 +42,20 @@ frontend/                        React 18, no bundler. Edit a .jsx and reload.
 
 nano_notebooklm/
   ai/
-    base.py                      LLMBackend ABC + TruncationSignal sentinel.
+    base.py                      LLMBackend ABC (carries name + kind attrs) + TruncationSignal.
     openai_backend.py            Generic OpenAI-compatible client (OpenAI, DeepSeek, Moonshot,
                                  Zhipu, MiniMax, Groq, Together, Gemini compat endpoint, …).
                                  Detects base_url to handle codex-proxy and DeepSeek quirks.
-    claude_backend.py            Anthropic native API.
-    local_backend.py             Thin subclass of OpenAIBackend for local /v1 servers.
-    router.py                    ModelRouter — registers configured backends, dispatches by
+                                 Accepts http_timeout kwarg so /api/providers/{id}/test can
+                                 cap the underlying httpx client.
+    claude_backend.py            Anthropic native API (same http_timeout kwarg).
+    local_backend.py             Legacy thin subclass; new code paths construct OpenAIBackend
+                                 directly via _build_backend (kept for backward import compat).
+    router.py                    ModelRouter — reads artifacts/providers.json, dispatches by
                                  task_type or explicit override, handles retries + fallback.
+                                 Methods: reload() to swap backends without restart,
+                                 get_openai_compat() for endpoints that need a chat-completions
+                                 backend (agent, explain-node), diagnose_row() for UI badges.
     prompt_templates.py          All system prompts and language bindings.
 
   ingest/                        File → chunk pipeline (PDF/PPTX/DOCX/MD).
@@ -97,8 +103,24 @@ tests/                           pytest. Runs offline; uses deterministic fake e
   *why* is non-obvious (a workaround, a hidden constraint, a subtle
   invariant). Don't restate what the code does.
 - **Backend selection is data-driven.** Don't hardcode backend names in
-  business logic — read `router.backends` keys. The frontend reads
-  `available_backends` from `/api/status` to render chips.
+  business logic — read `router.backends` keys (which are provider ids
+  like `"openai-main"`, `"claude-main"`, or a user-added `"openai-alt"`,
+  NOT class-family names). The frontend reads `available_backends` +
+  `providers` from `/api/status` to render the topbar chip + Settings
+  matrix. For endpoints that require an OpenAI-compatible backend
+  specifically (agent loop, explain-node), call
+  `router.get_openai_compat()` instead of dict-lookup by literal name.
+- **Provider config is hot-swappable.** `artifacts/providers.json` is
+  the source of truth; `.env` is the first-boot seed only. Mutations
+  go through `PUT/DELETE /api/providers/...` + `router.reload()` under
+  `_PROVIDERS_LOCK`. Never close an old backend instance's httpx client
+  inside `reload()` — in-flight requests on the stack still hold the
+  ref. Always go through `save_providers()` (atomic write 0o600) +
+  `router.reload()`, never edit the file behind the router's back.
+- **API key safety.** `api_key_ref` is the only on-disk representation;
+  `env:VAR` resolves at backend-build via `os.getenv`, `literal:...`
+  stores the key inline. Responses MUST go through
+  `_redact_provider_row` so `literal:` values never leave the process.
 
 ---
 
@@ -107,16 +129,26 @@ tests/                           pytest. Runs offline; uses deterministic fake e
 ### Add support for a new LLM provider
 
 If the provider exposes an OpenAI-compatible `/v1/chat/completions`,
-**no code changes are needed** — the user just sets `OPENAI_BASE_URL`,
-`OPENAI_API_KEY`, and `OPENAI_MODEL` in `.env`. Update the table in
-[`README.md`](README.md) and `.env.example` with the new endpoint.
+**no code changes are needed**. The user can either:
+
+- Add it via the Settings UI (`PUT /api/providers/<id>` under the hood,
+  no restart needed); or
+- Seed it in `.env` (`OPENAI_BASE_URL` + `OPENAI_API_KEY` +
+  `OPENAI_MODEL`) and let the first-boot bootstrap synthesise the row.
+
+Either way the row lands in `artifacts/providers.json`. Update the
+README table only if the endpoint is worth documenting as a built-in
+shortcut.
 
 If the provider has a native non-OpenAI API (like Anthropic): create
 `nano_notebooklm/ai/<name>_backend.py` modeled on `claude_backend.py`,
-add config keys to `nano_notebooklm/config.py`, register it in
-`router._init_backends`, add an entry to the `ChatRequest.backend`
-`Literal` in `api/server.py`, and a chip variant in `frontend/app.jsx` +
-`frontend/settings.jsx` + `frontend/styles.css`.
+add config keys to `nano_notebooklm/config.py`, add the kind to
+`config.PROVIDER_KINDS` + `ProviderUpsertRequest.kind` Literal in
+`api/server.py`, dispatch on it inside
+`ModelRouter._build_backend`, and add an icon variant to
+`frontend/app.jsx` (topbar chip `iconFor`) + a kind label in
+`frontend/i18n.js`. `ChatRequest.backend` is `str | None` and does NOT
+need updating — provider ids are dynamic.
 
 ### Add a new skill
 
@@ -179,9 +211,13 @@ pytest tests/test_api_smoke.py -x      # quick gate
 If you change a backend, smoke-test it manually:
 
 ```bash
-curl http://localhost:8000/api/status | jq '.available_backends, .openai_model, .claude_model, .local_llm_model'
+curl http://localhost:8000/api/status | jq '.available_backends, .providers'
+curl http://localhost:8000/api/providers | jq
+# Pin chat to an explicit provider id
 curl -X POST http://localhost:8000/api/chat -H 'Content-Type: application/json' \
-  -d '{"question": "ping", "backend": "openai"}' | jq '.path, .model'
+  -d '{"question": "ping", "backend": "openai-main"}' | jq '.path, .model'
+# One-click connectivity probe (5s timeout, no detail field on failure)
+curl -X POST http://localhost:8000/api/providers/openai-main/test | jq
 ```
 
 ---
