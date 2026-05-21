@@ -501,10 +501,15 @@ async def test_extract_from_chunks_writes_concept_embedding_when_embed_fn_passed
 
 def test_upload_stages_contract_unchanged_after_r4_4():
     """R4-4 must not add a stage_c — embedding computation folds into Stage B
-    so frontend processing.jsx's 4-bar rendering stays correct."""
+    so frontend processing.jsx's stage rendering stays correct.
+
+    fix-all v2 (2026-05-21): split out "extracting" as its own stage so the
+    slow MinerU / PyMuPDF page extract phase is visible in the UI; tuple
+    grew from 4 → 5 entries. Still no kg_stage_c.
+    """
     from nano_notebooklm.kg import extractor
     assert extractor.UPLOAD_STAGES == (
-        "chunking", "embedding", "kg_stage_a", "kg_stage_b",
+        "extracting", "chunking", "embedding", "kg_stage_a", "kg_stage_b",
     )
     # UploadStage Literal must match the tuple (no kg_stage_c).
     src = (REPO_ROOT / "nano_notebooklm" / "kg" / "extractor.py").read_text(

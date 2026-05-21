@@ -1,8 +1,29 @@
 [project]
 name = "nano-notebooklm"
-version = "0.1.0"
-description = "AI-powered study assistant: knowledge extraction, notes, exam prep, and more"
+version = "0.2.0"
+description = "Self-hosted, provider-agnostic study assistant: chat with citations, structured LaTeX notes, exam-prep with a self-evolving question bank, and an editable knowledge graph"
+readme = "README.md"
+license = "MIT"
 requires-python = ">=3.10"
+keywords = ["notebooklm", "rag", "knowledge-graph", "study-assistant", "llm", "self-hosted", "fastapi"]
+authors = [
+    { name = "ArthurYangX", email = "yangjc27@gmail.com" },
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Web Environment",
+    "Framework :: FastAPI",
+    "Intended Audience :: End Users/Desktop",
+    "Intended Audience :: Education",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Education",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = [
     # AI backends
     "anthropic>=0.40.0",
