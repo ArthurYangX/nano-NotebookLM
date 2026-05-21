@@ -197,9 +197,13 @@ def test_drain_queue_before_reraise_source_order():
     drain-before-await invariant is preserved; the slice anchor moves.
     """
     src = Path("api/server.py").read_text(encoding="utf-8")
+    # fix-all v2: bumped window 8000 → 20000 chars. The upload pipeline
+    # body grew (truthful stage refactor) and the legacy 8000-char slice
+    # no longer covered the queue-drain block, producing a stale-test
+    # "substring not found" against a working invariant.
     upload = src[
         src.index("async def _run_upload_pipeline"):
-        src.index("async def _run_upload_pipeline") + 8000
+        src.index("async def _run_upload_pipeline") + 20000
     ]
     drain_pos = upload.index("while not kg_queue.empty()")
     await_pos = upload.index("concepts, relations = await extract_task")
@@ -212,7 +216,12 @@ def test_drain_queue_before_reraise_source_order():
 def test_extractor_exposes_upload_stages_constant():
     from nano_notebooklm.kg import extractor as extractor_mod
     assert hasattr(extractor_mod, "UPLOAD_STAGES")
-    assert extractor_mod.UPLOAD_STAGES == ("chunking", "embedding", "kg_stage_a", "kg_stage_b")
+    # 2026-05-20: "extracting" split out of "chunking" so the slow
+    # MinerU/PyMuPDF page extraction is visible as its own stage.
+    assert extractor_mod.UPLOAD_STAGES == (
+        "extracting", "chunking", "embedding", "kg_stage_a", "kg_stage_b",
+    )
+    assert extractor_mod.EXTRACTING == "extracting"
     assert extractor_mod.KG_STAGE_A == "kg_stage_a"
     assert extractor_mod.KG_STAGE_B == "kg_stage_b"
 

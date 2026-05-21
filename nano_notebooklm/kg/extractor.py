@@ -45,10 +45,18 @@ from typing import Any, Callable, Final, Literal
 # fix-all v1 #A9: single source of truth for the R4-2 NDJSON `stage`
 # field. Imported by api/server.py and grepped against by tests +
 # frontend processing.jsx so a typo on either side breaks loudly.
-UploadStage = Literal["chunking", "embedding", "kg_stage_a", "kg_stage_b"]
+UploadStage = Literal["extracting", "chunking", "embedding", "kg_stage_a", "kg_stage_b"]
+# 2026-05-20: "extracting" split out of "chunking". Previously a single
+# chunking stage covered both MinerU/PyMuPDF text extraction (slow:
+# 4-10s/page on mineru CPU) AND the cheap pages → 1.5KB chunk
+# segmentation (~ms/page). With the split, users see the slow part
+# tick as its own stage and the second chunking bar move fast.
+EXTRACTING: Final[str] = "extracting"
 KG_STAGE_A: Final[str] = "kg_stage_a"
 KG_STAGE_B: Final[str] = "kg_stage_b"
-UPLOAD_STAGES: Final[tuple[str, ...]] = ("chunking", "embedding", "kg_stage_a", "kg_stage_b")
+UPLOAD_STAGES: Final[tuple[str, ...]] = (
+    "extracting", "chunking", "embedding", "kg_stage_a", "kg_stage_b",
+)
 
 from nano_notebooklm.ai import prompt_templates as prompts
 from nano_notebooklm.ai.router import ModelRouter
@@ -547,7 +555,8 @@ async def extract_from_chunks(
         *[_stage_a_for_file(f) for f in files_ordered],
         return_exceptions=True,
     )
-    _emit(KG_STAGE_A, 100)
+    # 2026-05-20: don't emit 100 here — Stage A's per-file accumulation +
+    # topo_sort still runs below. Emit truthfully after that.
 
     per_file_overview: dict[str, str] = {}
     per_file_topics: dict[str, list[Concept]] = {}
@@ -587,6 +596,11 @@ async def extract_from_chunks(
             position = {tid: i + 1 for i, tid in enumerate(ordered)}
             for t in topics:
                 t.learning_order = position.get(t.concept_id)
+
+    # 2026-05-20: Stage A truthful 100% — fire AFTER per-file accumulation
+    # + topo_sort, not the moment `asyncio.gather` returns. The window is
+    # small (~ms) but it's still a lie of the same shape as Stage B's.
+    _emit(KG_STAGE_A, 100)
 
     # ── Stage B fully pipelined (R5-2 fix-all v5 A) ────────────────────
     # R5-1 fix-all v1 #F2 already flattened the outer per-file loop, but
@@ -644,7 +658,15 @@ async def extract_from_chunks(
         concepts, relations = result
         all_concepts.extend(concepts)
         all_relations.extend(relations)
-    _emit(KG_STAGE_B, 100)
+    # 2026-05-20: Stage B truthful 100% — DON'T emit 100 here. The
+    # concept-embedding pass below + chapter-root synthesis still run for
+    # 5-30s. We emit 80 to signal "gather done", then 95 after the
+    # embedding pass. Server.py emits 100 only after merge + KG build +
+    # disk save — i.e. when "done" really means done. Without this fix
+    # the frontend modal hits Stage B 100% while server status is still
+    # "running" for tens of seconds, leaving the UI visibly stuck until
+    # a hard reload.
+    _emit(KG_STAGE_B, 80)
 
     # R4-4: cache concept_embedding on every non-root concept so graph_search
     # can cosine-rank against the query without recomputing. Folded into
@@ -668,9 +690,30 @@ async def extract_from_chunks(
         chunk_text_lookup = {c.chunk_id: c.text for c in chunks}
         try:
             texts = [_concept_embed_text(c, chunk_text_lookup) for c in targets]
-            embs = await asyncio.to_thread(embed_fn, texts)
+            # fix-all v2 LOW F8: batch the embed_fn call and interpolate
+            # Stage B progress between batches. The pass is one atomic
+            # call covering 30-200 concepts (~10s/100 local, 5-15s/batch
+            # over API); pre-fix the bar visibly stalled at 80% for the
+            # whole duration. 32 is conservative — bump via env on
+            # high-throughput local backends. Trailing `_emit(KG_STAGE_B,
+            # 95)` outside the if-block still covers the no-embed-fn /
+            # no-targets path.
+            BATCH = int(os.getenv("KG_STAGE_B_EMBED_BATCH", "32"))
+            BATCH = max(1, BATCH)
+            n_batches = max(1, (len(texts) + BATCH - 1) // BATCH)
+            all_embs: list = []
+            for bi in range(n_batches):
+                batch = texts[bi * BATCH : (bi + 1) * BATCH]
+                batch_embs = await asyncio.to_thread(embed_fn, batch)
+                all_embs.extend(batch_embs)
+                # Interpolate Stage B 80 → 95 across the embedding pass
+                # so the bar reflects real progress. Cap at 95 so the
+                # caller's post-save `_set_stage(KG_STAGE_B, 100)`
+                # remains the truth-of-done emitter.
+                pct = 80 + int((95 - 80) * (bi + 1) / n_batches)
+                _emit(KG_STAGE_B, min(95, pct))
             # embed_fn returns either np.ndarray (shape [n, d]) or list[list[float]].
-            for c, emb in zip(targets, embs):
+            for c, emb in zip(targets, all_embs):
                 c.concept_embedding = [float(x) for x in emb]
         except Exception:  # noqa: BLE001 — embedding failure is non-fatal
             logger.warning(
@@ -689,6 +732,9 @@ async def extract_from_chunks(
             "concepts (no chapter roots, no macro topics — investigate LLM output)",
             len(files_ordered), course_name, len(all_concepts),
         )
+        # Truthful 95% emit on the early-return path too — server.py
+        # finishes to 100 after disk save.
+        _emit(KG_STAGE_B, 95)
         return all_concepts, all_relations
 
     # ── Synthesize one root per file + wire edges ──────────────────────
@@ -780,6 +826,13 @@ async def extract_from_chunks(
             + len(all_relations) + len(prereq_relations),
         len(sampled), len(files_ordered),
     )
+
+    # 2026-05-20: Stage B has finished the embedding pass + chapter-root
+    # synthesis here; only merge / KG build / disk save remain in the
+    # caller (server.py). Emit 95 so the bar reflects "most of Stage B
+    # done, finalizing" — the caller emits 100 after the last byte hits
+    # disk.
+    _emit(KG_STAGE_B, 95)
 
     return (
         roots + all_topics_flat + all_concepts,

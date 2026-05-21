@@ -261,6 +261,7 @@ class KBStore:
         engine: str = "pymupdf",
         lang: str = "ch",
         on_progress: Callable[[int, int], None] | None = None,
+        on_extract_progress: Callable[[int, int], None] | None = None,
     ) -> Course:
         """Ingest all documents from a course directory.
 
@@ -316,6 +317,16 @@ class KBStore:
         # Saves the ~50s model-load overhead for every extra PDF beyond
         # the first. Non-PDF files (pptx/docx/md/txt) still go through
         # extract_file individually since they don't use mineru anyway.
+        total_files = len(files)
+        # fix-all v1 stage-split: emit extracting 0% up-front so the UI
+        # shows the new "Extracting" stage starting immediately, even
+        # before the mineru batch returns.
+        if on_extract_progress:
+            try:
+                on_extract_progress(0, max(total_files, 1))
+            except Exception:
+                logger.warning("on_extract_progress raised at start; suppressed", exc_info=True)
+
         mineru_batch_results: dict[str, list[PageInfo]] = {}
         if engine == "mineru":
             pdf_files = [f for f in files if f.suffix.lower() == ".pdf"]
@@ -340,26 +351,68 @@ class KBStore:
                         "mineru batch failed (%s); falling back to per-file extraction",
                         type(exc).__name__,
                     )
+                # Mineru batch is "all or nothing" — once it returns,
+                # extraction for every PDF in the batch is effectively
+                # done. Non-PDFs still extract per-file below; their
+                # progress increments through the per-file loop.
+                if on_extract_progress and mineru_batch_results:
+                    try:
+                        on_extract_progress(len(pdf_files), max(total_files, 1))
+                    except Exception:
+                        logger.warning("on_extract_progress raised after mineru batch; suppressed", exc_info=True)
 
-        total_files = len(files)
         if on_progress:
             try:
                 on_progress(0, max(total_files, 1))
             except Exception:
                 logger.warning("on_progress raised at start; suppressed", exc_info=True)
+        # fix-all v2 M3: track files that actually yielded pages so we
+        # can warn-log when the final force-tick claims completion for
+        # skipped files. Surfacing the skip count to the progress bar
+        # would require extending the (done,total) callback signature
+        # (invasive across server.py + frontend); the warning log is
+        # the minimal honest fix.
+        extracted_ok = 0
+        skipped_files: list[str] = []
+        # fix-all v2 LOW F3: track files for which extraction has completed
+        # via an explicit counter instead of relying on the loop index `i`
+        # being cumulative across both the mineru-batched PDFs and the
+        # per-file loop. A future refactor (e.g. `for i, filepath in
+        # enumerate(non_pdf_files):`) would silently double-count without
+        # this decoupling. Initialized to the number of files already
+        # accounted for by the mineru batch tick above.
+        extracted_so_far = len(mineru_batch_results) if mineru_batch_results else 0
         with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}")) as progress:
             task = progress.add_task(f"Ingesting {course_id}...", total=total_files)
             for i, filepath in enumerate(files, start=1):
                 try:
                     pages: list[PageInfo] | None = None
+                    extracted_in_loop = False
                     if engine == "mineru" and filepath.suffix.lower() == ".pdf":
                         pages = mineru_batch_results.get(str(filepath.resolve()))
                         file_type = FileType.PDF
                     if pages is None:
                         pages, file_type = extract_file(filepath, engine=engine, lang=lang)
+                        extracted_in_loop = True
                     if not pages:
+                        skipped_files.append(filepath.name)
                         progress.advance(task)
                         continue
+                    extracted_ok += 1
+
+                    # Tick extracting AFTER extract_file (pymupdf or any
+                    # non-PDF). PDFs that came from the mineru batch had
+                    # their tick already accounted for above.
+                    # fix-all v2 LOW F3: pass `extracted_so_far` (count of
+                    # files for which extraction has completed) rather
+                    # than `i` (raw loop index) so a future loop refactor
+                    # over a filtered list can't silently double-count.
+                    if extracted_in_loop and on_extract_progress:
+                        extracted_so_far += 1
+                        try:
+                            on_extract_progress(extracted_so_far, max(total_files, 1))
+                        except Exception:
+                            logger.warning("on_extract_progress raised mid-loop; suppressed", exc_info=True)
 
                     doc_id = sha256_file(filepath)[:16]
                     rel_path = str(filepath.relative_to(course_dir))
@@ -383,6 +436,27 @@ class KBStore:
                             on_progress(i, max(total_files, 1))
                         except Exception:
                             logger.warning("on_progress raised mid-loop; suppressed", exc_info=True)
+
+        # Force extracting 100% in case the per-file ticks under-counted
+        # (some files yielded no pages and got `continue`d above without
+        # ticking). The chunking phase emits its own 100% via on_progress
+        # on the final iteration regardless.
+        # fix-all v2 M3: this counts ATTEMPTED files, not files that
+        # actually produced pages — a file that returned no pages is
+        # silently rolled into the 100% tick. The frontend bar can't
+        # reflect the skip count without extending the (done,total)
+        # callback signature, so we log instead.
+        if on_extract_progress:
+            try:
+                on_extract_progress(total_files, max(total_files, 1))
+            except Exception:
+                logger.warning("on_extract_progress raised at end; suppressed", exc_info=True)
+        if extracted_ok < total_files:
+            logger.warning(
+                "extracting: %d / %d files yielded no pages — skipped: %s",
+                total_files - extracted_ok, total_files,
+                ", ".join(skipped_files[:10]) + ("..." if len(skipped_files) > 10 else ""),
+            )
 
         # Save chunks
         chunks_path = course_artifacts / "chunks.json"

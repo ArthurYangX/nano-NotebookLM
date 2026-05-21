@@ -35,7 +35,51 @@ def extract_pdf(filepath: str) -> list[PageInfo]:
 
 
 def extract_pptx(filepath: str) -> list[PageInfo]:
-    """Extract text slide-by-slide from a PPTX."""
+    """Extract text slide-by-slide from a PPTX.
+
+    fix-all v2 LOW F2: python-pptx uses lxml without disabling external
+    entity processing, so a malicious .pptx (billion-laughs / XXE) can
+    pin CPU or memory during the underlying XML parse. M4 already
+    neutralised the page-count path (`_scan_file_pages`) by skipping
+    python-pptx entirely there, but the real extraction path was left
+    open. Defense: pre-check the .pptx zip envelope before letting
+    python-pptx near the XML. Real decks have ~5-300 members totalling
+    a few MB to ~100MB uncompressed; billion-laughs payloads inflate to
+    GBs and/or carry thousands of tiny entity-defining members. Rejecting
+    pathological envelopes upfront keeps the lxml call contained without
+    regressing on real uploads. The zip-bomb thresholds are conservative
+    enough that we'd expect zero false positives on classroom material.
+    """
+    import zipfile
+
+    _PPTX_MAX_UNCOMPRESSED = 500 * 1024 * 1024  # 500MB
+    _PPTX_MAX_MEMBERS = 5000
+    _PPTX_MAX_INFLATION_RATIO = 200  # compressed → uncompressed
+
+    try:
+        with zipfile.ZipFile(filepath) as zf:
+            infos = zf.infolist()
+            if len(infos) > _PPTX_MAX_MEMBERS:
+                raise ValueError(
+                    f"pptx envelope rejected: {len(infos)} members exceeds "
+                    f"safety cap {_PPTX_MAX_MEMBERS} (possible zip bomb)"
+                )
+            total_uncompressed = sum(i.file_size for i in infos)
+            total_compressed = sum(i.compress_size for i in infos) or 1
+            if total_uncompressed > _PPTX_MAX_UNCOMPRESSED:
+                raise ValueError(
+                    f"pptx envelope rejected: uncompressed {total_uncompressed} "
+                    f"exceeds safety cap {_PPTX_MAX_UNCOMPRESSED}"
+                )
+            if total_uncompressed // total_compressed > _PPTX_MAX_INFLATION_RATIO:
+                raise ValueError(
+                    f"pptx envelope rejected: inflation ratio "
+                    f"{total_uncompressed // total_compressed} exceeds "
+                    f"safety cap {_PPTX_MAX_INFLATION_RATIO} (possible zip bomb)"
+                )
+    except zipfile.BadZipFile as exc:
+        raise ValueError(f"pptx envelope rejected: not a valid zip ({exc})") from exc
+
     from pptx import Presentation
 
     prs = Presentation(filepath)

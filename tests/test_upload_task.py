@@ -133,7 +133,7 @@ def test_upload_status_endpoint_returns_snapshot(upload_client):
         predicate=lambda s: s["status"] in ("done", "error"),
     )
     assert state["status"] == "done", state
-    for stage in ("chunking", "embedding", "kg_stage_a", "kg_stage_b"):
+    for stage in ("extracting", "chunking", "embedding", "kg_stage_a", "kg_stage_b"):
         assert state["stages"][stage]["progress"] == 100, state["stages"]
     assert state["result"]["course_id"] == "SnapshotCourse"
     assert state["result"]["files"] == 1

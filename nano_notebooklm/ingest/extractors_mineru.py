@@ -331,8 +331,12 @@ def _get_or_start_mineru_server(
                     start_new_session=True,
                 )
             except OSError as exc:
-                _MINERU_SERVER_DISABLED_REASON = f"launch failed: {exc}"
-                logger.warning("mineru-api launch failed: %s", exc)
+                # M1: scrub exc body — OSError.__str__ embeds absolute paths /
+                # usernames, surfaced via /api/status (unauthenticated). Keep the
+                # exception type + errno; drop the message body.
+                errno_str = f" errno={exc.errno}" if exc.errno else ""
+                _MINERU_SERVER_DISABLED_REASON = f"launch failed: {type(exc).__name__}{errno_str}"
+                logger.warning("mineru-api launch failed: %s%s", type(exc).__name__, errno_str)
                 return None
 
             ready_event = threading.Event()

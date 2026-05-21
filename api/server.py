@@ -48,7 +48,7 @@ from nano_notebooklm.skills.latex_sanitizer import (
     MAX_LATEX_BYTES,
 )
 from nano_notebooklm.skills import notes_full_course
-from nano_notebooklm.kg.extractor import UPLOAD_STAGES
+from nano_notebooklm.kg.extractor import UPLOAD_STAGES, EXTRACTING, KG_STAGE_A, KG_STAGE_B  # fix-all v2 H4: use named constants over bare literals
 from nano_notebooklm import config
 
 logging.basicConfig(
@@ -3196,6 +3196,15 @@ async def _save_uploaded_file(f: UploadFile, dest: Path, suffix: str) -> int:
 class UploadStartResponse(BaseModel):
     task_id: str
     course_id: str
+    # Conservative wall-clock estimate (seconds) the upload pipeline
+    # should take end-to-end. Sourced from per-file page counts × engine
+    # cost + mineru cold-start surcharge when the server isn't warm.
+    # UI displays this as "约 N 分钟" with a live countdown.
+    estimated_seconds: int = 0
+    # Total pages across all uploaded files (PDF page count from fitz,
+    # PPTX slide count from python-pptx, 0 for md/docx). Surfaced so the
+    # UI can show honest "0 / N pages" progress alongside the estimate.
+    total_pages: int = 0
     model_config = {"extra": "forbid"}
 
 
@@ -3226,9 +3235,193 @@ class UploadTaskStateResponse(BaseModel):
     error: str | None = None
     error_stage: str | None = None
     file_names: list[str]
+    estimated_seconds: int = 0
+    total_pages: int = 0
     # NOTE: internal field `saved_count` from TaskState is intentionally
     # not part of the public response (review-swarm M5).
     model_config = {"extra": "forbid"}
+
+
+# Per-engine extraction baselines (seconds per page). Sourced from
+# measured runs on M4 CPU (memory: NIGHTLY_2026-05-13 + own benchmarks):
+#   - pymupdf vector text layer: ~0.05s/page
+#   - mineru pipeline backend on CPU: ~10s/page (cold cache); steady-
+#     state warm is closer to 3-4s/page but we keep the conservative
+#     value so users get pleasant surprises, not nasty ones.
+#   - mineru VLM on CUDA (AutoDL 5090): ~1.5s/page — not applicable to
+#     the local Mac path, so not used here.
+_EXTRACT_SECS_PER_PAGE = {
+    "pymupdf": 0.05,
+    # Memory's NIGHTLY_2026-05-13 cites 10s/page for mineru CPU-OCR on
+    # cold cache; this session's benchmarks measured 3-4s/page steady-
+    # state on M4. We use 6 as the middle — close to warm reality, far
+    # enough from the floor that an unlucky first page doesn't blow it.
+    "mineru": 6.0,
+}
+_PPTX_RENDER_SECS_PER_SLIDE = 2.0
+_PPTX_BASE_SECS = 5.0  # LibreOffice startup
+_MINERU_COLD_START_SECS = 40.0  # one-time cost when server isn't warm
+
+
+def _scan_file_pages(upload_dir: Path) -> tuple[int, dict[Path, int]]:
+    """Return (total_pages, {filepath: pages}) for everything in dir.
+
+    PDFs counted via PyMuPDF (fitz); pptx via python-pptx; other types
+    count as 0 pages (they don't have a page-driven cost model).
+    Failures fall back to a rough size-based estimate so a corrupt file
+    doesn't poison the ETA — caller still sees a number.
+    """
+    per_file: dict[Path, int] = {}
+    total = 0
+    try:
+        files = [f for f in upload_dir.iterdir() if f.is_file()]
+    except OSError:
+        return 0, {}
+    for f in files:
+        suffix = f.suffix.lower()
+        size = max(1, f.stat().st_size)
+        pages = 0
+        if suffix == ".pdf":
+            try:
+                import fitz
+                with fitz.open(str(f)) as doc:
+                    pages = len(doc) or 1
+            except Exception:  # noqa: BLE001 — corrupt PDF, fall back
+                pages = max(1, size // 100_000)
+        elif suffix == ".pptx":
+            # fix-all v2 M4: skip python-pptx slide count for the ETA.
+            # python-pptx uses lxml under the hood without disabling
+            # entity expansion, so a malicious deck (billion-laughs /
+            # XXE) could pin the CPU during this pre-pipeline scan.
+            # The size-based fallback is rough but the ETA accuracy hit
+            # is negligible — and it removes the XML attack surface.
+            pages = max(5, size // 200_000)
+        per_file[f] = pages
+        total += pages
+    return total, per_file
+
+
+def _estimate_upload_duration_seconds(
+    upload_dir: Path, engine: str, mineru_warm: bool | None,
+    *, total_pages: int | None = None, per_file_pages: dict[Path, int] | None = None,
+) -> int:
+    """Rough wall-clock estimate for the upload pipeline.
+
+    Order-of-magnitude only — used to set user expectation on the
+    Preparing screen. Baselines in ``_EXTRACT_SECS_PER_PAGE`` (memory:
+    NIGHTLY_2026-05-13 + this session's benchmarks); 30% safety margin
+    on top so overruns are rare.
+
+    Accepts pre-computed page counts to avoid re-opening every PDF when
+    the caller already scanned (e.g. via `_scan_file_pages`).
+    """
+    if per_file_pages is None or total_pages is None:
+        total_pages, per_file_pages = _scan_file_pages(upload_dir)
+
+    # 2026-05-20: extracting + chunking split. The slow per-page cost
+    # lives in extracting (MinerU/PyMuPDF text extraction); chunking is
+    # the cheap pages → 1.5KB segmentation (a few ms per page).
+    extracting = 0.0
+    chunking = 0.0
+    estimated_chunks = 0
+    # fix-all v2 M2: if engine=mineru but the mineru server is sticky-
+    # disabled (env kill-switch or repeated startup failure), the actual
+    # extraction falls back to the pymupdf subprocess CLI via
+    # extractors_mineru's fallback path. Pick the matching per-page
+    # baseline so the ETA doesn't overshoot 6× when the user picked
+    # mineru on an unhealthy host. Best-effort: if the disable flag
+    # flips mid-estimate we just over-estimate, which is acceptable.
+    effective_engine = engine
+    if engine == "mineru":
+        try:
+            from nano_notebooklm.ingest import extractors_mineru as _m
+            if _m._MINERU_SERVER_DISABLED_REASON is not None:
+                effective_engine = "pymupdf"
+        except Exception:  # noqa: BLE001 — ETA must never raise
+            pass
+    per_page = _EXTRACT_SECS_PER_PAGE.get(effective_engine, _EXTRACT_SECS_PER_PAGE["pymupdf"])
+
+    for f, pages in per_file_pages.items():
+        suffix = f.suffix.lower()
+        size = max(1, f.stat().st_size)
+        if suffix == ".pdf":
+            extracting += pages * per_page
+            chunking += pages * 0.01  # segmentation is ~10ms/page
+            estimated_chunks += pages * 4
+        elif suffix == ".pptx":
+            # LibreOffice startup + per-slide render is UI-prep cost
+            # we attribute to extracting (the pptx sidecar flow lives
+            # in the extracting stage on the server side).
+            extracting += _PPTX_BASE_SECS + pages * _PPTX_RENDER_SECS_PER_SLIDE
+            chunking += pages * 0.02
+            estimated_chunks += pages * 2
+        elif suffix == ".docx":
+            extracting += 3.0
+            chunking += 0.5
+            estimated_chunks += max(5, size // 5_000)
+        else:  # .md / .txt / other allow-listed
+            extracting += 1.0
+            chunking += 0.2
+            estimated_chunks += max(2, size // 5_000)
+
+    # mineru cold-start surcharge (once per process). mineru_warm is
+    # True/False/None — None means warm-up in flight, treat as cold.
+    # fix-all v2 M2: skip the cold-start surcharge when mineru is
+    # sticky-disabled and we've fallen back to pymupdf.
+    if effective_engine == "mineru" and not mineru_warm:
+        extracting += _MINERU_COLD_START_SECS
+
+    # 2026-05-20: embedding cost depends heavily on EMBEDDING_MODE.
+    #   - local sentence-transformer: ~0.05s/chunk (batched 128 on MPS)
+    #   - codex API /embeddings: 30-90s per ~50-chunk batch (memory:
+    #     "codex proxy embed 60-150s/batch 实测"). Conservatively 50s
+    #     baseline + per-chunk amortization.
+    embedding_mode = (config.EMBEDDING_MODE or "local").lower()
+    if embedding_mode == "api":
+        # codex /embeddings: roughly 1s/chunk amortized in 50-chunk batches,
+        # plus 30s baseline for the first batch's latency
+        embedding = max(30.0, estimated_chunks * 1.0)
+    else:
+        embedding = max(2.0, estimated_chunks * 0.05)
+
+    # 2026-05-20: KG cost realistic model.
+    #
+    # Stage A — ONE LLM call per file. Codex avg 12-20s per call. Files
+    # run with `_STAGE_A_PARALLELISM=3` concurrency (see kg/extractor.py),
+    # so multi-file uploads batch in groups of 3.
+    import math
+    n_files = max(1, len(per_file_pages))
+    STAGE_A_CONCURRENCY = 3
+    STAGE_A_SECS_PER_CALL = 18.0  # codex avg in practice, with some slow tail
+    kg_a = max(STAGE_A_SECS_PER_CALL,
+               math.ceil(n_files / STAGE_A_CONCURRENCY) * STAGE_A_SECS_PER_CALL)
+    #
+    # Stage B — ONE LLM call per sampled chunk (30% sampling), with
+    # `_STAGE_B_CONCURRENCY=10` default. Sample chunks → ceil(N/10)
+    # batches → each batch avg ~12s on codex (stragglers push the batch
+    # ceiling). After all batches, a concept-embedding pass runs (~3
+    # concepts per sampled chunk). Embedding cost again depends on mode.
+    # Then merge + KG build + JSON save ~3s.
+    STAGE_B_CONCURRENCY = 10
+    STAGE_B_SECS_PER_BATCH = 12.0
+    sampled_chunks = max(1, int(round(estimated_chunks * 0.3)))
+    kg_b_llm = math.ceil(sampled_chunks / STAGE_B_CONCURRENCY) * STAGE_B_SECS_PER_BATCH
+    n_concepts = sampled_chunks * 3
+    if embedding_mode == "api":
+        # codex /embeddings for concepts; ~1s/concept amortized but with
+        # base latency floor
+        kg_b_embed = max(15.0, n_concepts * 1.0)
+    else:
+        kg_b_embed = max(2.0, n_concepts * 0.15)
+    kg_b_save = 3.0
+    kg_b = kg_b_llm + kg_b_embed + kg_b_save
+
+    # Baseline values themselves are conservative (memory: 10s/page for
+    # mineru CPU-OCR is the cold-cache figure; warm steady-state is
+    # 3-6s/page). Keep a small 10% safety on top instead of compounding
+    # the conservative baseline with a large margin.
+    total = extracting + chunking + embedding + kg_a + kg_b
+    return max(5, int(round(total * 1.1)))
 
 
 @app.post("/api/upload/{course_id}", tags=["ingest"],
@@ -3322,6 +3515,18 @@ async def upload_files(
     import asyncio as _asyncio
 
     task_id = uuid.uuid4().hex
+    # Scan once: page counts + ETA share the same per-file open.
+    # mineru_warm comes from the boot-time warmup hook
+    # (True/False/None — None counts as cold).
+    # fix-all v2 H3: _scan_file_pages opens every uploaded file with
+    # fitz/python-pptx — multi-second blocking on large PDFs that would
+    # freeze all other request handling on the event loop. Off-load.
+    total_pages, per_file_pages = await _asyncio.to_thread(_scan_file_pages, upload_dir)
+    estimated = _estimate_upload_duration_seconds(
+        upload_dir, engine,
+        mineru_warm=getattr(app.state, "mineru_warm_ok", None),
+        total_pages=total_pages, per_file_pages=per_file_pages,
+    )
     state: dict[str, Any] = {
         "task_id": task_id,
         "course_id": course_id,
@@ -3334,6 +3539,8 @@ async def upload_files(
         "error_stage": None,
         "file_names": saved_names,
         "saved_count": saved,
+        "estimated_seconds": estimated,
+        "total_pages": total_pages,
     }
     # `app.state.upload_tasks` is wired in `_probe_soffice` startup. Fall
     # back to the module-level dict for TestClient setups that import the
@@ -3350,7 +3557,12 @@ async def upload_files(
     _UPLOAD_TASK_OBJECTS.add(_bg_task)
     _bg_task.add_done_callback(_UPLOAD_TASK_OBJECTS.discard)
 
-    return {"task_id": task_id, "course_id": course_id}
+    return {
+        "task_id": task_id,
+        "course_id": course_id,
+        "estimated_seconds": estimated,
+        "total_pages": total_pages,
+    }
 
 
 def _set_stage(state: dict[str, Any], stage: str, progress: int,
@@ -3374,6 +3586,40 @@ def _set_stage(state: dict[str, Any], stage: str, progress: int,
         prev = state["stages"].get(stage) or {}
         detail = prev.get("detail")
     state["stages"][stage] = {"progress": progress, "detail": detail}
+
+
+def _clamp_earlier_stages(state: dict[str, Any], current_stage: str) -> None:
+    """fix-all v2 LOW F1: defensive monotonic clamp on the kg_queue
+    consumer side.
+
+    The current producer (`extract_from_chunks` → `_emit(KG_STAGE_A,
+    100)` then `_emit(KG_STAGE_B, 0)`) is sequential synchronous
+    `put_nowait`, so FIFO order IS preserved in practice and Stage A
+    always reaches 100 before any Stage B event lands. The consumer
+    has no defense, though, against a future refactor (parallel
+    producers, queue reordering, new stage interleaving) that breaks
+    that invariant.
+
+    When the current event is for a stage strictly later in
+    UPLOAD_STAGES than some earlier stage that hasn't yet hit 100,
+    clamp the earlier ones to 100. Unknown stages (not in
+    UPLOAD_STAGES) are a no-op so a typo doesn't accidentally roll
+    progress forward on every other stage.
+
+    Note: kg_stage_b is the last stage; its truthful 100 is emitted
+    by the caller AFTER `kg.save` (not from the queue). So this
+    helper never clamps kg_stage_b itself — there's no later stage.
+    """
+    try:
+        stage_idx = UPLOAD_STAGES.index(current_stage)
+    except ValueError:
+        return
+    if stage_idx <= 0:
+        return
+    for earlier_stage in UPLOAD_STAGES[:stage_idx]:
+        cur = (state["stages"].get(earlier_stage) or {}).get("progress", 0)
+        if cur < 100:
+            _set_stage(state, earlier_stage, 100)
 
 
 async def _run_upload_pipeline(
@@ -3428,14 +3674,24 @@ async def _run_upload_pipeline(
                 # missing soffice or a single broken deck only logs a
                 # warning, never aborts the upload (Reader text-mode is
                 # the fallback).
-                current_stage = "chunking"
-                _set_stage(state, "chunking", 0)
-                # Carve out a sub-range for ingest_course's per-file
-                # callback. With pptx sidecar gen, 0-50% is already spent on
-                # rendering; without, the whole 0-99 belongs to ingest.
-                chunking_lo = 50 if (pptx_to_render and getattr(app.state, "pptx_pdf_available", False)) else 0
+                # 2026-05-20: extracting + chunking are now separate stages.
+                # extracting = pptx sidecar render (UI-prep) + the slow
+                #              text extraction phase (mineru CPU-OCR or
+                #              pymupdf vector layer read).
+                # chunking   = pages → 1.5KB chunk segmentation per file
+                #              (~ms each — fast).
+                # Both stages tick INSIDE the single kb.ingest_course call
+                # via on_extract_progress (extracting) and on_progress
+                # (chunking-done-per-file).
+                current_stage = EXTRACTING
+                _set_stage(state, EXTRACTING, 0)
+                # extracting bar carves out 0-50 for pptx sidecar render
+                # (if any), 50-99 for the file extraction loop. 100 is
+                # written by ingest_course's forced end-tick + final write
+                # below.
+                extracting_lo = 50 if (pptx_to_render and getattr(app.state, "pptx_pdf_available", False)) else 0
                 if pptx_to_render and getattr(app.state, "pptx_pdf_available", False):
-                    _set_stage(state, "chunking", 25, detail={
+                    _set_stage(state, EXTRACTING, 25, detail={
                         "sub": f"rendering {len(pptx_to_render)} pptx preview(s)",
                     })
                     from nano_notebooklm.ingest.pptx_pdf import convert_directory
@@ -3444,23 +3700,44 @@ async def _run_upload_pipeline(
                         convert_directory, upload_dir, preview_dir,
                     )
                     rendered = sum(1 for v in sidecar_results.values() if v is not None)
-                    _set_stage(state, "chunking", 50, detail={
+                    _set_stage(state, EXTRACTING, 50, detail={
                         "pptx_previews_rendered": rendered,
                         "pptx_previews_total": len(sidecar_results),
                     })
 
-                # Per-file progress callback. Maps to [chunking_lo, 99] so
-                # the final 100% write below carries the `documents` detail.
-                # Runs on the worker thread; dict writes are GIL-atomic and
-                # the poller tolerates ms-level lag, so no lock needed.
-                def _on_chunk_progress(done: int, total: int) -> None:
-                    pct = chunking_lo + int((99 - chunking_lo) * done / max(total, 1))
-                    _set_stage(state, "chunking", min(99, max(chunking_lo, pct)))
+                # Per-file callbacks: extracting ticks 50-99 as each file's
+                # text extraction completes; chunking ticks 0-99 as each
+                # file's chunk_pages segmentation completes (separate event
+                # in ingest_course's per-file loop). Both writes are GIL-
+                # atomic dict mutations; poller tolerates ms-level lag.
+                # fix-all v2 H6: each callback unconditionally sets
+                # current_stage to its own phase. Since kb.ingest_course
+                # interleaves extract → chunk per file (pymupdf engine),
+                # an exception raised inside extract_file after a chunk
+                # callback fired must still be attributed to extracting.
+                # fix-all v2 M9: cap in-loop progress at 98 (not 99) so the
+                # post-to_thread `_set_stage(..., 100)` writes can't be
+                # clobbered by a stale 99 emitted from the worker thread
+                # after to_thread returns (GIL release/acquire ordering).
+                def _on_extract_progress(done: int, total: int) -> None:
+                    nonlocal current_stage
+                    current_stage = EXTRACTING
+                    pct = extracting_lo + int((98 - extracting_lo) * done / max(total, 1))
+                    _set_stage(state, EXTRACTING, min(98, max(extracting_lo, pct)))
 
+                def _on_chunk_progress(done: int, total: int) -> None:
+                    nonlocal current_stage
+                    current_stage = "chunking"
+                    pct = int(98 * done / max(total, 1))
+                    _set_stage(state, "chunking", min(98, max(0, pct)))
+
+                _set_stage(state, "chunking", 0)
                 course_obj = await _asyncio.to_thread(
                     kb.ingest_course, str(upload_dir), course_id, engine, lang,
                     on_progress=_on_chunk_progress,
+                    on_extract_progress=_on_extract_progress,
                 )
+                _set_stage(state, EXTRACTING, 100)
                 _set_stage(state, "chunking", 100, detail={
                     "documents": len(course_obj.documents),
                 })
@@ -3487,7 +3764,7 @@ async def _run_upload_pipeline(
                 # Stages 3 + 4: KG extraction. The extractor's
                 # progress_callback is invoked from the same loop, so a
                 # plain queue + drain interleaves cleanly with our await.
-                current_stage = "kg_stage_a"
+                current_stage = KG_STAGE_A
                 kg_queue: _asyncio.Queue = _asyncio.Queue(maxsize=64)
 
                 def _progress(stage: str, pct: int):
@@ -3511,8 +3788,15 @@ async def _run_upload_pipeline(
 
                 async def _extract_task():
                     if not chunks:
-                        _progress("kg_stage_a", 100)
-                        _progress("kg_stage_b", 100)
+                        # fix-all v2 H1: Stage A may emit 100 here (no
+                        # post-emit work on that stage); Stage B caps at
+                        # 95 so the post-save `_set_stage(KG_STAGE_B, 100)`
+                        # below remains the single source of truth for
+                        # "Stage B is truly done" even on the empty-
+                        # chunks branch (merge_concepts([]) +
+                        # KnowledgeGraph().save() still runs).
+                        _progress(KG_STAGE_A, 100)
+                        _progress(KG_STAGE_B, 95)
                         return [], []
                     return await extract_from_chunks(
                         chunks, course_id, router,
@@ -3528,6 +3812,7 @@ async def _run_upload_pipeline(
                         if isinstance(ev, dict) and ev.get("stage"):
                             current_stage = ev["stage"]
                             _set_stage(state, ev["stage"], int(ev.get("progress") or 0))
+                            _clamp_earlier_stages(state, ev["stage"])  # fix-all v2 LOW F1
                     except _asyncio.TimeoutError:
                         continue
                 # Drain any remaining frames BEFORE awaiting the task
@@ -3539,6 +3824,7 @@ async def _run_upload_pipeline(
                         if isinstance(ev, dict) and ev.get("stage"):
                             current_stage = ev["stage"]
                             _set_stage(state, ev["stage"], int(ev.get("progress") or 0))
+                            _clamp_earlier_stages(state, ev["stage"])  # fix-all v2 LOW F1
                     except _asyncio.QueueEmpty:
                         break
 
@@ -3550,6 +3836,15 @@ async def _run_upload_pipeline(
                 kg.add_relations(relations)
                 kg_path = config.ARTIFACTS_DIR / "courses" / course_id / "knowledge_graph.json"
                 await _asyncio.to_thread(kg.save, kg_path)
+                # 2026-05-20: Stage B truthful 100% — emit only after disk
+                # save completes. extract_from_chunks emits 95 right
+                # before its return; the gap (merge + KG build + JSON
+                # write) is real work, ~1-3s. Without this fix the
+                # frontend hit 100% while the server was still doing the
+                # save, leaving the modal mounted for the whole duration
+                # — a Cmd+Shift+R reload bypassed the stuck modal and
+                # made the bug look like "works fine after refresh".
+                _set_stage(state, KG_STAGE_B, 100)
 
                 # review-swarm v2 MED-5 (2026-05-13): bust the graphrag
                 # courses-with-KG cache so the next All Courses chat sees
