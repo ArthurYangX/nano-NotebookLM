@@ -4458,14 +4458,19 @@ async def switch_embedding_preset(req: EmbeddingSwitchRequest):
 class ProviderUpsertRequest(BaseModel):
     """Body for `PUT /api/providers/{id}`. `id` comes from the path.
 
-    `api_key_ref` must use the env: or literal: prefix — see the
-    inline `api_key_ref` form in the Settings UI for the helper text
-    users see. `base_url` is required for openai_compat[_local].
+    `api_key_ref` is OPTIONAL on update: omitting it tells the server
+    to preserve the row's currently-stored value. (The frontend Settings
+    UI relies on this — a blank password field means "keep the key" so
+    the redacted `literal:***` placeholder we returned on GET never
+    cycles back as a real save.) On CREATE (no existing row) the
+    handler 422s if api_key_ref is absent — we have nothing to inherit.
+    When present, must use the `env:VAR` or `literal:<value>` prefix.
+    `base_url` is required for openai_compat[_local].
     """
     kind: Literal["openai_compat", "openai_compat_local", "anthropic"]
     label: str = Field(..., min_length=1, max_length=80)
     base_url: str | None = Field(None, max_length=512)
-    api_key_ref: str = Field(..., min_length=1, max_length=512)
+    api_key_ref: str | None = Field(None, min_length=1, max_length=512)
     model: str = Field(..., min_length=1, max_length=200)
     enabled: bool = True
     model_config = {"extra": "forbid"}
@@ -4506,36 +4511,56 @@ async def list_providers():
          summary="Create or update an LLM provider")
 async def upsert_provider(provider_id: str, req: ProviderUpsertRequest):
     _validate_provider_id(provider_id)
-    row = {
-        "id": provider_id,
-        "kind": req.kind,
-        "label": req.label,
-        "base_url": req.base_url,
-        "api_key_ref": req.api_key_ref,
-        "model": req.model,
-        "enabled": req.enabled,
-    }
-    ok, err = config._validate_provider_dict(row)
-    if not ok:
-        raise HTTPException(422, f"provider row rejected: {err}")
-    if req.api_key_ref.startswith("literal:"):
-        logger.warning(
-            "provider %r upserted with literal: api_key_ref — "
-            "consider env:VAR instead so the key stays out of artifacts/providers.json",
-            provider_id,
-        )
 
     async with _PROVIDERS_LOCK:
         data = config.load_providers()
-        existing = data.get("providers", [])
-        is_update = any(r.get("id") == provider_id for r in existing)
-        if not is_update and len(existing) >= _PROVIDER_MAX_ROWS:
+        existing_rows = data.get("providers", [])
+        existing = next((r for r in existing_rows if r.get("id") == provider_id), None)
+        is_update = existing is not None
+        if not is_update and len(existing_rows) >= _PROVIDER_MAX_ROWS:
             raise HTTPException(
                 409,
                 f"provider row cap reached ({_PROVIDER_MAX_ROWS}); "
                 f"delete an unused row before adding a new one",
             )
-        rows = [r for r in existing if r.get("id") != provider_id]
+
+        # Resolve api_key_ref: explicit value wins; on update with no
+        # value, preserve the stored ref. This is the contract the
+        # Settings UI relies on — blank password field means "keep
+        # the stored key" without re-PUTing the redacted `literal:***`
+        # placeholder over the real key.
+        if req.api_key_ref is not None:
+            resolved_api_key_ref = req.api_key_ref
+        elif is_update:
+            resolved_api_key_ref = existing["api_key_ref"]
+        else:
+            raise HTTPException(
+                422,
+                "api_key_ref required when creating a new provider",
+            )
+
+        row = {
+            "id": provider_id,
+            "kind": req.kind,
+            "label": req.label,
+            "base_url": req.base_url,
+            "api_key_ref": resolved_api_key_ref,
+            "model": req.model,
+            "enabled": req.enabled,
+        }
+        ok, err = config._validate_provider_dict(row)
+        if not ok:
+            raise HTTPException(422, f"provider row rejected: {err}")
+        if resolved_api_key_ref.startswith("literal:") and req.api_key_ref is not None:
+            # Only warn on EXPLICIT literal sets, not on update-by-omission
+            # (the latter just preserves what's already there).
+            logger.warning(
+                "provider %r upserted with literal: api_key_ref — "
+                "stored inline in artifacts/providers.json (file mode 0o600)",
+                provider_id,
+            )
+
+        rows = [r for r in existing_rows if r.get("id") != provider_id]
         rows.append(row)
         data["providers"] = rows
         # If this is the only enabled row, auto-promote it to default —

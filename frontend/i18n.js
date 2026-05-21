@@ -349,6 +349,22 @@
     "settings.providers.form.label":        { zh: "显示名", en: "Display name" },
     "settings.providers.form.api_key_ref":  { zh: "API key ref（env:VAR 或 literal:...，推荐前者）", en: "API key ref (env:VAR or literal:...; prefer env)" },
     "settings.providers.form.base_url":     { zh: "Base URL（OpenAI 兼容必填）", en: "Base URL (required for OpenAI-compatible)" },
+    "settings.providers.form.preset":       { zh: "供应商预设（选一个一键填好 base URL / 模型 / key ref）", en: "Vendor preset (one-click fills base URL / model / key ref)" },
+    "settings.providers.preset.custom":     { zh: "自定义（手动填）", en: "Custom (manual)" },
+    "settings.providers.api_key.label":     { zh: "API key", en: "API key" },
+    "settings.providers.api_key.placeholder": { zh: "sk-... 直接粘贴你的 API key", en: "sk-... paste your API key" },
+    "settings.providers.api_key.inherits_env": {
+      zh: "留空即从环境变量 {var} 读取（在 .env 设置）。粘贴 key 在此可覆盖。",
+      en: "Leave blank to read from env var {var} (set in .env). Paste a key here to override.",
+    },
+    "settings.providers.api_key.inherits_literal": {
+      zh: "留空保留当前已存储的 key。重新粘贴可替换。",
+      en: "Leave blank to keep the currently stored key. Paste here to replace.",
+    },
+    "settings.providers.api_key.literal_warn": {
+      zh: "key 会明文存入 artifacts/providers.json（文件权限 0600，仅当前用户可读）。",
+      en: "Stored inline in artifacts/providers.json (file mode 0600, owner-only).",
+    },
     "settings.providers.test.running":      { zh: "测试中…", en: "Testing…" },
     "settings.providers.test.ok":           { zh: "✓ {ms}ms", en: "✓ {ms}ms" },
     "settings.providers.test.fail":         { zh: "✗ {err}", en: "✗ {err}" },

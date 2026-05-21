@@ -97,17 +97,170 @@ function LoadingBadge({ ready, ok, labelOk, labelBad }) {
   return <Badge ok={ok} labelOk={labelOk} labelBad={labelBad} />;
 }
 
+// Preset catalogue for the "Add provider" quick-fill dropdown. Each
+// entry packages a vendor's `kind` / `base_url` / suggested model into
+// a single click so the user doesn't have to memorise the OpenAI-
+// compatible endpoint URL or which env var name the SDK conventionally
+// reads. "custom" is the escape hatch (no auto-fill, manual everything).
+// Keep the brand names in `label` un-i18n'd — they're proper nouns.
+// When extending, mirror the new entry in README.md's provider table.
+const PROVIDER_PRESETS = [
+  // OpenAI-compatible cloud
+  { value: "openai",    label: "OpenAI",            kind: "openai_compat",       base_url: "https://api.openai.com/v1",                                model: "gpt-4o-mini",                              api_key_ref: "env:OPENAI_API_KEY"   },
+  { value: "deepseek",  label: "DeepSeek",          kind: "openai_compat",       base_url: "https://api.deepseek.com/v1",                              model: "deepseek-chat",                            api_key_ref: "env:DEEPSEEK_API_KEY" },
+  { value: "moonshot",  label: "Moonshot (Kimi)",   kind: "openai_compat",       base_url: "https://api.moonshot.cn/v1",                               model: "moonshot-v1-8k",                           api_key_ref: "env:MOONSHOT_API_KEY" },
+  { value: "zhipu",     label: "Zhipu (GLM)",       kind: "openai_compat",       base_url: "https://open.bigmodel.cn/api/paas/v4",                     model: "glm-4-flash",                              api_key_ref: "env:ZHIPU_API_KEY"    },
+  { value: "minimax",   label: "MiniMax",           kind: "openai_compat",       base_url: "https://api.minimax.chat/v1",                              model: "abab6.5-chat",                             api_key_ref: "env:MINIMAX_API_KEY"  },
+  { value: "groq",      label: "Groq",              kind: "openai_compat",       base_url: "https://api.groq.com/openai/v1",                           model: "llama-3.3-70b-versatile",                  api_key_ref: "env:GROQ_API_KEY"     },
+  { value: "together",  label: "Together",          kind: "openai_compat",       base_url: "https://api.together.xyz/v1",                              model: "meta-llama/Llama-3.3-70B-Instruct-Turbo",  api_key_ref: "env:TOGETHER_API_KEY" },
+  { value: "gemini",    label: "Gemini",            kind: "openai_compat",       base_url: "https://generativelanguage.googleapis.com/v1beta/openai/", model: "gemini-2.0-flash",                         api_key_ref: "env:GEMINI_API_KEY"   },
+  // Anthropic native
+  { value: "anthropic", label: "Anthropic Claude",  kind: "anthropic",           base_url: null,                                                       model: "claude-sonnet-4-5",                        api_key_ref: "env:ANTHROPIC_API_KEY"},
+  // Local OpenAI-compatible runners (loopback URL pre-filled — operator
+  // edits the port / model to match their setup)
+  { value: "ollama",    label: "Ollama (local)",    kind: "openai_compat_local", base_url: "http://localhost:11434/v1",                                model: "qwen2.5:7b",                               api_key_ref: "env:LOCAL_LLM_API_KEY"},
+  { value: "vllm",      label: "vLLM (local)",      kind: "openai_compat_local", base_url: "http://localhost:8000/v1",                                 model: "Qwen/Qwen2.5-7B-Instruct",                 api_key_ref: "env:LOCAL_LLM_API_KEY"},
+  { value: "lmstudio",  label: "LM Studio (local)", kind: "openai_compat_local", base_url: "http://localhost:1234/v1",                                 model: "",                                         api_key_ref: "env:LOCAL_LLM_API_KEY"},
+  // Escape hatch — user fills everything manually.
+  { value: "custom",    label: "",                  kind: "openai_compat",       base_url: "",                                                         model: "",                                         api_key_ref: ""                     },
+];
+
+
+// API key field — single password input (matches OpenWebUI / Cursor /
+// Cline / LobeChat convention). The `env:` / `literal:` prefix machinery
+// is hidden from the UI:
+//   - blank input + preset has `env:VAR` → save sends the env: ref;
+//     server reads $VAR at backend-build (key never lands on disk)
+//   - blank input + edit mode → frontend OMITS api_key_ref from the
+//     PUT body; server's upsert handler preserves the stored value
+//   - non-blank input → save sends `literal:<value>`; stored inline
+//     in artifacts/providers.json (file mode 0o600)
+//
+// Power users who want explicit env: refs can still hand-edit
+// providers.json directly; the API still accepts both schemes.
+function ApiKeyRefField({ t, draft, setDraft, isEdit }) {
+  const ref = draft.api_key_ref || "";
+  const inherited = draft._inherited_api_key_ref || "";
+  const isLiteral = ref.startsWith("literal:");
+  // Password field only ever shows the literal body. Env: refs and
+  // edit-mode redacted placeholders (`literal:***`) are invisible —
+  // the user manipulates them via the leave-blank behavior + hint.
+  const displayed = isLiteral ? ref.slice(8) : "";
+
+  function writeRef(val) {
+    if (!val) {
+      if (isEdit) {
+        // Blank → omit from PUT body. Server's upsert keeps the
+        // stored value (fixes a previous bug where the redacted
+        // "literal:***" placeholder could be re-saved over the real key).
+        setDraft(prev => ({ ...prev, api_key_ref: "" }));
+      } else {
+        // Add mode → restore the preset's env: ref so blanking out an
+        // accidental paste doesn't lose the preset's safe default.
+        setDraft(prev => ({ ...prev, api_key_ref: prev._inherited_api_key_ref || "" }));
+      }
+      return;
+    }
+    setDraft(prev => ({ ...prev, api_key_ref: "literal:" + val.trim() }));
+  }
+
+  // What does "leave blank" inherit? Drives the explanatory hint.
+  let inheritHint = null;
+  if (!isLiteral) {
+    if (inherited.startsWith("env:")) {
+      inheritHint = t("settings.providers.api_key.inherits_env", { var: inherited.slice(4) });
+    } else if (inherited.startsWith("literal:")) {
+      inheritHint = t("settings.providers.api_key.inherits_literal");
+    }
+  }
+
+  return (
+    <div className="settings-prov-form-row">
+      <div className="api-key-ref-wrap" style={{ flex: 1 }}>
+        <div className="api-key-ref-label">{t("settings.providers.api_key.label")}</div>
+        <input
+          type="password" value={displayed}
+          onChange={e => writeRef(e.target.value)}
+          placeholder={t("settings.providers.api_key.placeholder")}
+          autoComplete="off" spellCheck={false}
+        />
+        {inheritHint && (
+          <div className="api-key-ref-hint">{inheritHint}</div>
+        )}
+        {isLiteral && (
+          <div className="api-key-ref-hint api-key-ref-hint-warn">
+            {t("settings.providers.api_key.literal_warn")}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+
 // Subform shared by "edit existing" and "add new" provider flows. Kept
 // at module scope (above Settings) so it can hold its own render state
 // without polluting the parent component. `isEdit=true` locks the id
-// field (router-dict key is immutable) and lets the api_key_ref blank
-// out to "keep current".
+// field (router-dict key is immutable), hides the preset selector
+// (irrelevant for an existing row), and lets the api_key_ref blank out
+// to "keep current".
 function ProviderForm({ t, draft, setDraft, isEdit, onSave, onCancel, saving }) {
   if (!draft) return null;
   const upd = (k, v) => setDraft(prev => ({ ...prev, [k]: v }));
   const showBaseUrl = draft.kind === "openai_compat" || draft.kind === "openai_compat_local";
+
+  function applyPreset(presetValue) {
+    const p = PROVIDER_PRESETS.find(x => x.value === presetValue);
+    if (!p) return;
+    if (presetValue === "custom") {
+      // Custom = clean slate. Forces user to fill everything manually
+      // so they don't accidentally inherit one vendor's defaults into
+      // a different provider config.
+      setDraft(prev => ({
+        ...prev,
+        _preset: "custom",
+        kind: "openai_compat",
+        label: "",
+        base_url: "",
+        model: "",
+        api_key_ref: "",
+        _inherited_api_key_ref: "",
+      }));
+      return;
+    }
+    setDraft(prev => ({
+      ...prev,
+      // Never auto-fill `id` — provider ids must be unique and the
+      // user is the only authority on which one makes sense.
+      kind: p.kind,
+      label: p.label,
+      base_url: p.base_url || "",
+      model: p.model || "",
+      api_key_ref: p.api_key_ref || "",
+      _inherited_api_key_ref: p.api_key_ref || "",
+      _preset: presetValue,
+    }));
+  }
+
+  const currentPreset = draft._preset || "openai";
+  const isCustom = currentPreset === "custom";
+
   return (
     <div className="settings-prov-form">
+      {!isEdit && (
+        <div className="settings-prov-form-row">
+          <label className="wide">
+            <span>{t("settings.providers.form.preset")}</span>
+            <select value={currentPreset} onChange={e => applyPreset(e.target.value)}>
+              {PROVIDER_PRESETS.map(p => (
+                <option key={p.value} value={p.value}>
+                  {p.value === "custom" ? t("settings.providers.preset.custom") : p.label}
+                </option>
+              ))}
+            </select>
+          </label>
+        </div>
+      )}
       <div className="settings-prov-form-row">
         <label>
           <span>{t("settings.providers.form.id")}</span>
@@ -115,17 +268,19 @@ function ProviderForm({ t, draft, setDraft, isEdit, onSave, onCancel, saving }) 
             type="text" value={draft.id}
             onChange={e => upd("id", e.target.value)}
             disabled={isEdit}
-            placeholder="openai-alt"
+            placeholder={currentPreset === "custom" ? "my-provider" : (currentPreset + "-1")}
           />
         </label>
-        <label>
-          <span>{t("settings.providers.col.kind")}</span>
-          <select value={draft.kind} onChange={e => upd("kind", e.target.value)}>
-            <option value="openai_compat">{t("settings.providers.kind.openai_compat")}</option>
-            <option value="openai_compat_local">{t("settings.providers.kind.openai_compat_local")}</option>
-            <option value="anthropic">{t("settings.providers.kind.anthropic")}</option>
-          </select>
-        </label>
+        {(isCustom || isEdit) && (
+          <label>
+            <span>{t("settings.providers.col.kind")}</span>
+            <select value={draft.kind} onChange={e => upd("kind", e.target.value)}>
+              <option value="openai_compat">{t("settings.providers.kind.openai_compat")}</option>
+              <option value="openai_compat_local">{t("settings.providers.kind.openai_compat_local")}</option>
+              <option value="anthropic">{t("settings.providers.kind.anthropic")}</option>
+            </select>
+          </label>
+        )}
       </div>
       <div className="settings-prov-form-row">
         <label>
@@ -145,23 +300,7 @@ function ProviderForm({ t, draft, setDraft, isEdit, onSave, onCancel, saving }) 
           </label>
         </div>
       )}
-      <div className="settings-prov-form-row">
-        <label className="wide">
-          <span>
-            {t("settings.providers.form.api_key_ref")}
-            {isEdit && (
-              <em style={{ marginLeft: 6, fontStyle: "normal", opacity: 0.6 }}>
-                {t("settings.providers.api_key_ref_disabled_hint")}
-              </em>
-            )}
-          </span>
-          <input
-            type="text" value={draft.api_key_ref || ""}
-            onChange={e => upd("api_key_ref", e.target.value)}
-            placeholder="env:OPENAI_API_KEY"
-          />
-        </label>
-      </div>
+      <ApiKeyRefField t={t} draft={draft} setDraft={setDraft} isEdit={isEdit} />
       <div className="settings-prov-form-row">
         <label className="inline">
           <input type="checkbox" checked={!!draft.enabled} onChange={e => upd("enabled", e.target.checked)} />
@@ -199,23 +338,30 @@ function ProvidersMatrix({ t, status, onStatusRefresh, onCommitBackend }) {
     setDraft({
       id: row.id, kind: row.kind, label: row.label,
       base_url: row.base_url || "",
-      // Blank on edit so the user can "keep current" without typing the
-      // env var name again. The save handler falls back to the stored
-      // value when this stays blank.
+      // Blank on edit so the user can "keep current" without re-typing.
+      // save() OMITS api_key_ref from the PUT body when blank; the
+      // server preserves the stored value. (Don't fall back to the
+      // server's `_inherited` here — that would be the REDACTED form
+      // for literal: rows, and re-PUTing `literal:***` would overwrite
+      // the real key with the placeholder.)
       api_key_ref: "",
+      _inherited_api_key_ref: row.api_key_ref,  // for the hint only; never sent
       model: row.model, enabled: row.enabled,
-      _current_api_key_ref: row.api_key_ref,
     });
   }
 
   function startAdd() {
     setOpError(null);
     setEditingId("__add__");
+    // Initial draft mirrors the "openai" preset; the form's preset
+    // dropdown lets the user switch to any vendor without restart.
     setDraft({
-      id: "", kind: "openai_compat", label: "",
+      id: "", kind: "openai_compat", label: "OpenAI",
       base_url: "https://api.openai.com/v1",
       api_key_ref: "env:OPENAI_API_KEY",
-      model: "", enabled: true,
+      _inherited_api_key_ref: "env:OPENAI_API_KEY",
+      model: "gpt-4o-mini", enabled: true,
+      _preset: "openai",
     });
   }
 
@@ -231,16 +377,19 @@ function ProvidersMatrix({ t, status, onStatusRefresh, onCommitBackend }) {
       setOpError(t("settings.providers.error", { msg: "ID must match [A-Za-z0-9_-]{1,80}" }));
       return;
     }
-    let apiKeyRef = (draft.api_key_ref || "").trim();
-    if (isEdit && !apiKeyRef) apiKeyRef = draft._current_api_key_ref || "";
+    const apiKeyRef = (draft.api_key_ref || "").trim();
     const body = {
       kind: draft.kind,
       label: (draft.label || "").trim() || targetId,
       base_url: (draft.base_url || "").trim() || null,
-      api_key_ref: apiKeyRef,
       model: (draft.model || "").trim(),
       enabled: !!draft.enabled,
     };
+    // Only include api_key_ref when we actually have one. Server treats
+    // absence in update mode as "keep stored value" — avoids re-PUTing
+    // a redacted `literal:***` placeholder over a real stored key.
+    // Create mode without api_key_ref → server 422s, which is what we want.
+    if (apiKeyRef) body.api_key_ref = apiKeyRef;
     setSaving(true);
     try {
       await window.API.upsertProvider(targetId, body);

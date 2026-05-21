@@ -3942,6 +3942,22 @@ mark.hl-flash, .hl-jump.hl-flash { animation: hl-flash 0.9s ease-out; }
 }
 .settings-prov-form-row button:disabled { opacity: 0.5; cursor: not-allowed; }
 
+/* ── ApiKeyRefField — single password input + inheritance hint ── */
+.api-key-ref-wrap { display: flex; flex-direction: column; gap: 4px; }
+.api-key-ref-label {
+  font-size: 12px; color: var(--ink-3);
+}
+.api-key-ref-wrap input {
+  font-family: var(--mono); font-size: 13px;
+  padding: 5px 8px;
+  border: 1px solid var(--paper-3); border-radius: 4px;
+  background: var(--paper); color: var(--ink);
+}
+.api-key-ref-hint {
+  font-size: 11px; color: var(--ink-4); line-height: 1.4;
+}
+.api-key-ref-hint-warn { color: oklch(0.50 0.10 50); }
+
 .settings-chip {
   font-family: var(--mono); font-size: 12px;
   padding: 4px 12px; border-radius: 999px;

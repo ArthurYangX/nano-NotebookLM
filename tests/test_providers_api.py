@@ -132,6 +132,66 @@ def test_put_provider_registers_in_router(isolated_providers):
         assert "openai-alt" in s["available_backends"]
 
 
+def test_put_without_api_key_ref_preserves_stored_literal(isolated_providers, monkeypatch):
+    """fix-all v3: editing a row whose stored api_key_ref is a literal
+    key MUST NOT lose the real key just because the frontend omits
+    api_key_ref from the PUT body. Server resolves None → keep stored.
+    """
+    from nano_notebooklm import config
+    from api.server import app, router
+
+    CANARY = "sk-walk-canary-ABC123-keep-me"
+    # Seed a literal-key row directly (bypassing PUT to avoid the
+    # explicit-literal warning log).
+    data = config.load_providers()
+    data["providers"].append({
+        "id": "litprobe", "kind": "openai_compat", "label": "Lit",
+        "base_url": "https://api.openai.com/v1",
+        "api_key_ref": f"literal:{CANARY}",
+        "model": "gpt-4o", "enabled": True,
+    })
+    config.save_providers(data)
+    router.reload()
+
+    with TestClient(app) as c:
+        # PUT WITHOUT api_key_ref — mimics the frontend "leave blank
+        # = keep current" flow after edit.
+        r = c.put("/api/providers/litprobe", json={
+            "kind": "openai_compat", "label": "Lit (renamed)",
+            "base_url": "https://api.openai.com/v1",
+            "model": "gpt-4o-mini",
+            "enabled": True,
+            # ← api_key_ref intentionally absent
+        })
+        assert r.status_code == 200, r.text
+
+    # The real key on disk must still be the canary, NOT the redacted
+    # placeholder. Read providers.json directly — the API redacts so
+    # we can't see it via GET.
+    on_disk = config.load_providers()
+    lit_row = next(p for p in on_disk["providers"] if p["id"] == "litprobe")
+    assert lit_row["api_key_ref"] == f"literal:{CANARY}", (
+        f"literal key was overwritten: got {lit_row['api_key_ref']!r}"
+    )
+    # Label change took effect though
+    assert lit_row["label"] == "Lit (renamed)"
+
+
+def test_put_without_api_key_ref_for_new_provider_422(isolated_providers):
+    """CREATE path: omitting api_key_ref must 422 (nothing to inherit
+    from). Pin the asymmetry between create vs update."""
+    from api.server import app
+    with TestClient(app) as c:
+        r = c.put("/api/providers/brand-new", json={
+            "kind": "openai_compat", "label": "New",
+            "base_url": "https://api.openai.com/v1",
+            "model": "gpt-4o", "enabled": True,
+            # ← no api_key_ref
+        })
+        assert r.status_code == 422, r.text
+        assert "api_key_ref" in r.text
+
+
 def test_put_rejects_bad_id_and_bad_api_key_ref(isolated_providers):
     from api.server import app
     with TestClient(app) as c:
