@@ -190,8 +190,10 @@ def convert_directory(
     *,
     force: bool = False,
 ) -> dict[str, Path | None]:
-    """Convert every .pptx in `upload_dir` (non-recursive); returns a map
-    of source filename → sidecar path (or None on failure / skip).
+    """Convert every .pptx / .ppt in `upload_dir` (non-recursive); returns
+    a map of source filename → sidecar path (or None on failure / skip).
+    LibreOffice handles both formats with the same `--convert-to pdf`
+    invocation, so we accept either suffix.
 
     Caller logs the aggregate result; this helper never raises so a single
     bad deck cannot abort a multi-file upload.
@@ -203,7 +205,7 @@ def convert_directory(
     if not upload_dir.is_dir():
         return out
     for entry in sorted(upload_dir.iterdir()):
-        if entry.suffix.lower() != ".pptx" or not entry.is_file():
+        if entry.suffix.lower() not in (".pptx", ".ppt") or not entry.is_file():
             continue
         out[entry.name] = convert_pptx_to_pdf(
             entry, preview_dir, force=force, soffice=binary,

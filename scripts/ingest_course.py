@@ -23,11 +23,19 @@ def main():
                         help="PDF extractor (pymupdf=fast/lossy, mineru=slow/lossless)")
     parser.add_argument("--lang", choices=["ch", "en"], default="ch",
                         help="MinerU OCR language (only used when --engine=mineru)")
+    parser.add_argument("--previews-dir", type=str, default=None,
+                        help="Directory holding soffice-rendered .pptx → .pdf sidecars; "
+                             "when set with --engine=mineru, .pptx files ride MinerU "
+                             "through their sidecar PDF.")
     parser.add_argument("--build-index", action="store_true", help="Build search index after ingestion")
     args = parser.parse_args()
 
     kb = KBStore()
-    course = kb.ingest_course(args.course_dir, args.course_id, engine=args.engine, lang=args.lang)
+    course = kb.ingest_course(
+        args.course_dir, args.course_id,
+        engine=args.engine, lang=args.lang,
+        previews_dir=Path(args.previews_dir) if args.previews_dir else None,
+    )
     print(f"Ingested course: {course.course_id} (engine={args.engine})")
 
     if args.build_index:

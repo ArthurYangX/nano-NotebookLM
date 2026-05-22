@@ -27,6 +27,7 @@ from __future__ import annotations
 import importlib
 import inspect
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -180,15 +181,27 @@ def test_add_concepts_merge_path_fills_concept_embedding_when_existing_missing()
 def test_extract_from_chunks_offloads_embed_fn_to_thread():
     """Source pin: embed_fn call inside extract_from_chunks must be
     awaited via asyncio.to_thread, not invoked synchronously on the
-    event loop. Grep guards against accidental revert."""
+    event loop.
+
+    fix-all v2 LOW F8 (later refactor) batches the embed_fn call so
+    the exact arg name changed from ``texts`` to ``batch``; the
+    invariant (synchronous embed_fn runs in a thread) is preserved.
+    Pin the threaded-call shape instead of the specific arg name so
+    legitimate batching tweaks don't trip this guard.
+    """
     src = (REPO_ROOT / "nano_notebooklm" / "kg" / "extractor.py").read_text(
         encoding="utf-8"
     )
-    # The line is inside the embed_fn branch in extract_from_chunks; pin
-    # the exact `await asyncio.to_thread(embed_fn, texts)` shape so a
-    # future refactor can't downgrade it to `embs = embed_fn(texts)`.
-    assert "await asyncio.to_thread(embed_fn, texts)" in src, \
+    # The embed_fn call MUST be wrapped in asyncio.to_thread (any
+    # arg name); a bare ``embed_fn(...)`` await would block the loop.
+    assert re.search(r"await\s+asyncio\.to_thread\(\s*embed_fn\s*,", src), (
         "embed_fn must be awaited via asyncio.to_thread to keep the event loop responsive"
+    )
+    # Negative guard: no bare ``embed_fn(...)`` call that isn't behind
+    # to_thread. Grep for ``= embed_fn(`` (assignment shape used pre-fix).
+    assert re.search(r"=\s*embed_fn\(", src) is None, (
+        "found a synchronous ``= embed_fn(...)`` call; must go through asyncio.to_thread"
+    )
 
 
 # ── #A3: graphrag admission uses passes_score_gate ──────────────────

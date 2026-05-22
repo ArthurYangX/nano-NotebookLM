@@ -61,17 +61,31 @@ def test_drag_handler_skips_offsets_when_sim_is_live():
     )
 
 
-def test_alphatarget_restart_only_on_mousedown_not_mousemove():
-    """fix-all v1 #A4: alphaTarget(0.2).restart() fires once at
-    mousedown — per-mousemove restart re-enters the d3 timer and
-    multiplies the tick storm. Inside the mousemove `kind === "node"`
-    branch, restart() must NOT appear in executable code (comments are
-    allowed to reference it for historical context)."""
+def test_alphatarget_restart_fires_at_most_once_per_drag():
+    """fix-all v1 #A4: alphaTarget(0.2).restart() must fire AT MOST
+    once per drag — per-mousemove restart re-enters the d3 timer and
+    multiplies the tick storm.
+
+    2026-05-13 refactor moved the warm-up out of mousedown (so a pure
+    click doesn't shake the graph) into the first real mousemove,
+    gated by ``d.simWarmed``. The contract is now: when restart()
+    appears inside the mousemove ``kind === "node"`` branch it MUST
+    be guarded by an ``if (!d.simWarmed)`` block that flips the flag
+    to true. Without that guard, restart fires every frame again.
+    """
     src = _strip_js_comments(Path("frontend/mindmap.jsx").read_text(encoding="utf-8"))
     m = re.search(r"} else if \(d\.kind === \"node\"\) \{[\s\S]+?\} else if \(d\.kind === \"connect\"", src)
     assert m
     body = m.group(0)
-    assert ".restart()" not in body, "drag mousemove must not call restart()"
+    if ".restart()" in body:
+        # Restart present → must sit under a once-per-drag guard.
+        guard = re.search(r"if\s*\(\s*!\s*d\.simWarmed\s*\)\s*\{[^}]*\.restart\(\)[^}]*d\.simWarmed\s*=\s*true",
+                          body, re.DOTALL)
+        assert guard, (
+            "restart() in mousemove must be wrapped in "
+            "`if (!d.simWarmed) { ...restart()...; d.simWarmed = true; }` "
+            "so it fires at most once per drag"
+        )
 
 
 # ── A3: rAF-throttled tick + childrenByParent Map ────────────────────
@@ -202,11 +216,17 @@ def test_enabled_relations_preserves_disabled_chips_on_re_extract():
     assert "setEnabledRelations(new Set(relationTypes))" not in src
 
 
-# ── A17: CLAUDE.md Maturity Notes mention R4-3 ───────────────────────
+# ── A17: CLAUDE.md still references the mind-map subsystem ───────────
+#
+# Originally pinned the literal "Mind map R4-3" header (a historical
+# fix-all section). After the 2026-05-20 open-source rewrite that
+# anchor is gone, but the underlying contract — CLAUDE.md must point
+# coding agents at the d3-force layout used by mindmap.jsx — still
+# matters. Pin the stable surface (file name + library) instead of
+# the historical section title.
 
 
-def test_claude_md_documents_r4_3():
+def test_claude_md_documents_mindmap_subsystem():
     md = Path("CLAUDE.md").read_text(encoding="utf-8")
-    assert "Mind map R4-3" in md
-    assert "prepareMindmapForce" in md
-    assert "d3-force" in md
+    assert "mindmap.jsx" in md, "CLAUDE.md should point agents at mindmap.jsx"
+    assert "d3-force" in md, "CLAUDE.md should mention the d3-force layout convention"

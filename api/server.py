@@ -257,7 +257,7 @@ async def _warn_multi_worker_unsafe() -> None:
 MAX_UPLOAD_SIZE_MB = 50
 MAX_UPLOAD_SIZE_BYTES = MAX_UPLOAD_SIZE_MB * 1024 * 1024
 
-ALLOWED_UPLOAD_SUFFIXES = {".pdf", ".pptx", ".docx", ".md", ".txt"}
+ALLOWED_UPLOAD_SUFFIXES = {".pdf", ".pptx", ".ppt", ".docx", ".md", ".txt"}
 
 # review-swarm fix-all v1 #6: reject any uploaded filename that contains
 # C0 controls (\x00-\x1f), DEL (\x7f), or Unicode bidi/format characters.
@@ -812,6 +812,17 @@ class NoteFullCourseRequest(BaseModel):
                     "every per-file LLM call. Default false uses cached "
                     "entries whose chunk_hash matches the current chunks.",
     )
+    # Selection-driven generation: when the user has unchecked some files
+    # in the Library sidebar, only generate notes for the remaining set.
+    # `None` (default) means "no filter — generate for every source_file"
+    # — same convention as ChatRequest.checked_files. An empty list `[]`
+    # is rejected by the endpoint with a 422 so a UI bug that sends an
+    # empty selection doesn't silently produce a zero-file generation.
+    checked_files: list[str] | None = Field(
+        None,
+        description="If set, generate notes only for source_files in this "
+                    "list. None = all files. Mirrors ChatRequest convention.",
+    )
 
 
 class NotePdfExportRequest(BaseModel):
@@ -1136,9 +1147,27 @@ async def delete_course(course_id: str):
     # course_id wait until we finish — and vice versa, we wait for any
     # in-flight upload to release. After release we evict the lock so the
     # dict doesn't accumulate one entry per deleted course.
+    #
+    # 2026-05-22 fix: refuse to block indefinitely on an in-flight upload.
+    # The pre-fix `async with upload_lock:` would silently wait minutes-to-
+    # hours when the user's upload was stuck on a slow extractor (mineru
+    # CPU fallback can take 2h+ for a 350-page deck). The user perceived
+    # this as "delete button does nothing" and the dir stayed populated.
+    # Try to acquire with a 0.5s window; if it's held, surface a 409 so
+    # the UI can prompt the user to cancel the in-flight upload first.
     upload_lock = _upload_lock_for(course_id)
-    async with upload_lock:
+    try:
+        await _asyncio.wait_for(upload_lock.acquire(), timeout=0.5)
+    except _asyncio.TimeoutError:
+        raise HTTPException(
+            status_code=409,
+            detail=f"upload in progress for course {course_id!r}; "
+                   f"cancel it before deleting the course.",
+        )
+    try:
         await _asyncio.to_thread(_do_delete)
+    finally:
+        upload_lock.release()
     _maybe_evict_upload_lock(course_id)
     # review-swarm v2 MED-5 (2026-05-13): bust the graphrag courses-with-KG
     # cache so All Courses graphrag stops surfacing the deleted course on
@@ -1262,14 +1291,14 @@ def _schedule_lazy_pptx_render(course_id: str, source_file: str, source_path: Pa
 
 
 def _resolve_pptx_pdf_sidecar(course_id: str, source_file: str) -> Path | None:
-    """For a .pptx `source_file`, return the sidecar PDF path if generated.
+    """For a .pptx / .ppt `source_file`, return the sidecar PDF path if generated.
 
-    Returns None for non-pptx inputs and when no sidecar exists. Same
+    Returns None for non-pptx/ppt inputs and when no sidecar exists. Same
     path-traversal guard as `_resolve_source_path` (resolve + relative_to
     the preview root) so a hand-crafted `source_file="../../etc/passwd"`
     cannot escape the preview dir.
     """
-    if not source_file or Path(source_file).suffix.lower() != ".pptx":
+    if not source_file or Path(source_file).suffix.lower() not in (".pptx", ".ppt"):
         return None
     from nano_notebooklm.ingest.pptx_pdf import sidecar_path
     preview_root = _preview_dir_for(course_id).resolve() if _preview_dir_for(course_id).exists() else None
@@ -1755,9 +1784,19 @@ async def stream_full_course_notes(req: NoteFullCourseRequest, request: Request)
     # off disk and instantiates Pydantic models — for a 15K-chunk course
     # that's 100-500ms of sync work before the first `plan` event can
     # ship. Push it to a thread so the event loop stays responsive.
+    # Reject explicit empty-list selection (UI bug guard): a user who
+    # unchecks every file should not be able to invoke generation with
+    # zero source_files. None = all (default); a non-empty subset is fine.
+    if req.checked_files is not None and len(req.checked_files) == 0:
+        raise HTTPException(
+            status_code=422,
+            detail="checked_files is an empty list — uncheck-all means "
+                   "nothing to generate. Send null/omit to generate all.",
+        )
     plans = await asyncio.to_thread(
         notes_full_course.plan_for_course, kb, course_id,
         user_lang=user_lang, force_refresh=req.force,
+        checked_files=req.checked_files,
     )
 
     global_sem = _get_full_course_semaphore()
@@ -2048,6 +2087,54 @@ async def stream_full_course_notes(req: NoteFullCourseRequest, request: Request)
                         "type": "review_chunk",
                         "delta": item,
                     }, ensure_ascii=False) + "\n"
+
+                # C2 continuation for the review pass: when the upstream
+                # hits max_output_tokens mid-polish, re-prompt with the
+                # tail of partial output asking the model to resume from
+                # exactly where it stopped. Same shape as the per-file
+                # continuation in generate_file_stream — bounded rounds,
+                # each round can itself truncate, and a crashing
+                # continuation keeps whatever partial body we've assembled
+                # so far (still flagged review_truncated for the UI chip).
+                cont_round = 0
+                max_rounds = notes_full_course.CONTINUATION_MAX_ROUNDS
+                tail_chars = notes_full_course.CONTINUATION_TAIL_CHARS
+                while review_truncated and cont_round < max_rounds:
+                    cont_round += 1
+                    review_truncated = False
+                    tail = partial[-tail_chars:]
+                    cont_prompt = notes_full_course.build_review_continuation_prompt(
+                        tail, cont_round, max_rounds,
+                    )
+                    try:
+                        async for item in router.complete_stream(
+                            cont_prompt,
+                            task_type=review_inputs["task_type"],
+                            system=review_inputs["system"],
+                            temperature=review_inputs["temperature"],
+                            max_tokens=review_inputs["max_tokens"],
+                        ):
+                            if isinstance(item, TruncationSignal):
+                                review_truncated = True
+                                logger.warning(
+                                    "review continuation round %d also "
+                                    "truncated for course %s (reason=%s)",
+                                    cont_round, course_id, item.reason,
+                                )
+                                continue
+                            partial += item
+                            yield json.dumps({
+                                "type": "review_chunk",
+                                "delta": item,
+                            }, ensure_ascii=False) + "\n"
+                    except Exception as e:  # noqa: BLE001
+                        logger.warning(
+                            "review continuation round %d failed for course "
+                            "%s: %s — keeping partial output",
+                            cont_round, course_id, type(e).__name__,
+                        )
+                        review_truncated = True
+                        break
 
                 # Sanitize the reviewed body with the no-cap variant — a
                 # 20-file course legitimately exceeds the 80KB single-topic
@@ -3265,13 +3352,15 @@ class UploadTaskStateResponse(BaseModel):
 #     the local Mac path, so not used here.
 _EXTRACT_SECS_PER_PAGE = {
     "pymupdf": 0.05,
-    # Memory's NIGHTLY_2026-05-13 cites 10s/page for mineru CPU-OCR on
-    # cold cache; this session's benchmarks measured 3-4s/page steady-
-    # state on M4. We use 6 as the middle — close to warm reality, far
-    # enough from the floor that an unlucky first page doesn't blow it.
-    "mineru": 6.0,
+    # 2026-05-22 (fix-all v3 round 2): 10 → 13s/page. Direct
+    # observation: 8-page pptx-via-sidecar deck took 96-107s through
+    # mineru-api server backend on CPU = 12-13s/page. Over-estimating
+    # by 10% is far better UX than under-estimating by 30%.
+    "mineru": 13.0,
 }
-_PPTX_RENDER_SECS_PER_SLIDE = 2.0
+# 2026-05-22 (fix-all v3): observed soffice ~5s for 8-page deck =
+# ~0.6s/page incl. startup. Was 2s/page (way overestimating).
+_PPTX_RENDER_SECS_PER_SLIDE = 0.5
 _PPTX_BASE_SECS = 5.0  # LibreOffice startup
 _MINERU_COLD_START_SECS = 40.0  # one-time cost when server isn't warm
 
@@ -3301,7 +3390,7 @@ def _scan_file_pages(upload_dir: Path) -> tuple[int, dict[Path, int]]:
                     pages = len(doc) or 1
             except Exception:  # noqa: BLE001 — corrupt PDF, fall back
                 pages = max(1, size // 100_000)
-        elif suffix == ".pptx":
+        elif suffix in (".pptx", ".ppt"):
             # fix-all v2 M4: skip python-pptx slide count for the ETA.
             # python-pptx uses lxml under the hood without disabling
             # entity expansion, so a malicious deck (billion-laughs /
@@ -3361,11 +3450,16 @@ def _estimate_upload_duration_seconds(
             extracting += pages * per_page
             chunking += pages * 0.01  # segmentation is ~10ms/page
             estimated_chunks += pages * 4
-        elif suffix == ".pptx":
-            # LibreOffice startup + per-slide render is UI-prep cost
-            # we attribute to extracting (the pptx sidecar flow lives
-            # in the extracting stage on the server side).
+        elif suffix in (".pptx", ".ppt"):
+            # LibreOffice startup + per-slide render = sidecar prep cost.
             extracting += _PPTX_BASE_SECS + pages * _PPTX_RENDER_SECS_PER_SLIDE
+            # fix-all v3 (2026-05-22): pptx + engine=mineru also runs the
+            # rendered sidecar PDF through MinerU. Previously this branch
+            # only counted the soffice cost, leaving the ETA short by the
+            # entire mineru leg (e.g. 8-page deck: estimate 21s, actual
+            # ~130s). Add the same per-page cost as a real PDF.
+            if effective_engine == "mineru":
+                extracting += pages * per_page
             chunking += pages * 0.02
             estimated_chunks += pages * 2
         elif suffix == ".docx":
@@ -3377,12 +3471,17 @@ def _estimate_upload_duration_seconds(
             chunking += 0.2
             estimated_chunks += max(2, size // 5_000)
 
-    # mineru cold-start surcharge (once per process). mineru_warm is
-    # True/False/None — None means warm-up in flight, treat as cold.
-    # fix-all v2 M2: skip the cold-start surcharge when mineru is
-    # sticky-disabled and we've fallen back to pymupdf.
-    if effective_engine == "mineru" and not mineru_warm:
-        extracting += _MINERU_COLD_START_SECS
+    # 2026-05-22 (fix-all v4 M4): scale the surcharge by warmth. The
+    # FastAPI warmup ping only confirms the process is reachable; the
+    # pipeline model loads lazily on the first /file_parse. But on the
+    # SECOND upload the model is fully warm, so a full 40s surcharge
+    # over-estimates by 25-35s. Pay the full cost only when warmth is
+    # unknown/false; pay a small first-call latency floor when warm.
+    if effective_engine == "mineru":
+        if mineru_warm:
+            extracting += 8.0   # first-request latency on a warm server
+        else:
+            extracting += _MINERU_COLD_START_SECS
 
     # 2026-05-20: embedding cost depends heavily on EMBEDDING_MODE.
     #   - local sentence-transformer: ~0.05s/chunk (batched 128 on MPS)
@@ -3405,9 +3504,19 @@ def _estimate_upload_duration_seconds(
     import math
     n_files = max(1, len(per_file_pages))
     STAGE_A_CONCURRENCY = 3
-    STAGE_A_SECS_PER_CALL = 18.0  # codex avg in practice, with some slow tail
-    kg_a = max(STAGE_A_SECS_PER_CALL,
-               math.ceil(n_files / STAGE_A_CONCURRENCY) * STAGE_A_SECS_PER_CALL)
+    # 2026-05-22 (fix-all v3 round 2): bumped 18 → 45s. The earlier 18s
+    # baseline assumed codex non-thinking mode at full throughput. In
+    # practice (DeepSeek V4 thinking / Claude / Gemini): 30-60s per
+    # call is the realistic range for a pptx-sized chunk of text.
+    STAGE_A_SECS_PER_CALL = 45.0
+    # 2026-05-22 (fix-all v4 M4): scale the per-call cost by avg
+    # pages-per-file. A 1-page deck's prompt is a fraction of a
+    # 30-page textbook's, so the LLM tail is shorter. Reference
+    # `STAGE_A_SECS_PER_CALL` budget is for ~8-page material.
+    avg_pages = max(1.0, sum(per_file_pages.values()) / n_files) if per_file_pages else 1.0
+    stage_a_size_factor = min(1.0, max(0.25, avg_pages / 8.0))
+    stage_a_per_call_eff = max(8.0, STAGE_A_SECS_PER_CALL * stage_a_size_factor)
+    kg_a = math.ceil(n_files / STAGE_A_CONCURRENCY) * stage_a_per_call_eff
     #
     # Stage B — ONE LLM call per sampled chunk (30% sampling), with
     # `_STAGE_B_CONCURRENCY=10` default. Sample chunks → ceil(N/10)
@@ -3416,9 +3525,22 @@ def _estimate_upload_duration_seconds(
     # concepts per sampled chunk). Embedding cost again depends on mode.
     # Then merge + KG build + JSON save ~3s.
     STAGE_B_CONCURRENCY = 10
-    STAGE_B_SECS_PER_BATCH = 12.0
+    # 2026-05-22 (fix-all v3 round 2): 12 → 30s. Wallclock of an
+    # N-concurrent batch = the slowest call in it; thinking-mode LLMs
+    # routinely run 20-40s. Reserving 30s leaves a small over-estimate
+    # margin for the typical case.
+    STAGE_B_SECS_PER_BATCH = 30.0
     sampled_chunks = max(1, int(round(estimated_chunks * 0.3)))
-    kg_b_llm = math.ceil(sampled_chunks / STAGE_B_CONCURRENCY) * STAGE_B_SECS_PER_BATCH
+    # 2026-05-22 (fix-all v4 M4): scale a partial last batch by its
+    # fill ratio. A 1-chunk "batch" doesn't pay the same tail-latency
+    # cost as a fully-packed 10-chunk batch; baseline 50% of full.
+    n_full_batches = sampled_chunks // STAGE_B_CONCURRENCY
+    last_batch_fill = sampled_chunks - n_full_batches * STAGE_B_CONCURRENCY
+    last_batch_cost = (
+        STAGE_B_SECS_PER_BATCH * (0.5 + 0.5 * last_batch_fill / STAGE_B_CONCURRENCY)
+        if last_batch_fill > 0 else 0.0
+    )
+    kg_b_llm = n_full_batches * STAGE_B_SECS_PER_BATCH + last_batch_cost
     n_concepts = sampled_chunks * 3
     if embedding_mode == "api":
         # codex /embeddings for concepts; ~1s/concept amortized but with
@@ -3429,12 +3551,14 @@ def _estimate_upload_duration_seconds(
     kg_b_save = 3.0
     kg_b = kg_b_llm + kg_b_embed + kg_b_save
 
-    # Baseline values themselves are conservative (memory: 10s/page for
-    # mineru CPU-OCR is the cold-cache figure; warm steady-state is
-    # 3-6s/page). Keep a small 10% safety on top instead of compounding
-    # the conservative baseline with a large margin.
+    # 2026-05-22 (fix-all v3 round 2): safety margin 10% → 40%.
+    # Reality across the upload pipeline has more variance than the
+    # baselines capture (heavy LaTeX pages, LLM tail latency, soffice
+    # warm-up jitter). Better UX to over-estimate by 40% than to
+    # under-estimate by 50% (an "ETA: 2min" tag rotting visibly past
+    # 4min is worse than an "ETA: 5min" tag finishing in 3min).
     total = extracting + chunking + embedding + kg_a + kg_b
-    return max(5, int(round(total * 1.1)))
+    return max(5, int(round(total * 1.4)))
 
 
 @app.post("/api/upload/{course_id}", tags=["ingest"],
@@ -3522,7 +3646,10 @@ async def upload_files(
     # stage event fires). Failures are silent — Reader text-mode is the
     # fallback. We snapshot the .pptx file list here so concurrent uploads
     # to the same course can't race on the rename.
-    pptx_to_render = sorted(p for p in upload_dir.glob("*.pptx") if p.is_file())
+    pptx_to_render = sorted(
+        p for p in upload_dir.iterdir()
+        if p.is_file() and p.suffix.lower() in (".pptx", ".ppt")
+    )
 
     # ── Schedule background task; return task_id immediately ──
     import asyncio as _asyncio
@@ -3698,22 +3825,34 @@ async def _run_upload_pipeline(
                 # (chunking-done-per-file).
                 current_stage = EXTRACTING
                 _set_stage(state, EXTRACTING, 0)
-                # extracting bar carves out 0-50 for pptx sidecar render
-                # (if any), 50-99 for the file extraction loop. 100 is
-                # written by ingest_course's forced end-tick + final write
-                # below.
-                extracting_lo = 50 if (pptx_to_render and getattr(app.state, "pptx_pdf_available", False)) else 0
+                # fix-all v3 (2026-05-22): the extracting bar reflects ONLY
+                # the actual MinerU / PyMuPDF extraction work — the
+                # soffice pptx→pdf sidecar render runs BEFORE it as a
+                # silent preparation step (stage stays EXTRACTING=0, only
+                # the detail.sub string changes). Previously the soffice
+                # phase carved out 0-50% of the bar, which on a fast deck
+                # made the bar jump to 50% in 3s then appear stuck for
+                # 80+s while MinerU did the real work — confusing UX.
+                # Resolve preview_dir unconditionally so the engine=mineru
+                # pptx-via-sidecar path (handled inside kb.ingest_course)
+                # has a directory to look in even when this pipeline run
+                # didn't need to re-render any sidecars (e.g. cache hit).
+                preview_dir = _preview_dir_for(course_id)
                 if pptx_to_render and getattr(app.state, "pptx_pdf_available", False):
-                    _set_stage(state, EXTRACTING, 25, detail={
-                        "sub": f"rendering {len(pptx_to_render)} pptx preview(s)",
+                    # Structured-only detail so the frontend localizes via
+                    # i18n (`processing.with_pptx_render`). Never emit a
+                    # human-readable English `sub` here — zh users would
+                    # otherwise see the English string in the overlay.
+                    _set_stage(state, EXTRACTING, 0, detail={
+                        "pptx_previews_total": len(pptx_to_render),
+                        "pptx_previews_rendered": 0,
                     })
                     from nano_notebooklm.ingest.pptx_pdf import convert_directory
-                    preview_dir = _preview_dir_for(course_id)
                     sidecar_results = await _asyncio.to_thread(
                         convert_directory, upload_dir, preview_dir,
                     )
                     rendered = sum(1 for v in sidecar_results.values() if v is not None)
-                    _set_stage(state, EXTRACTING, 50, detail={
+                    _set_stage(state, EXTRACTING, 0, detail={
                         "pptx_previews_rendered": rendered,
                         "pptx_previews_total": len(sidecar_results),
                     })
@@ -3732,23 +3871,45 @@ async def _run_upload_pipeline(
                 # post-to_thread `_set_stage(..., 100)` writes can't be
                 # clobbered by a stale 99 emitted from the worker thread
                 # after to_thread returns (GIL release/acquire ordering).
+                # review-swarm fix-all (M2+M4): monotonic clamp so the bar
+                # only ever advances. Without it, two real cases regress:
+                #   (a) mineru batch fires (1..N) per-file ticks, then the
+                #       wrapper raises and store.py falls through to the
+                #       per-file loop with `extracted_so_far = 0` → bar
+                #       visibly drops from e.g. 75% back to 25%.
+                #   (b) The old defensive `max(extracting_lo, pct)` clamp
+                #       was dropped during the fix-all v3 split; today's
+                #       callers happen to be monotonic but the contract
+                #       wasn't enforced by the function.
+                # Clamping here makes both correct regardless of caller.
+                extract_pct_hwm = 0
+                chunk_pct_hwm = 0
+
                 def _on_extract_progress(done: int, total: int) -> None:
-                    nonlocal current_stage
+                    nonlocal current_stage, extract_pct_hwm
                     current_stage = EXTRACTING
-                    pct = extracting_lo + int((98 - extracting_lo) * done / max(total, 1))
-                    _set_stage(state, EXTRACTING, min(98, max(extracting_lo, pct)))
+                    # fix-all v3: bar = 0-98 reflects ONLY the real
+                    # extraction work (MinerU / PyMuPDF). soffice pptx→pdf
+                    # render no longer carves out a leading window.
+                    pct = int(98 * done / max(total, 1))
+                    pct = min(98, max(extract_pct_hwm, pct))
+                    extract_pct_hwm = pct
+                    _set_stage(state, EXTRACTING, pct)
 
                 def _on_chunk_progress(done: int, total: int) -> None:
-                    nonlocal current_stage
+                    nonlocal current_stage, chunk_pct_hwm
                     current_stage = "chunking"
                     pct = int(98 * done / max(total, 1))
-                    _set_stage(state, "chunking", min(98, max(0, pct)))
+                    pct = min(98, max(chunk_pct_hwm, pct))
+                    chunk_pct_hwm = pct
+                    _set_stage(state, "chunking", pct)
 
                 _set_stage(state, "chunking", 0)
                 course_obj = await _asyncio.to_thread(
                     kb.ingest_course, str(upload_dir), course_id, engine, lang,
                     on_progress=_on_chunk_progress,
                     on_extract_progress=_on_extract_progress,
+                    previews_dir=preview_dir,
                 )
                 _set_stage(state, EXTRACTING, 100)
                 _set_stage(state, "chunking", 100, detail={

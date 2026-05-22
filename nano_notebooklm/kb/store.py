@@ -262,15 +262,24 @@ class KBStore:
         lang: str = "ch",
         on_progress: Callable[[int, int], None] | None = None,
         on_extract_progress: Callable[[int, int], None] | None = None,
+        previews_dir: Path | None = None,
     ) -> Course:
         """Ingest all documents from a course directory.
 
         Args:
           engine: `pymupdf` (fast default) or `mineru` (slow, 10s/page on
             M4 CPU, but recovers LaTeX equations and tables that PyMuPDF
-            destroys). Only affects `.pdf` files; other types use their
-            native extractor either way.
+            destroys).
           lang: passed to mineru when `engine='mineru'`. `ch` or `en`.
+          previews_dir: when set AND engine=='mineru', `.pptx` / `.ppt`
+            files whose soffice-rendered PDF sidecar lives under this
+            directory get routed through MinerU on the sidecar — so
+            slides with embedded LaTeX / complex tables benefit from
+            MinerU just like real PDFs do. Chunks remain stamped with
+            the ORIGINAL .pptx as source (the sidecar shares page
+            numbering with the reader's PDF preview, so citation jumps
+            still align). When unset OR no sidecar exists, .pptx
+            extraction falls back to python-pptx as before.
         """
         course_dir = Path(course_dir)
         if course_id is None:
@@ -328,20 +337,67 @@ class KBStore:
                 logger.warning("on_extract_progress raised at start; suppressed", exc_info=True)
 
         mineru_batch_results: dict[str, list[PageInfo]] = {}
+        # Map original .pptx file → sidecar PDF path. Only populated when
+        # engine=='mineru' AND a sidecar exists. The per-file loop below
+        # uses this to swap mineru results from the sidecar key back onto
+        # the original .pptx file's chunks.
+        pptx_sidecar_for: dict[Path, Path] = {}
+        # Hoisted so the per-file tick gate below can tell which
+        # originals were already accounted for by the post-batch tick.
+        pdf_files: list[Path] = []
+        pptx_files: list[Path] = []
         if engine == "mineru":
             pdf_files = [f for f in files if f.suffix.lower() == ".pdf"]
-            if pdf_files:
+            pptx_files = [f for f in files if f.suffix.lower() in (".pptx", ".ppt")]
+            if previews_dir is not None and pptx_files:
+                from nano_notebooklm.ingest.pptx_pdf import sidecar_path as _sidecar_for
+                for ppt in pptx_files:
+                    cand = _sidecar_for(previews_dir, ppt.name)
+                    if cand.exists():
+                        pptx_sidecar_for[ppt] = cand
+                    else:
+                        logger.info(
+                            "pptx-via-mineru: %s has no sidecar at %s; "
+                            "falling back to python-pptx for this file",
+                            ppt.name, cand,
+                        )
+            batch_inputs: list[Path] = list(pdf_files) + list(pptx_sidecar_for.values())
+            if batch_inputs:
                 from nano_notebooklm.ingest.extractors_mineru import (
                     extract_pdfs_mineru_batch,
                     MinerUExtractionError,
                 )
                 logger.info(
-                    "mineru engine: batch-extracting %d PDFs in one subprocess",
-                    len(pdf_files),
+                    "mineru engine: batch-extracting %d PDFs (%d direct + %d pptx sidecar) "
+                    "in one subprocess",
+                    len(batch_inputs), len(pdf_files), len(pptx_sidecar_for),
                 )
+                # fix-all v3 (2026-05-22): per-file tick so the UI bar
+                # advances during a multi-file mineru batch instead of
+                # jumping 0 → done at the very end. Pages aren't ticked
+                # (mineru /file_parse is one-shot per file); file-level
+                # is the finest granularity we get from the server.
+                #
+                # Denominator note (review-swarm M1): `done` here is local
+                # to the batch (1..len(batch_inputs)) but we forward it
+                # against `total_files`, which is correct — those `done`
+                # files are also "done" from the global course's POV.
+                # Non-PDFs that the batch never touched then get ticked by
+                # the per-file loop below, smoothly advancing the bar to
+                # 100. The chunking bar (separate phase) continues
+                # advancing during any non-PDF extract tail so the user
+                # never sees both bars idle simultaneously.
+                def _on_mineru_file_done(done: int, total: int) -> None:
+                    if on_extract_progress is None:
+                        return
+                    try:
+                        on_extract_progress(done, max(total_files, 1))
+                    except Exception:
+                        logger.warning("on_extract_progress raised inside mineru batch tick", exc_info=True)
                 try:
                     mineru_batch_results = extract_pdfs_mineru_batch(
-                        [str(p) for p in pdf_files], lang=lang,
+                        [str(p) for p in batch_inputs], lang=lang,
+                        on_file_done=_on_mineru_file_done,
                     )
                 except (MinerUExtractionError, FileNotFoundError) as exc:
                     # Batch failed wholesale → fall back to per-file
@@ -353,11 +409,12 @@ class KBStore:
                     )
                 # Mineru batch is "all or nothing" — once it returns,
                 # extraction for every PDF in the batch is effectively
-                # done. Non-PDFs still extract per-file below; their
-                # progress increments through the per-file loop.
+                # done. Non-PDFs (other than pptx-via-sidecar) still
+                # extract per-file below; their progress increments
+                # through the per-file loop.
                 if on_extract_progress and mineru_batch_results:
                     try:
-                        on_extract_progress(len(pdf_files), max(total_files, 1))
+                        on_extract_progress(len(batch_inputs), max(total_files, 1))
                     except Exception:
                         logger.warning("on_extract_progress raised after mineru batch; suppressed", exc_info=True)
 
@@ -374,14 +431,19 @@ class KBStore:
         # the minimal honest fix.
         extracted_ok = 0
         skipped_files: list[str] = []
-        # fix-all v2 LOW F3: track files for which extraction has completed
-        # via an explicit counter instead of relying on the loop index `i`
-        # being cumulative across both the mineru-batched PDFs and the
-        # per-file loop. A future refactor (e.g. `for i, filepath in
-        # enumerate(non_pdf_files):`) would silently double-count without
-        # this decoupling. Initialized to the number of files already
-        # accounted for by the mineru batch tick above.
-        extracted_so_far = len(mineru_batch_results) if mineru_batch_results else 0
+        # fix-all v4 H2 (2026-05-22): track which ORIGINAL filepaths the
+        # mineru batch was supposed to cover. The per-file loop below
+        # must not re-tick for these — their count was paid at the
+        # post-batch tick (`on_extract_progress(len(batch_inputs), …)`)
+        # above. The previous form initialised `extracted_so_far` from
+        # `len(mineru_batch_results)`, which (a) diverged from the
+        # post-batch tick when mineru returned fewer entries than
+        # submitted, and (b) let the loop re-tick when sidecar lookup
+        # missed → progress bar could overshoot total_files.
+        batch_originals: set[Path] = set()
+        if engine == "mineru" and mineru_batch_results:
+            batch_originals = set(pdf_files) | set(pptx_sidecar_for.keys())
+        extracted_so_far = len(batch_originals)
         with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}")) as progress:
             task = progress.add_task(f"Ingesting {course_id}...", total=total_files)
             for i, filepath in enumerate(files, start=1):
@@ -391,6 +453,23 @@ class KBStore:
                     if engine == "mineru" and filepath.suffix.lower() == ".pdf":
                         pages = mineru_batch_results.get(str(filepath.resolve()))
                         file_type = FileType.PDF
+                    elif engine == "mineru" and filepath in pptx_sidecar_for:
+                        # pptx routed through MinerU via its rendered
+                        # sidecar PDF. Pages come from the sidecar's
+                        # extraction; file_type stays PPTX so the
+                        # browser reader continues to resolve the
+                        # original .pptx → sidecar.pdf for preview
+                        # (which is the file mineru just read from —
+                        # page numbers line up).
+                        sidecar = pptx_sidecar_for[filepath]
+                        pages = mineru_batch_results.get(str(sidecar.resolve()))
+                        file_type = FileType.PPTX
+                        if pages is None:
+                            logger.info(
+                                "pptx-via-mineru: batch result missing for %s "
+                                "(sidecar %s); falling back to python-pptx",
+                                filepath.name, sidecar.name,
+                            )
                     if pages is None:
                         pages, file_type = extract_file(filepath, engine=engine, lang=lang)
                         extracted_in_loop = True
@@ -403,11 +482,17 @@ class KBStore:
                     # Tick extracting AFTER extract_file (pymupdf or any
                     # non-PDF). PDFs that came from the mineru batch had
                     # their tick already accounted for above.
-                    # fix-all v2 LOW F3: pass `extracted_so_far` (count of
-                    # files for which extraction has completed) rather
-                    # than `i` (raw loop index) so a future loop refactor
-                    # over a filtered list can't silently double-count.
-                    if extracted_in_loop and on_extract_progress:
+                    # fix-all v4 H2: also skip the tick when the file is
+                    # an original mineru *intended* to handle (whether
+                    # or not the lookup found pages) — its count was
+                    # paid by the post-batch tick. Otherwise a sidecar
+                    # lookup miss + python-pptx fallback would tick the
+                    # same file twice and overshoot total_files.
+                    if (
+                        extracted_in_loop
+                        and filepath not in batch_originals
+                        and on_extract_progress
+                    ):
                         extracted_so_far += 1
                         try:
                             on_extract_progress(extracted_so_far, max(total_files, 1))

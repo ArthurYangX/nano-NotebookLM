@@ -52,6 +52,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+from typing import Callable
 
 from nano_notebooklm.types import PageInfo
 
@@ -478,6 +479,7 @@ async def _extract_one_via_server(
     lang: str,
     *,
     timeout_seconds: float | None = None,
+    client: "httpx.AsyncClient | None" = None,
 ) -> list[PageInfo]:
     """POST a single PDF to the mineru-api server and parse the response.
 
@@ -487,6 +489,12 @@ async def _extract_one_via_server(
 
     ``timeout_seconds`` is the per-PDF HTTP read timeout. When None,
     defaults to ``_per_pdf_timeout()`` (300s or operator override).
+
+    ``client`` is an optional shared ``httpx.AsyncClient`` so a batch
+    caller (extract_pdfs_mineru_via_server) can reuse one connection
+    pool across N PDFs instead of paying TLS + pool warmup per file.
+    When None, a per-call client is created and torn down (backwards-
+    compatible path used by the direct-call tests).
     """
     import httpx
 
@@ -499,25 +507,37 @@ async def _extract_one_via_server(
     # Open the file in a thread to avoid blocking the loop on slow disks.
     data = await asyncio.to_thread(filepath.read_bytes)
     files = {"files": (filepath.name, data, "application/pdf")}
-    # ``lang_list`` accepts multi-value form fields. Pass one per file.
-    form = [
-        ("lang_list", lang),
-        ("backend", "pipeline"),
-        ("parse_method", "auto"),
-        ("formula_enable", "true"),
-        ("table_enable", "true"),
-        ("return_md", "false"),
-        ("return_middle_json", "false"),
-        ("return_model_output", "false"),
-        ("return_content_list", "true"),
-        ("return_images", "false"),
-        ("response_format_zip", "false"),
-        ("return_original_file", "false"),
-    ]
+    # fix-all v3 (2026-05-22): httpx 0.28's AsyncClient.post() crashes
+    # with "Attempted to send an sync request with an AsyncClient instance"
+    # when `data` is a list-of-tuples (the form-encoded multi-value
+    # shape). Dict-with-string-values works correctly. Single-file
+    # path here only needs single values, so a dict is fine.
+    form = {
+        "lang_list": lang,
+        "backend": "pipeline",
+        "parse_method": "auto",
+        "formula_enable": "true",
+        "table_enable": "true",
+        "return_md": "false",
+        "return_middle_json": "false",
+        "return_model_output": "false",
+        "return_content_list": "true",
+        "return_images": "false",
+        "response_format_zip": "false",
+        "return_original_file": "false",
+    }
 
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(timeout_seconds, connect=10.0)) as client:
-            resp = await client.post(f"{server_url}/file_parse", files=files, data=form)
+        if client is not None:
+            # Shared batch-level client: per-call request timeout overrides
+            # the client's default so a stuck PDF doesn't stall the next.
+            resp = await client.post(
+                f"{server_url}/file_parse", files=files, data=form,
+                timeout=httpx.Timeout(timeout_seconds, connect=10.0),
+            )
+        else:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(timeout_seconds, connect=10.0)) as _c:
+                resp = await _c.post(f"{server_url}/file_parse", files=files, data=form)
     except httpx.HTTPError as exc:
         # fix-all v1 (review-swarm S3 L1): the singleton may be stale
         # (proc died between poll and send). Clear it so the next call
@@ -540,14 +560,19 @@ async def _extract_one_via_server(
         raise MinerUExtractionError(f"mineru-api {filepath.name}: bad JSON: {exc}") from exc
 
     results = payload.get("results") or {}
-    # The server keys by the original filename (with extension).
+    # The server keys by the original filename. Two known formats:
+    #   1. Exact `filepath.name` (most common).
+    #   2. Stripped of exactly one trailing `.pdf` — happens on the
+    #      pptx-via-sidecar path where filepath.name is `deck.pptx.pdf`
+    #      and the server keys it as `deck.pptx`.
+    # fix-all v4 M5 (2026-05-22): dropped the fuzzy `Path(k).stem ==
+    # filepath.stem` fallback. With two uploads like `foo.pdf` and
+    # `foo.pptx` (sidecar `foo.pptx.pdf`) the fuzzy match could route
+    # one file's chunks onto the other's. Fail fast with the exact
+    # key list instead — easier to debug than silent mis-routing.
     entry = results.get(filepath.name)
-    if entry is None:
-        # Fall back to stem match — older versions strip the suffix.
-        for k, v in results.items():
-            if Path(k).stem == filepath.stem:
-                entry = v
-                break
+    if entry is None and filepath.suffix.lower() == ".pdf":
+        entry = results.get(filepath.with_suffix("").name)
     if entry is None:
         raise MinerUExtractionError(
             f"mineru-api {filepath.name}: no entry in results (keys={list(results)[:3]})"
@@ -555,8 +580,20 @@ async def _extract_one_via_server(
 
     blocks = entry.get("content_list")
     if not isinstance(blocks, list):
+        # fix-all v3 (2026-05-22): include entry shape so we can see what
+        # the server actually returned. Previously this just said
+        # "content_list missing" with no clue about which field IS there
+        # — making debugging impossible without poking the server.
+        entry_keys = list(entry.keys()) if isinstance(entry, dict) else []
+        entry_preview = ""
+        if isinstance(entry, dict):
+            for k in ("error", "status", "message", "detail"):
+                if k in entry:
+                    entry_preview = f" · {k}={str(entry[k])[:120]}"
+                    break
         raise MinerUExtractionError(
-            f"mineru-api {filepath.name}: content_list missing or wrong type"
+            f"mineru-api {filepath.name}: content_list missing or wrong type "
+            f"(entry keys={entry_keys}{entry_preview})"
         )
 
     pages = _blocks_to_pages(blocks)
@@ -590,6 +627,7 @@ async def extract_pdfs_mineru_via_server(
     *,
     timeout_seconds: float = 1800.0,
     device: str = "cpu",
+    on_file_done: Callable[[int, int], None] | None = None,
 ) -> dict[str, list[PageInfo]]:
     """Server-backed batch: one HTTP request per PDF, ``asyncio.gather``.
 
@@ -622,23 +660,53 @@ async def extract_pdfs_mineru_via_server(
     logger.info("mineru-api: batch start — %d PDFs", len(paths))
     t0 = time.monotonic()
 
-    async def _one(p: Path) -> tuple[Path, list[PageInfo] | None, str | None]:
-        try:
-            pages = await _extract_one_via_server(url, p, lang, timeout_seconds=timeout_seconds)
-            return (p, pages, None)
-        except Exception as exc:  # noqa: BLE001 — per-file fault isolation
-            return (p, None, f"{type(exc).__name__}: {exc}")
+    # fix-all v3 round 2 (2026-05-22): hoist a single AsyncClient so the
+    # connection pool is reused across all PDFs in the batch instead of
+    # rebuilt per-file (each rebuild costs ~100ms TLS/pool warmup on
+    # localhost loopback; matters once N > ~5 PDFs).
+    import httpx
+    # review-swarm L4: the shared client's *default* timeout is the
+    # per-PDF budget, not the whole-batch one. Every call site below
+    # passes an explicit per-request timeout, but if a future refactor
+    # drops that override, every request silently inheriting a 30-min
+    # client default would let a single stuck PDF stall the entire
+    # batch instead of timing out at 5 min. Defaulting to the per-PDF
+    # cap fails safe.
+    _client_default_timeout = httpx.Timeout(_per_pdf_timeout(), connect=10.0)
+    async with httpx.AsyncClient(timeout=_client_default_timeout) as shared_client:
+        async def _one(p: Path) -> tuple[Path, list[PageInfo] | None, str | None]:
+            try:
+                pages = await _extract_one_via_server(
+                    url, p, lang, timeout_seconds=timeout_seconds,
+                    client=shared_client,
+                )
+                return (p, pages, None)
+            except Exception as exc:  # noqa: BLE001 — per-file fault isolation
+                return (p, None, f"{type(exc).__name__}: {exc}")
 
-    tasks = [asyncio.create_task(_one(p)) for p in paths]
-    results: dict[str, list[PageInfo]] = {}
-    errors: list[str] = []
-    for fut in asyncio.as_completed(tasks):
-        p, pages, err = await fut
-        if pages is not None:
-            results[str(p)] = pages
-        else:
-            errors.append(f"{p.name}: {err}")
-            logger.warning("mineru-api: failed %s — %s", p.name, err)
+        tasks = [asyncio.create_task(_one(p)) for p in paths]
+        results: dict[str, list[PageInfo]] = {}
+        errors: list[str] = []
+        finished = 0
+        total_files = len(paths)
+        for fut in asyncio.as_completed(tasks):
+            p, pages, err = await fut
+            if pages is not None:
+                results[str(p)] = pages
+            else:
+                errors.append(f"{p.name}: {err}")
+                logger.warning("mineru-api: failed %s — %s", p.name, err)
+            finished += 1
+            # fix-all v3 (2026-05-22): emit a per-file progress tick so the
+            # upload UI's extracting bar advances incrementally instead of
+            # jumping from 0 → done when the whole batch returns. Per-page
+            # ticking isn't possible (mineru-api /file_parse is one-shot
+            # request/response), so file-granularity is the best we have.
+            if on_file_done is not None:
+                try:
+                    on_file_done(finished, total_files)
+                except Exception:
+                    logger.warning("on_file_done raised; suppressed", exc_info=True)
 
     elapsed = time.monotonic() - t0
     logger.info(
@@ -837,6 +905,7 @@ def extract_pdfs_mineru_batch(
     *,
     timeout_seconds: int = 3600,
     device: str = "cpu",
+    on_file_done: Callable[[int, int], None] | None = None,
 ) -> dict[str, list[PageInfo]]:
     """Batch-extract many PDFs through MinerU.
 
@@ -864,6 +933,7 @@ def extract_pdfs_mineru_batch(
                 extract_pdfs_mineru_via_server(
                     filepaths, lang=lang,
                     timeout_seconds=float(timeout_seconds), device=device,
+                    on_file_done=on_file_done,
                 )
             )
         except MinerUExtractionError as exc:

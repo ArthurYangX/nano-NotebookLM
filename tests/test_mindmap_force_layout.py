@@ -130,7 +130,17 @@ def test_relation_filter_zero_edges_renders_isolated_nodes():
     assert "kg-relation-filter" in src
     assert "enabledRelations" in src
     assert "allRelationsFiltered" in src
-    assert "已过滤所有关系" in src
+    # i18n refactor (commit db0c7a8): the chip copy moved from inline
+    # Chinese to a t() key. Pin the literal t()-callsite shape (not just
+    # `'mindmap.filtered_all' in src`, which would pass for a stray
+    # comment or console.log too) and verify the localized string lives
+    # in i18n.js.
+    import re
+    assert re.search(r't\(\s*["\']mindmap\.filtered_all["\']', src), \
+        "mindmap.filtered_all must be invoked via t(...) in mindmap.jsx"
+    i18n_src = Path("frontend/i18n.js").read_text(encoding="utf-8")
+    assert '"mindmap.filtered_all"' in i18n_src
+    assert "已过滤所有关系" in i18n_src
     assert "visNodes.map" in src
 
 
