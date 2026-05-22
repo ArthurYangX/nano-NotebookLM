@@ -14,11 +14,11 @@ English | [简体中文](README.zh-CN.md)
 
 <sub>Not affiliated with Google. NotebookLM is a trademark of Google LLC.</sub>
 
-<a href="https://github.com/ArthurYangX/nano-NotebookLM/releases/download/v0.2.0/hero.mp4">
-  <img src="docs/screenshots/hero.png" alt="nano-NotebookLM hero — click to watch the demo" width="900">
-</a>
-<br>
-<sub>▶ Click the image to play the demo video (MP4, hosted on the v0.2.0 release).</sub>
+<video src="https://github.com/ArthurYangX/nano-NotebookLM/releases/download/v0.2.0/hero.mp4"
+       poster="docs/screenshots/hero.png"
+       width="900" autoplay loop muted playsinline controls>
+  <img src="docs/screenshots/hero.png" alt="nano-NotebookLM hero" width="900">
+</video>
 
 </div>
 
