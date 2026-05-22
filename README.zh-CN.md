@@ -14,11 +14,11 @@
 
 <sub>本项目与 Google 无关。NotebookLM 是 Google LLC 的商标。</sub>
 
-<video src="https://github.com/ArthurYangX/nano-NotebookLM/releases/download/v0.2.0/hero.mp4"
-       poster="docs/screenshots/hero.png"
-       width="900" autoplay loop muted playsinline controls>
-  <img src="docs/screenshots/hero.png" alt="nano-NotebookLM 主图" width="900">
-</video>
+<a href="https://github.com/ArthurYangX/nano-NotebookLM/releases/download/v0.2.0/hero.mp4">
+  <img src="docs/screenshots/hero.png" alt="nano-NotebookLM 主图 — 点击观看演示视频" width="900">
+</a>
+<br>
+<sub>▶ 点击图片播放演示视频（MP4，托管在 v0.2.0 release 上）。</sub>
 
 </div>
 
