@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Question or discussion
+    url: https://github.com/ArthurYangX/nano-NotebookLM/discussions
+    about: For open-ended questions, deployment help, or sharing how you use it.

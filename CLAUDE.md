@@ -28,7 +28,7 @@ provider-agnostic LLM router.
 
 ```
 api/server.py                    FastAPI routes + middleware + Pydantic models.
-                                 ~3000 lines; one file deliberately. Search by route.
+                                 ~5300 lines; one file deliberately. Search by route.
 
 frontend/                        React 18, no bundler. Edit a .jsx and reload.
   app.jsx                        Top-level shell, course switching, topbar chips.
@@ -37,8 +37,21 @@ frontend/                        React 18, no bundler. Edit a .jsx and reload.
   notes.jsx                      LaTeX notes editor (CodeMirror) + tectonic PDF.
   mindmap.jsx                    d3-force KG with edit ops.
   exam-prep.jsx                  Self-evolving quiz.
-  settings.jsx                   Backend chip radios, status badges.
+  quiz.jsx                       Practice quiz (one-shot, non-bank).
+  library.jsx                    Course library sidebar + course picker modal.
+  processing.jsx                 Upload progress overlay (consumes NDJSON stage events
+                                 from /api/upload + the ETA estimator from server.py).
+  settings.jsx                   Providers matrix, embedding-preset radios, status badges.
+  tweaks-panel.jsx               Per-course generation tweaks (note/quiz/exam knobs).
+  i18n.js                        Central STRINGS table (zh + en). All user-facing copy
+                                 goes here; components call `t("key", {placeholders})`.
+                                 New strings: add to the dict + reference via t(); never
+                                 inline a literal in JSX. Missing key falls back to the key.
   api.js                         Fetch wrappers; one place to add a new endpoint client-side.
+  study-state.js                 Shared client state (active course / file / chat session).
+  markdown.js                    Markdown renderer (assistant answers, notes preview).
+  latex-to-html.js               LaTeX → HTML sanitizer for KaTeX rendering.
+  styles.css                     All CSS lives here.
 
 nano_notebooklm/
   ai/
@@ -121,6 +134,11 @@ tests/                           pytest. Runs offline; uses deterministic fake e
   `env:VAR` resolves at backend-build via `os.getenv`, `literal:...`
   stores the key inline. Responses MUST go through
   `_redact_provider_row` so `literal:` values never leave the process.
+- **All UI copy through i18n.** Every user-facing string in `frontend/*.jsx`
+  goes through `t("key", {vars})` resolved against `frontend/i18n.js`.
+  Don't hardcode `"Loading…"` / `"加载中…"` in JSX. Add a new entry to
+  the STRINGS table with both `zh` and `en` bodies; placeholders use
+  `{name}` and are substituted by `t()` at call time.
 
 ---
 
@@ -167,6 +185,33 @@ Use `StreamingResponse(stream(), media_type="application/x-ndjson")`.
 Inside `stream()`, run blocking work in `asyncio.to_thread` and bridge
 to an `asyncio.Queue` if the producer is sync. See `/api/upload` or
 `/api/notes/full-course/stream` for the pattern.
+
+### Background upload pipeline
+
+`POST /api/upload/{course_id}` does NOT block on the heavy ingest; it
+spawns an in-memory background task (`_run_upload_pipeline`) and returns
+`task_id` immediately. The browser then polls `GET /api/upload/{task_id}`
+for stage + percent + detail. Stages, in order:
+`extracting → chunking → embedding → kg_stage_a → kg_stage_b`, each
+emitting truthful 0..100 boundaries; server.py owns the final
+`KG_STAGE_B=100` after `kg.save()`. Tasks live in process memory with a
+1h TTL and die with the server (no Celery, by design).
+
+The processing overlay also shows an ETA computed by
+`_estimate_upload_duration_seconds` (constants near the top: per-page
+extraction cost per engine, mineru cold-start surcharge, Stage A/B
+concurrency + per-call seconds, final safety margin). Tweak these when
+real-world wallclock drifts persistently more than ~30% off the bar.
+
+### Hook MinerU into a non-PDF source
+
+MinerU only natively eats PDFs, but `.pptx` can ride a sidecar: when
+`engine=='mineru'` AND `previews_dir` is passed to `KBStore.ingest_course`,
+each `.pptx` is matched to its soffice-rendered sidecar PDF (path lookup
+via `ingest.pptx_pdf.sidecar_path`). The sidecar is added to the mineru
+batch; results land back on the original `.pptx` filename so chunks
+stamp the user-facing source. `.ppt` rides the same path. If no sidecar
+exists, extraction silently falls back to python-pptx for that file.
 
 ### Touch the knowledge graph
 

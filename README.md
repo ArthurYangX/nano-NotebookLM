@@ -1,32 +1,79 @@
-# nano-NOTEBOOKLM
+<div align="center">
 
-A self-hosted, open-source study assistant. Upload course PDFs / PPTX /
-DOCX / Markdown → automatic knowledge graph + vector index → chat with
-citations, structured LaTeX notes, practice quizzes, exam prep with a
-self-evolving question bank, and an editable mind map.
+# nano-NotebookLM
 
-Bring your own model: works with **OpenAI / DeepSeek / Moonshot / Zhipu /
-MiniMax / Groq / Together / Anthropic Claude / Gemini**, or any local
-runner that speaks OpenAI's `/v1/chat/completions` (**Ollama / vLLM /
-LM Studio / llama.cpp**).
+**A self-hosted, open-source study assistant — chat with citations, structured LaTeX notes, exam-prep with a self-evolving question bank, and an editable knowledge graph.**
 
-> Looking for a quickstart? See [Quick Start](#quick-start). Looking for
-> how things fit together? See [`CLAUDE.md`](CLAUDE.md).
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![Tests](https://github.com/ArthurYangX/nano-NotebookLM/actions/workflows/test.yml/badge.svg)](https://github.com/ArthurYangX/nano-NotebookLM/actions/workflows/test.yml)
+[![Code style](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
+[![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
+
+English | [简体中文](README.zh-CN.md)
+
+<sub>Not affiliated with Google. NotebookLM is a trademark of Google LLC.</sub>
+
+<video src="https://github.com/ArthurYangX/nano-NotebookLM/releases/download/v0.2.0/hero.mp4"
+       poster="docs/screenshots/hero.png"
+       width="900" autoplay loop muted playsinline controls>
+  <img src="docs/screenshots/hero.png" alt="nano-NotebookLM hero" width="900">
+</video>
+
+</div>
+
+---
+
+Upload course PDFs / PPTX / DOCX / Markdown → automatic knowledge graph
++ vector index → chat with **page-accurate citations**, structured
+LaTeX notes, practice quizzes, exam prep with a **self-evolving question
+bank**, and an editable mind map.
+
+Bring your own model: **OpenAI · DeepSeek · Moonshot · Zhipu · MiniMax
+· Groq · Together · Anthropic Claude · Gemini**, or any local runner
+that speaks OpenAI's `/v1/chat/completions` (**Ollama / vLLM / LM Studio
+/ llama.cpp**).
+
+```bash
+git clone https://github.com/ArthurYangX/nano-NotebookLM && cd nano-NotebookLM
+python -m venv .venv && source .venv/bin/activate && pip install -e ".[test]"
+cp .env.example .env && $EDITOR .env   # set at least one LLM key
+python api/server.py                   # → http://localhost:8000
+```
+
+> Looking for architecture and code map? See [`CLAUDE.md`](CLAUDE.md).
+> Want to contribute? See [`CONTRIBUTING.md`](CONTRIBUTING.md).
+
+---
+
+## Why nano-NotebookLM
+
+| Capability                                | nano-NotebookLM   | Google NotebookLM | ChatGPT (upload PDF) |
+|-------------------------------------------|:-----------------:|:-----------------:|:--------------------:|
+| Fully self-hosted, your data never leaves | ✅                | ❌                | ❌                   |
+| Bring your own LLM (cloud or local)       | ✅ 9+ providers   | ❌ Gemini only    | ❌ OpenAI only       |
+| **Page-accurate citations**, click to jump | ✅               | ✅                | ⚠️ inline quote only |
+| Editable knowledge graph                  | ✅                | ❌                | ❌                   |
+| LaTeX notes (KaTeX + tectonic PDF)        | ✅                | ❌                | ❌                   |
+| Exam prep with self-evolving question bank | ✅               | ❌                | ❌                   |
+| Background upload pipeline, resumable     | ✅                | ✅                | ⚠️ session-bound     |
+| Cross-course retrieval                    | ✅                | ❌                | ❌                   |
+| Cost at scale                             | Local GPU / API   | Free tier capped  | Subscription         |
 
 ---
 
 ## Features
 
-- **Chat with citations** — RAG (BM25 + FAISS + RRF) + a knowledge-graph
-  retriever (concept-cosine seed + BFS hop expansion). Every answer links
-  back to the source page in the built-in PDF reader.
+- **Chat with page-accurate citations** — RAG (BM25 + FAISS + RRF) +
+  knowledge-graph retriever (concept-cosine seed + BFS hop expansion).
+  Every answer links back to the source page in the built-in PDF reader.
 - **LaTeX notes** — per-source-file streaming generation with a global
   review pass. KaTeX in the browser; optional `tectonic` compile to PDF.
 - **Practice quizzes + Exam Prep** — generates questions, grades them,
   and **auto-generates variants of the ones you got wrong** so the bank
   grows in the directions you actually need.
 - **Editable knowledge graph** — d3-force layout with relation filters,
-  double-click edit, shift-drag to connect, "N" to add child, "Del" to
+  double-click edit, shift-drag to connect, `N` to add child, `Del` to
   remove. Edits persist as an overlay so re-extraction never clobbers
   your work.
 - **Reader** — built-in PDF / PPTX preview, click any citation chip in a
@@ -34,27 +81,44 @@ LM Studio / llama.cpp**).
 - **Background upload pipeline** — close the tab and come back; the
   ingest job keeps running.
 
+### See it in action
+
+<table>
+<tr>
+<td width="50%" valign="top">
+  <img src="docs/screenshots/notes.png" alt="LaTeX Notes">
+  <br><b>LaTeX Notes</b> — per-file streaming generation, KaTeX preview, click any citation chip to jump to the source page.
+</td>
+<td width="50%" valign="top">
+  <img src="docs/screenshots/mindmap.png" alt="Knowledge Graph">
+  <br><b>Knowledge Graph</b> — d3-force layout with relation filters (part-of / depends-on / related / example-of). Edit overlay survives re-extraction.
+</td>
+</tr>
+<tr>
+<td width="50%" valign="top">
+  <img src="docs/screenshots/exam-prep.png" alt="Exam Prep">
+  <br><b>Exam Prep</b> — topics weighted by mastery; wrong answers auto-spawn variant questions so the bank grows where you need it.
+</td>
+<td width="50%" valign="top">
+  <img src="docs/screenshots/upload.png" alt="Upload pipeline">
+  <br><b>Upload pipeline</b> — pick the PDF engine per-course (PyMuPDF for speed, MinerU for scanned). Runs in the background, resumable.
+</td>
+</tr>
+</table>
+
 ---
 
 ## Architecture
 
-```
-[ React 18 (CDN, no build) ]
-            ↓
-[ FastAPI on :8000 ]
-   ├── /api/chat       ── intent router → graphrag → RAG → translate → cross-course → general
-   ├── /api/notes      ── per-file streaming LaTeX + review pass + tectonic PDF
-   ├── /api/quiz       ── practice quiz generation
-   ├── /api/exam-prep  ── self-evolving topic bank
-   ├── /api/mindmap    ── KG read/write with edit overlay
-   ├── /api/upload     ── background-task pipeline (extracting → chunking → embedding → KG)
-   ├── /api/providers  ── add / edit / delete / test / set-default LLM providers
-   └── /api/status     ── available backends, embedding mode, health
-            ↓
-[ LLM router ] ─── any N providers (OpenAI-compatible + Anthropic), hot-swappable via UI
-[ Embeddings ] ─── sentence-transformers (offline) or OpenAI-compatible API
-[ Storage    ] ─── FAISS + BM25 + NetworkX KG  (under ./artifacts/)
-```
+<div align="center">
+
+<img src="docs/screenshots/architecture.png" alt="nano-NotebookLM architecture" width="900">
+
+*Three layers: Application (Notes / KG / Reader / QA / Exam Prep) →
+Retrieval (BM25 + FAISS + GraphRAG + RRF) → Model (OpenAI / DeepSeek /
+Claude cloud APIs, or any local 7B–14B served via Ollama / vLLM).*
+
+</div>
 
 Single-process, single-machine, no auth, no DB — designed for one user
 or a small team running it on their own laptop / workstation.
@@ -65,7 +129,7 @@ or a small team running it on their own laptop / workstation.
 
 ```bash
 # 1. clone + install
-git clone <repo-url> nano-notebooklm && cd nano-notebooklm
+git clone https://github.com/ArthurYangX/nano-NotebookLM && cd nano-NotebookLM
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[test]"
 
@@ -77,7 +141,8 @@ $EDITOR .env                  # set OPENAI_API_KEY (or ANTHROPIC_API_KEY, or LOC
 python api/server.py          # → http://localhost:8000
 ```
 
-Open the browser, click "上传第一个文档", drop in a PDF, and you're done.
+Open the browser, click **Upload your first document**, drop in a PDF, and you're
+done.
 
 ### Test the install
 
@@ -87,24 +152,38 @@ pytest                         # unit + API smoke tests; no LLM keys required
 
 ---
 
-## Configuring an LLM backend
+## Provider matrix
 
-You need **at least one** of: `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or
-`LOCAL_LLM_BASE_URL + LOCAL_LLM_MODEL`. All three can coexist — the
-frontend chip in the topbar cycles between them.
+| Provider              | Type             | `OPENAI_BASE_URL`                                              | Suggested model                              |
+|-----------------------|------------------|----------------------------------------------------------------|----------------------------------------------|
+| OpenAI                | Cloud, native    | `https://api.openai.com/v1`                                    | `gpt-4o-mini`                                |
+| Anthropic Claude      | Cloud, native    | *(uses Anthropic SDK)*                                         | `claude-sonnet-4-5`                          |
+| DeepSeek              | Cloud, compat    | `https://api.deepseek.com/v1`                                  | `deepseek-chat`                              |
+| Moonshot              | Cloud, compat    | `https://api.moonshot.cn/v1`                                   | `moonshot-v1-8k`                             |
+| Zhipu GLM             | Cloud, compat    | `https://open.bigmodel.cn/api/paas/v4`                         | `glm-4-flash`                                |
+| MiniMax               | Cloud, compat    | `https://api.minimax.chat/v1`                                  | `abab6.5-chat`                               |
+| Groq                  | Cloud, compat    | `https://api.groq.com/openai/v1`                               | `llama-3.3-70b-versatile`                    |
+| Together              | Cloud, compat    | `https://api.together.xyz/v1`                                  | `meta-llama/Llama-3.3-70B-Instruct-Turbo`    |
+| Gemini (OpenAI mode)  | Cloud, compat    | `https://generativelanguage.googleapis.com/v1beta/openai/`     | `gemini-2.0-flash`                           |
+| **Ollama**            | Local            | `http://localhost:11434/v1`                                    | `qwen2.5:7b`                                 |
+| **vLLM**              | Local            | `http://localhost:8000/v1`                                     | `Qwen/Qwen2.5-7B-Instruct`                   |
+| **LM Studio**         | Local            | `http://localhost:1234/v1`                                     | *(model loaded in LM Studio)*                |
+| **llama.cpp server**  | Local            | `http://localhost:8080/v1`                                     | *(GGUF model loaded)*                        |
+
+You can mix freely — add a cloud OpenAI key for high-quality KG
+extraction, point chat at a local 7B for privacy, and the Settings UI
+swaps between them per-task without restart.
 
 ### Editing providers from the UI (no restart)
 
 `.env` is **just the first-boot seed**. On first start the server
 synthesises `artifacts/providers.json` from your env vars and from then
-on the Settings page is the source of truth: add a second OpenAI-compat
-endpoint, swap a model, set the active default, or one-click
-**Test → 5s ping** — all without restarting. Keys can stay in `.env`
-(`api_key_ref: env:VAR`) or be stored inline if you prefer
+on the Settings page is the source of truth: add a second
+OpenAI-compatible endpoint, swap a model, set the active default, or
+one-click **Test → 5s ping** — all without restarting. Keys can stay in
+`.env` (`api_key_ref: env:VAR`) or be stored inline if you prefer
 (`api_key_ref: literal:sk-…`; written 0o600, never echoed in any
 response).
-
-See the `Settings → AI Backend & Models` table or the new endpoints:
 
 | Endpoint                                    | Purpose                              |
 |---------------------------------------------|--------------------------------------|
@@ -114,65 +193,27 @@ See the `Settings → AI Backend & Models` table or the new endpoints:
 | `POST   /api/providers/{id}/test`           | 5-token ping with 5s timeout         |
 | `POST   /api/providers/default`             | Switch active default                |
 
-### Cloud providers (OpenAI-compatible)
-
-Just set `OPENAI_BASE_URL` + `OPENAI_MODEL` to the provider's endpoint:
-
-| Provider  | `OPENAI_BASE_URL`                                              | Suggested `OPENAI_MODEL`                    |
-|-----------|----------------------------------------------------------------|---------------------------------------------|
-| OpenAI    | `https://api.openai.com/v1`                                    | `gpt-4o-mini`                               |
-| DeepSeek  | `https://api.deepseek.com/v1`                                  | `deepseek-chat`                             |
-| Moonshot  | `https://api.moonshot.cn/v1`                                   | `moonshot-v1-8k`                            |
-| Zhipu GLM | `https://open.bigmodel.cn/api/paas/v4`                         | `glm-4-flash`                               |
-| MiniMax   | `https://api.minimax.chat/v1`                                  | `abab6.5-chat`                              |
-| Groq      | `https://api.groq.com/openai/v1`                               | `llama-3.3-70b-versatile`                   |
-| Together  | `https://api.together.xyz/v1`                                  | `meta-llama/Llama-3.3-70B-Instruct-Turbo`   |
-| Gemini    | `https://generativelanguage.googleapis.com/v1beta/openai/`     | `gemini-2.0-flash`                          |
-
-### Anthropic Claude
-
-```bash
-ANTHROPIC_API_KEY=sk-ant-...
-CLAUDE_MODEL=claude-sonnet-4-5
-```
-
-### Local model
-
-Run any OpenAI-compatible server on localhost, then:
-
-```bash
-# Ollama
-LOCAL_LLM_BASE_URL=http://localhost:11434/v1
-LOCAL_LLM_MODEL=qwen2.5:7b
-
-# vLLM
-LOCAL_LLM_BASE_URL=http://localhost:8000/v1
-LOCAL_LLM_MODEL=Qwen/Qwen2.5-7B-Instruct
-
-# LM Studio
-LOCAL_LLM_BASE_URL=http://localhost:1234/v1
-LOCAL_LLM_MODEL=<your loaded model name>
-```
-
 ---
 
 ## Embeddings
 
-```bash
-EMBEDDING_MODE=local                                           # default
-EMBEDDING_MODEL=paraphrase-multilingual-MiniLM-L12-v2          # offline, 50+ languages, CJK-friendly
-```
+Three switchable presets, picked from the Settings UI (no restart, no
+destructive rebuild — each preset gets its own FAISS namespace under
+`indices/faiss/<preset>/`, so toggling is a path-route):
 
-Or switch to API-mode embeddings for higher quality cross-lingual
-retrieval (costs money):
+| Preset         | Model                                            | Notes                                       |
+|----------------|--------------------------------------------------|---------------------------------------------|
+| `local_mini`   | `paraphrase-multilingual-MiniLM-L12-v2`          | Offline, 50+ languages, CJK-friendly (default) |
+| `openai_large` | `text-embedding-3-large`                         | Best cross-lingual quality, costs money     |
+| `bge_m3`       | `BAAI/bge-m3`                                    | Strong CJK + EN, runs locally (heavier)     |
 
-```bash
-EMBEDDING_MODE=api
-EMBEDDING_MODEL=text-embedding-3-small
-# Optional — route embeddings to a different provider than chat
-# EMBEDDING_API_KEY=...
-# EMBEDDING_API_BASE_URL=https://api.openai.com/v1
-```
+The first switch to a never-used preset kicks off a one-shot background
+rebuild of every course's index; the banner in the topbar tracks
+progress. Switching back to an already-built preset is instant.
+
+The env vars in `.env.example` (`EMBEDDING_MODE` / `EMBEDDING_MODEL` /
+`EMBEDDING_API_*`) only seed the first-run default — once the Settings
+preset is set, it wins.
 
 ---
 
@@ -184,9 +225,9 @@ EMBEDDING_MODEL=text-embedding-3-small
 | `POST /api/agent/stream`                    | Multi-turn tool-calling agent (NDJSON stream).                              |
 | `POST /api/notes/full-course/stream`        | Per-file LaTeX note generation with review pass; incremental cache.         |
 | `POST /api/quiz`                            | Practice quiz generation.                                                   |
-| `POST /api/exam-prep/*`                     | Topic planning, question seeding, quiz draw, submit + auto-variant.        |
+| `POST /api/exam-prep/*`                     | Topic planning, question seeding, quiz draw, submit + auto-variant.         |
 | `GET/POST /api/mindmap/{course_id}`         | Knowledge graph read; student edit ops.                                     |
-| `POST /api/upload/{course_id}`              | Upload files; returns `{task_id, course_id}` immediately.                  |
+| `POST /api/upload/{course_id}`              | Upload files; returns `{task_id, course_id}` immediately.                   |
 | `GET  /api/upload/status/{task_id}`         | Poll background ingest progress (resume on tab reopen).                     |
 | `GET  /api/status`                          | Configured backends, embedding mode, version, latency p50.                  |
 
@@ -195,7 +236,7 @@ Example:
 ```bash
 curl -X POST http://localhost:8000/api/chat \
   -H "Content-Type: application/json" \
-  -d '{"question": "What is a receptive field?", "course_id": null, "backend": "openai"}'
+  -d '{"question": "What is a receptive field?", "course_id": null, "backend": "openai-main"}'
 ```
 
 `backend` is optional — set it to any provider id from
@@ -221,6 +262,7 @@ nano_notebooklm/
 scripts/                 ingest + index + embedding helpers
 tests/                   pytest suite — runs offline, no LLM keys needed
 artifacts/               (gitignored) per-course chunks, indices, KG, notes
+docs/screenshots/        README assets
 ```
 
 ---
@@ -236,11 +278,35 @@ pytest tests/test_api_smoke.py # quick subset
 The frontend has no build step — it's React via the CDN and Babel
 standalone. Just edit a `.jsx` file and refresh the browser.
 
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the contributor checklist
+and [`CLAUDE.md`](CLAUDE.md) for the code-map / conventions.
+
+---
+
+## Roadmap
+
+Recently shipped:
+
+- Background upload pipeline with NDJSON stage events
+- UI-managed provider matrix (add / swap / test without restart)
+- Three-tier embedding presets (local MiniLM / OpenAI 3-large / BGE-M3)
+- MinerU OCR ingest for scanned PDFs
+- Multi-turn chat with history-aware query rewriting
+- Selection-driven notes generation (per-file checkbox, incremental cache)
+- Central i18n table (`frontend/i18n.js`) — full zh + en UI parity
+
+Planned (issues welcome):
+
+- Vite build option (opt-in, CDN stays default)
+- Mastery-driven exam-prep difficulty curve
+- Cross-course graph linking
+- Docker Compose one-liner
+
 ---
 
 ## Production notes
 
-nano-NOTEBOOKLM is designed for **single-user / small-team self-hosting**.
+nano-NotebookLM is designed for **single-user / small-team self-hosting**.
 There is no authentication, no rate limiting, no multi-tenant isolation,
 and no persistent task queue. If you expose it on the public internet:
 
@@ -257,9 +323,15 @@ and no persistent task queue. If you expose it on the public internet:
 
 ## Acknowledgements
 
-- Inspired by Google's NotebookLM.
+- Inspired by Google's [NotebookLM](https://notebooklm.google.com/).
+  **Not affiliated with Google.** NotebookLM is a trademark of Google LLC.
+- Naming convention follows [`nanoGPT`](https://github.com/karpathy/nanoGPT)
+  and [`nano-vLLM`](https://github.com/GeeeekExplorer/nano-vllm) —
+  small, self-hosted, single-file-friendly homages.
 - Knowledge graph layout: [d3-force](https://github.com/d3/d3-force).
-- PDF rendering: [PDFium](https://pdfium.googlesource.com/pdfium/) via
-  PDF.js fallback. LaTeX → PDF via [tectonic](https://tectonic-typesetting.github.io/).
+- PDF rendering: [PyMuPDF](https://pymupdf.readthedocs.io/) for
+  extraction, [PDF.js](https://mozilla.github.io/pdf.js/) in the browser.
+  LaTeX → PDF via [tectonic](https://tectonic-typesetting.github.io/).
 - Embeddings: [sentence-transformers](https://www.sbert.net/),
   multilingual MiniLM-L12-v2 default.
+- OCR for scanned PDFs: [MinerU](https://github.com/opendatalab/MinerU).
