@@ -93,6 +93,7 @@ class ReportGeneratorSkill(Skill):
             code_instructions=CODE_INSTRUCTIONS if include_code else "",
             format=fmt,
         )
+        prompt += prompts.USER_LANG_REMINDER(user_lang)
         system = REPORT_SYSTEM
         binding = prompts.USER_LANG_BINDING(user_lang)
         if binding:

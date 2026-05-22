@@ -163,7 +163,9 @@ async def run_agent(
         llm_stream = make_chat_completions_stream(backend)
 
     system_prompt = compose_system_prompt(course_id, course_names, user_lang=user_lang)
-    messages: list[dict] = [{"role": "user", "content": user_question}]
+    from nano_notebooklm.ai import prompt_templates as _prompts
+    user_msg = user_question + _prompts.USER_LANG_REMINDER(user_lang)
+    messages: list[dict] = [{"role": "user", "content": user_msg}]
     tools_schema = registry.openai_schemas()
 
     text_buf = ""

@@ -1216,6 +1216,7 @@ class QASkill(Skill):
             )
 
         prompt = prompts.QA_PROMPT.format(context=context, question=question)
+        prompt += prompts.USER_LANG_REMINDER(user_lang)
         resp = await self._complete_with_backend(
             prompt, task_type="qa_answer", system=system, temperature=0.3,
             backend=backend,
@@ -1319,6 +1320,7 @@ class QASkill(Skill):
                     "the system prompt — short, calm, redirect to course help."
                 )
 
+        prompt += prompts.USER_LANG_REMINDER(user_lang)
         try:
             resp = await self._complete_with_backend(
                 prompt,

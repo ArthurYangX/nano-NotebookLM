@@ -69,6 +69,7 @@ class QuizGeneratorSkill(Skill):
             weak_concepts_instruction=weak_instruction,
             source_text=source_text,
         )
+        prompt += prompts.USER_LANG_REMINDER(user_lang)
 
         system = prompts.QUIZ_GENERATION_SYSTEM
         binding = prompts.USER_LANG_BINDING(user_lang)

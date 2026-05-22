@@ -521,6 +521,7 @@ class ExamPrepSkill(Skill):
             max_topics=max_topics,
             source_text=source_text,
         )
+        prompt += prompts.USER_LANG_REMINDER(user_lang)
         system = prompts.EXAM_PREP_SYSTEM
         binding = prompts.USER_LANG_BINDING(user_lang)
         if binding:
@@ -728,6 +729,7 @@ class ExamPrepSkill(Skill):
             source_text=source_text,
             avoid_block=avoid_block,
         )
+        prompt += prompts.USER_LANG_REMINDER(user_lang)
         system = prompts.EXAM_PREP_SYSTEM
         binding = prompts.USER_LANG_BINDING(user_lang)
         if binding:

@@ -699,21 +699,64 @@ def USER_LANG_BINDING(lang: str | None) -> str:
         return ""
     label = _USER_LANG_LABELS[lang]
     other = "English" if lang == "zh" else "Chinese (中文)"
-    # Emphatic binding. Smaller / fine-tuned open-weight models tend to
-    # echo source-material language (English slides → English reply, even
-    # with `user_lang=zh` set); larger frontier models follow a soft
-    # binding fine. Hard-coded for both zh→en and en→zh directions.
+    # 2026-05-22: source-language drift fix. Previously the binding lived
+    # only at the end of the system prompt; user prompts (QA_PROMPT, notes,
+    # quiz) still contained large blocks of source-language reference
+    # material AND bilingual schema headings ("**课件覆盖 / In the course
+    # materials**"). Recency bias + visible source language pulled the
+    # model back to the chunk language even with a "Reply ONLY in en" set.
+    # The fix is twofold: (a) tighten this binding to explicitly cover
+    # bilingual schema labels and quoted material, (b) re-emit a one-line
+    # reminder at the end of each user message via USER_LANG_REMINDER.
     return (
         f"CRITICAL OUTPUT LANGUAGE REQUIREMENT — Reply ONLY in {lang} ({label}).\n"
-        f"This overrides rule #4 above and any language hint inferred from the "
-        f"question or reference documents.\n"
+        f"This overrides every other language hint, including: rule #4 above, "
+        f"the language of the reference documents, the language of any quoted "
+        f"text inside the user prompt, the language of any bilingual schema "
+        f"heading you are asked to reproduce, and the language of the question "
+        f"itself when it differs from {label}.\n"
         f"Even when the reference documents are written in {other}, you MUST "
         f"produce the entire response — definitions, explanations, paraphrased "
-        f"quotes, citation lead-ins — in {label}. The ONLY tokens that may "
-        f"remain in their original form are: proper nouns (e.g. \"Transformer\", "
-        f"\"BERT\"), formula symbols, and the exact file/page citation tags. "
+        f"quotes, citation lead-ins, bullet labels, section titles, examples — "
+        f"in {label}. Treat the reference documents as DATA to be summarised "
+        f"in {label}, not as a language template to mirror.\n"
+        f"When the prompt below instructs you to emit a heading like "
+        f"\"**课件覆盖 / In the course materials**\" or "
+        f"\"**补充背景 / Background**\", you MUST emit ONLY the {label} half "
+        f"(\"**In the course materials**\" / \"**Background**\" for English; "
+        f"\"**课件覆盖**\" / \"**补充背景**\" for Chinese). Drop the other "
+        f"half of the bilingual label entirely. Same for fixed phrases like "
+        f"\"资料中没有直接覆盖该主题 / Not directly covered in the course "
+        f"materials.\" — emit ONLY the {label} half.\n"
+        f"The ONLY tokens that may remain in their original (non-{label}) form "
+        f"are: proper nouns (e.g. \"Transformer\", \"BERT\", author names), "
+        f"formula symbols, code identifiers, and the exact file/page citation "
+        f"tags like \"[Source: lecture_8.pdf, Page 40/122]\". Everything else "
+        f"— including the prose around those tokens — must be in {label}. "
         f"Do not copy source-language sentences verbatim; translate the "
         f"meaning into {label} first."
+    )
+
+
+def USER_LANG_REMINDER(lang: str | None) -> str:
+    """One-line reminder to append at the END of the user message.
+
+    The system-prompt binding alone is fragile: a large reference-document
+    block in the source language pushes the binding out of the model's
+    attention window by the time it starts generating. Re-stating the
+    output language as the LAST line the model reads before generating
+    is cheap (≈25 tokens) and dramatically improves adherence on smaller
+    models (4o-mini, local 7-14B). Returns "" when no preference is set.
+    """
+    if lang not in _USER_LANG_LABELS:
+        return ""
+    label = _USER_LANG_LABELS[lang]
+    return (
+        f"\n\n---\n"
+        f"REMINDER: write the entire response in {label}, regardless of the "
+        f"language of the reference material above. Do not switch to the "
+        f"source-material language. For any bilingual schema heading, emit "
+        f"only the {label} half."
     )
 
 

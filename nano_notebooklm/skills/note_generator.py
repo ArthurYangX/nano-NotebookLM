@@ -68,6 +68,7 @@ class NoteGeneratorSkill(Skill):
         binding = prompts.USER_LANG_BINDING(user_lang)
         if binding:
             system = f"{system}\n\n{binding}"
+        prompt += prompts.USER_LANG_REMINDER(user_lang)
         return {
             "prompt": prompt,
             "system": system,
