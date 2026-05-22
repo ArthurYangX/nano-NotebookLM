@@ -101,12 +101,19 @@ case "$cmd" in
     ;;
 
   install|setup)
-    if [[ ! -d "$VENV" ]]; then
-      python3 -m venv "$VENV"
+    if command -v uv >/dev/null 2>&1; then
+      [[ -d "$VENV" ]] || uv venv "$VENV"
+      # shellcheck disable=SC1091
+      source "$VENV/bin/activate"
+      uv pip install -e ".[test]"
+    else
+      echo "uv not found — falling back to python -m venv + pip"
+      echo "(install uv for ~10x faster setup: https://docs.astral.sh/uv/getting-started/installation/)"
+      [[ -d "$VENV" ]] || python3 -m venv "$VENV"
+      # shellcheck disable=SC1091
+      source "$VENV/bin/activate"
+      pip install -e ".[test]"
     fi
-    # shellcheck disable=SC1091
-    source "$VENV/bin/activate"
-    pip install -e ".[test]"
     if [[ ! -f .env ]] && [[ -f .env.example ]]; then
       cp .env.example .env
       echo "created .env — fill OPENAI_API_KEY / OPENAI_BASE_URL before './dev.sh up'"

@@ -24,6 +24,8 @@ English | [简体中文](README.zh-CN.md)
 
 ---
 
+## Overview
+
 Upload course PDFs / PPTX / DOCX / Markdown → automatic knowledge graph
 + vector index → chat with **page-accurate citations**, structured
 LaTeX notes, practice quizzes, exam prep with a **self-evolving question
@@ -34,12 +36,58 @@ Bring your own model: **OpenAI · DeepSeek · Moonshot · Zhipu · MiniMax
 that speaks OpenAI's `/v1/chat/completions` (**Ollama / vLLM / LM Studio
 / llama.cpp**).
 
+---
+
+## Quick Start
+
 ```bash
+# 1. clone + install (uv is ~10× faster than pip; either works)
 git clone https://github.com/ArthurYangX/nano-NotebookLM && cd nano-NotebookLM
-python -m venv .venv && source .venv/bin/activate && pip install -e ".[test]"
-cp .env.example .env && $EDITOR .env   # set at least one LLM key
+uv venv && source .venv/bin/activate && uv pip install -e ".[test]"
+# or: python -m venv .venv && source .venv/bin/activate && pip install -e ".[test]"
+
+# 2. configure — copy the template and fill AT LEAST ONE LLM key
+#    (OPENAI_API_KEY, or ANTHROPIC_API_KEY, or LOCAL_LLM_BASE_URL+LOCAL_LLM_MODEL)
+cp .env.example .env
+
+# 3. run (Ctrl-C to stop; or use ./dev.sh below to manage as a background process)
 python api/server.py                   # → http://localhost:8000
 ```
+
+Prefer a managed lifecycle? `./dev.sh` wraps the same commands:
+
+```bash
+./dev.sh install   # creates .venv + installs deps + seeds .env
+./dev.sh up        # starts the server in background, waits for /api/health
+./dev.sh status    # pid + /api/status snapshot
+./dev.sh logs      # tail /tmp/nano-nlm.log
+./dev.sh down      # stops the server
+```
+
+> Install `uv` for ~10× faster setup:
+> `curl -LsSf https://astral.sh/uv/install.sh | sh` — full docs at
+> <https://docs.astral.sh/uv/getting-started/installation/>.
+> Plain `pip` works identically if you'd rather skip it.
+
+#### Optional extras (only install what you need)
+
+| What | Install | Without it |
+|---|---|---|
+| **MinerU** — OCR / layout-aware PDF extractor for scanned slides | `uv pip install -e ".[mineru]"` (heavy: ~3-5GB w/ models) | Upload `engine=mineru` returns an error; `engine=pymupdf` (default) still works |
+| **tectonic** — LaTeX → PDF compiler for Notes export | `brew install tectonic` / `apt install tectonic` | "Export PDF" button is hidden; in-browser KaTeX preview still works |
+| **LibreOffice** (`soffice`) — `.pptx` → PDF sidecar for MinerU | `brew install --cask libreoffice` / `apt install libreoffice` | `.pptx` with `engine=mineru` silently falls back to python-pptx (no OCR) |
+
+GPU: MinerU auto-detects CUDA on Linux (1–2 s/page); Apple Silicon
+defaults to CPU (~12 s/page) — auto-detect never picks MPS because the
+pipeline backend hangs there. Override with
+`MINERU_DEVICE_MODE=cuda|cpu|mps` in `.env`. **Escape hatch**: if CUDA
+is detected but breaks at runtime (stale driver / OOM), set
+`MINERU_DEVICE_MODE=cpu` to force CPU.
+
+> **Network requirement.** The frontend loads React / KaTeX / d3-force
+> / CodeMirror / IBM Plex fonts from public CDNs (jsdelivr, unpkg,
+> esm.sh, Google Fonts) — first page-load needs internet. Fully
+> air-gapped deployments will need to vendor those assets locally.
 
 > Looking for architecture and code map? See [`CLAUDE.md`](CLAUDE.md).
 > Want to contribute? See [`CONTRIBUTING.md`](CONTRIBUTING.md).
@@ -108,50 +156,6 @@ python api/server.py                   # → http://localhost:8000
 
 ---
 
-## Architecture
-
-<div align="center">
-
-<img src="docs/screenshots/architecture.png" alt="nano-NotebookLM architecture" width="900">
-
-*Three layers: Application (Notes / KG / Reader / QA / Exam Prep) →
-Retrieval (BM25 + FAISS + GraphRAG + RRF) → Model (OpenAI / DeepSeek /
-Claude cloud APIs, or any local 7B–14B served via Ollama / vLLM).*
-
-</div>
-
-Single-process, single-machine, no auth, no DB — designed for one user
-or a small team running it on their own laptop / workstation.
-
----
-
-## Quick Start
-
-```bash
-# 1. clone + install
-git clone https://github.com/ArthurYangX/nano-NotebookLM && cd nano-NotebookLM
-python -m venv .venv && source .venv/bin/activate
-pip install -e ".[test]"
-
-# 2. configure at least one LLM backend
-cp .env.example .env
-$EDITOR .env                  # set OPENAI_API_KEY (or ANTHROPIC_API_KEY, or LOCAL_LLM_*)
-
-# 3. run
-python api/server.py          # → http://localhost:8000
-```
-
-Open the browser, click **Upload your first document**, drop in a PDF, and you're
-done.
-
-### Test the install
-
-```bash
-pytest                         # unit + API smoke tests; no LLM keys required
-```
-
----
-
 ## Provider matrix
 
 | Provider              | Type             | `OPENAI_BASE_URL`                                              | Suggested model                              |
@@ -166,7 +170,7 @@ pytest                         # unit + API smoke tests; no LLM keys required
 | Together              | Cloud, compat    | `https://api.together.xyz/v1`                                  | `meta-llama/Llama-3.3-70B-Instruct-Turbo`    |
 | Gemini (OpenAI mode)  | Cloud, compat    | `https://generativelanguage.googleapis.com/v1beta/openai/`     | `gemini-2.0-flash`                           |
 | **Ollama**            | Local            | `http://localhost:11434/v1`                                    | `qwen2.5:7b`                                 |
-| **vLLM**              | Local            | `http://localhost:8000/v1`                                     | `Qwen/Qwen2.5-7B-Instruct`                   |
+| **vLLM**              | Local            | `http://localhost:8001/v1` *(pick any free port; **not** 8000 — that's the app server)* | `Qwen/Qwen2.5-7B-Instruct`                   |
 | **LM Studio**         | Local            | `http://localhost:1234/v1`                                     | *(model loaded in LM Studio)*                |
 | **llama.cpp server**  | Local            | `http://localhost:8080/v1`                                     | *(GGUF model loaded)*                        |
 
@@ -270,8 +274,8 @@ docs/screenshots/        README assets
 ## Development
 
 ```bash
-pip install -e ".[test]"
-pytest                         # unit + API smoke
+uv pip install -e ".[test]"    # or: pip install -e ".[test]"
+pytest                         # unit + API smoke; no LLM keys required
 pytest tests/test_api_smoke.py # quick subset
 ```
 
@@ -300,7 +304,6 @@ Planned (issues welcome):
 - Vite build option (opt-in, CDN stays default)
 - Mastery-driven exam-prep difficulty curve
 - Cross-course graph linking
-- Docker Compose one-liner
 
 ---
 

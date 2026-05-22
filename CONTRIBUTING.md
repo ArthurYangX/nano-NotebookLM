@@ -16,11 +16,23 @@ study-assistant experience better without adding operational burden."
 ```bash
 git clone https://github.com/ArthurYangX/nano-NotebookLM
 cd nano-NotebookLM
-python -m venv .venv && source .venv/bin/activate
-pip install -e ".[test]"
+uv venv && source .venv/bin/activate   # or: python -m venv .venv && source .venv/bin/activate
+uv pip install -e ".[test]"            # or: pip install -e ".[test]"
 cp .env.example .env       # at least one LLM key
 python api/server.py       # http://localhost:8000
 ```
+
+`./dev.sh install` does the same and auto-falls back to `pip` if `uv`
+isn't on PATH.
+
+Optional extras (only if you're touching those code paths):
+
+```bash
+uv pip install -e ".[mineru]"           # MinerU OCR / scanned-PDF tests
+brew install tectonic libreoffice       # tectonic = LaTeX→PDF; soffice = pptx→PDF sidecar
+```
+
+See the README "Optional extras" table for what each enables.
 
 ## Running tests
 

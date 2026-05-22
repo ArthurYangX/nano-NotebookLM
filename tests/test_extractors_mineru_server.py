@@ -301,6 +301,52 @@ def test_extract_one_via_server_bad_content_list_raises(tmp_path):
         )
 
 
+def test_extract_one_via_server_handles_json_string_content_list(tmp_path):
+    """mineru >=3.1 returns content_list as a JSON-encoded STRING instead
+    of an inline list. Without the json.loads shim, every server call would
+    fall back to subprocess CLI (paying the 30-45s cold start twice per
+    upload). Regression for the test-slide.pdf wallclock bug found on
+    2026-05-23 against mineru 3.1.14.
+    """
+    import httpx, json as _json
+
+    pdf = tmp_path / "x.pdf"
+    pdf.write_bytes(b"%PDF\n")
+
+    blocks = _fake_blocks_for_pdf("x")
+
+    def handler(call):
+        return httpx.Response(200, json={
+            "results": {"x.pdf": {"content_list": _json.dumps(blocks)}}
+        })
+
+    pages = _run_with_handler(
+        handler,
+        lambda: M._extract_one_via_server("http://test", pdf, "ch"),
+    )
+    assert [p.page for p in pages] == [1, 2]
+
+
+def test_extract_one_via_server_rejects_malformed_json_string(tmp_path):
+    """If content_list is a string but not valid JSON, fail loudly with
+    enough preview to debug — don't crash with a generic JSONDecodeError."""
+    import httpx
+
+    pdf = tmp_path / "x.pdf"
+    pdf.write_bytes(b"%PDF\n")
+
+    def handler(call):
+        return httpx.Response(200, json={
+            "results": {"x.pdf": {"content_list": "[not valid json"}}
+        })
+
+    with pytest.raises(M.MinerUExtractionError, match="not valid JSON"):
+        _run_with_handler(
+            handler,
+            lambda: M._extract_one_via_server("http://test", pdf, "ch"),
+        )
+
+
 # ── Batch + fallback wiring ─────────────────────────────────────────
 
 

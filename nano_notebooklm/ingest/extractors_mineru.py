@@ -31,9 +31,12 @@ Concurrency: on macOS, mineru-api hard-pins `max_concurrent_requests=1`
 `asyncio.gather` over multiple PDFs serialises inside the server. On
 Linux, operators raise it via `MINERU_API_MAX_CONCURRENT_REQUESTS`.
 
-MPS is disabled (`MINERU_DEVICE_MODE=cpu`) — under MPS the pipeline
-backend hangs at `DocAnalysis init` with 0% CPU. CPU mode is the only
-supported device on Apple Silicon.
+Device selection: `mineru_auto_device()` picks `cuda` when
+`torch.cuda.is_available()`, otherwise `cpu`. **MPS is never
+auto-selected** — under MPS the pipeline backend hangs at
+`DocAnalysis init` with 0% CPU, so Apple Silicon stays on CPU.
+Operators can force any device (including `mps` if they want to
+experiment) via `MINERU_DEVICE_MODE` in the env.
 """
 
 from __future__ import annotations
@@ -115,6 +118,56 @@ def _validated_max_concurrent_requests() -> str | None:
     return str(n)
 
 
+_KNOWN_MINERU_DEVICES = frozenset({"cpu", "cuda", "mps"})
+
+# Cache the auto-detection result. `import torch` is slow on a cold
+# process and (worse) can leave the interpreter in an unstable state if
+# the host has a broken cuda runtime — we only want to pay that cost
+# at most once. Env-override callers bypass the cache.
+_AUTO_DEVICE_CACHE: str | None = None
+
+
+def _reset_auto_device_cache() -> None:
+    """Test helper — drop the cached torch detection so the next call
+    re-probes. Production code never needs this."""
+    global _AUTO_DEVICE_CACHE
+    _AUTO_DEVICE_CACHE = None
+
+
+def mineru_auto_device() -> str:
+    """Pick a MinerU device.
+
+    Resolution order:
+      1. ``MINERU_DEVICE_MODE`` env, if it names one of ``cpu`` / ``cuda``
+         / ``mps``. Unknown values are logged and ignored so a typo like
+         ``guda`` does not silently make mineru hang at ``DocAnalysis init``
+         for 180s before the singleton sticky-disables itself.
+      2. ``cuda`` when ``torch.cuda.is_available()`` (cached).
+      3. ``cpu`` otherwise.
+
+    MPS is intentionally NOT auto-selected: the mineru pipeline backend
+    hangs at ``DocAnalysis init`` under MPS (see module docstring). An
+    operator who wants to retry can still force it via the env.
+    """
+    global _AUTO_DEVICE_CACHE
+    override = os.environ.get("MINERU_DEVICE_MODE", "").strip()
+    if override:
+        if override in _KNOWN_MINERU_DEVICES:
+            return override
+        logger.warning(
+            "MINERU_DEVICE_MODE=%r not in %s; ignoring override and auto-detecting",
+            override, sorted(_KNOWN_MINERU_DEVICES),
+        )
+    if _AUTO_DEVICE_CACHE is not None:
+        return _AUTO_DEVICE_CACHE
+    try:
+        import torch  # type: ignore[import-not-found]
+        _AUTO_DEVICE_CACHE = "cuda" if torch.cuda.is_available() else "cpu"
+    except Exception:
+        _AUTO_DEVICE_CACHE = "cpu"
+    return _AUTO_DEVICE_CACHE
+
+
 def _build_mineru_env(device: str) -> dict[str, str]:
     """Build a minimal env for the mineru subprocess (H3 fix).
 
@@ -135,8 +188,22 @@ def _build_mineru_env(device: str) -> dict[str, str]:
     else:
         env["MINERU_API_MAX_CONCURRENT_REQUESTS"] = validated
     env["MINERU_DEVICE_MODE"] = device
-    threads = os.environ.get("MINERU_OMP_THREADS")
-    if not threads:
+    threads_raw = os.environ.get("MINERU_OMP_THREADS")
+    threads: str
+    if threads_raw:
+        try:
+            n = int(threads_raw)
+            if n < 1:
+                raise ValueError(f"must be >= 1, got {n}")
+            threads = str(n)
+        except ValueError as exc:
+            logger.warning(
+                "MINERU_OMP_THREADS=%r invalid (%s); using default clamp",
+                threads_raw, exc,
+            )
+            cpu = os.cpu_count() or 4
+            threads = str(min(8, max(1, cpu)))
+    else:
         cpu = os.cpu_count() or 4
         threads = str(min(8, max(1, cpu)))
     for k in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
@@ -255,7 +322,7 @@ def _server_disabled() -> bool:
 
 def _get_or_start_mineru_server(
     *,
-    device: str = "cpu",
+    device: str | None = None,
     startup_timeout: float = 180.0,
 ) -> dict | None:
     """Return the singleton server state dict, lazily starting it.
@@ -272,8 +339,15 @@ def _get_or_start_mineru_server(
     """
     global _MINERU_SERVER, _MINERU_SERVER_DISABLED_REASON, _MINERU_SERVER_STARTING
 
+    # Cheap negative checks first — neither needs the device, and the
+    # device resolver may import torch. Don't pay that cost just to bail.
     if _server_disabled():
         return None
+
+    # Device resolution is deferred to the launch branch below: the
+    # cached-server fast path doesn't need it, and `mineru_auto_device()`
+    # imports torch which is slow + can segfault under bad cross-test
+    # torch state.
 
     # ─── Phase 1: cheap check under lock ─────────────────────────────
     own_launch = False
@@ -282,6 +356,23 @@ def _get_or_start_mineru_server(
         if _MINERU_SERVER is not None:
             proc = _MINERU_SERVER.get("proc")
             if proc is not None and proc.poll() is None:
+                # The server is started ONCE per process and bakes its
+                # device into the subprocess env. If the caller explicitly
+                # asked for a different device, warn — silently honoring
+                # the running device would mislead operators who toggle
+                # MINERU_DEVICE_MODE mid-process.
+                running_device = _MINERU_SERVER.get("device")
+                if (
+                    device is not None
+                    and running_device
+                    and running_device != device
+                ):
+                    logger.warning(
+                        "mineru-api server already running on device=%s; "
+                        "ignoring caller request for device=%s "
+                        "(restart the parent process to switch)",
+                        running_device, device,
+                    )
                 return _MINERU_SERVER
             # Process died — clear so we can restart.
             logger.warning(
@@ -304,6 +395,10 @@ def _get_or_start_mineru_server(
                 _MINERU_SERVER_DISABLED_REASON = "mineru-api CLI not found"
                 logger.info("mineru-api CLI missing; staying on subprocess path")
                 return None
+
+            # We're about to launch — now we actually need the device.
+            if device is None:
+                device = mineru_auto_device()
 
             try:
                 preferred_port = int(os.environ.get("MINERU_API_PORT", "47865"))
@@ -341,7 +436,10 @@ def _get_or_start_mineru_server(
                 return None
 
             ready_event = threading.Event()
-            pending = {"ready_event": ready_event, "proc": proc, "url": url, "port": port}
+            pending = {
+                "ready_event": ready_event, "proc": proc,
+                "url": url, "port": port, "device": device,
+            }
             _MINERU_SERVER_STARTING = pending
             own_launch = True
 
@@ -414,7 +512,11 @@ def _poll_until_ready(pending: dict, startup_timeout: float) -> dict | None:
         elapsed = time.monotonic() - t0
         logger.info("mineru-api: ready on %s after %.1fs", url, elapsed)
 
-        state = {"url": url, "port": port, "proc": proc, "started_at": time.monotonic()}
+        state = {
+            "url": url, "port": port, "proc": proc,
+            "started_at": time.monotonic(),
+            "device": pending.get("device"),
+        }
         with _MINERU_SERVER_LOCK:
             _MINERU_SERVER = state
             if _MINERU_SERVER_STARTING is pending:
@@ -579,6 +681,17 @@ async def _extract_one_via_server(
         )
 
     blocks = entry.get("content_list")
+    # mineru >=3.1 returns content_list as a JSON-encoded STRING instead
+    # of an inline list. Detect and decode so both old and new server
+    # versions produce the same list-of-block-dicts downstream.
+    if isinstance(blocks, str):
+        try:
+            blocks = json.loads(blocks)
+        except json.JSONDecodeError as exc:
+            raise MinerUExtractionError(
+                f"mineru-api {filepath.name}: content_list is a string but not "
+                f"valid JSON ({exc}); first 200 chars: {entry.get('content_list', '')[:200]!r}"
+            ) from exc
     if not isinstance(blocks, list):
         # fix-all v3 (2026-05-22): include entry shape so we can see what
         # the server actually returned. Previously this just said
@@ -626,7 +739,7 @@ async def extract_pdfs_mineru_via_server(
     lang: str = "ch",
     *,
     timeout_seconds: float = 1800.0,
-    device: str = "cpu",
+    device: str | None = None,
     on_file_done: Callable[[int, int], None] | None = None,
 ) -> dict[str, list[PageInfo]]:
     """Server-backed batch: one HTTP request per PDF, ``asyncio.gather``.
@@ -650,8 +763,9 @@ async def extract_pdfs_mineru_via_server(
     if missing:
         raise FileNotFoundError(f"missing inputs: {missing[:3]}")
 
-    # ``_get_or_start_mineru_server`` holds a threading lock during startup;
-    # don't run it on the event loop thread directly.
+    # Pass device through as-is — `_get_or_start_mineru_server` resolves
+    # None lazily right before launch, so the cached / disabled / no-CLI
+    # fast paths don't pay the torch import.
     state = await asyncio.to_thread(_get_or_start_mineru_server, device=device)
     if state is None:
         raise MinerUExtractionError("mineru-api server unavailable; caller should fall back")
@@ -729,7 +843,7 @@ def extract_pdf_mineru(
     start_page: int | None = None,
     end_page: int | None = None,
     timeout_seconds: int = 1800,
-    device: str = "cpu",
+    device: str | None = None,
 ) -> list[PageInfo]:
     """Extract PDF pages via MinerU pipeline backend.
 
@@ -743,8 +857,10 @@ def extract_pdf_mineru(
       start_page / end_page: 0-indexed inclusive range. None = whole PDF.
       timeout_seconds: subprocess timeout. Default 1800s = 30 min, enough
         for ~100 pages on M4 CPU.
-      device: `cpu` (only currently-supported on Apple Silicon) or `mps`
-        (currently hangs — keep `cpu`).
+      device: `cpu` / `cuda` / `mps`. None (default) → `mineru_auto_device()`
+        which picks `cuda` when available, else `cpu`. MPS hangs the
+        pipeline backend at `DocAnalysis init` — only set it manually if
+        you've verified your mineru version unblocks it.
 
     Returns: 1-based PageInfo list. Each page text is the natural reading
     order of blocks, with LaTeX equations as `$$...$$` blocks and tables
@@ -754,6 +870,10 @@ def extract_pdf_mineru(
     filepath = Path(filepath).resolve()
     if not filepath.exists():
         raise FileNotFoundError(filepath)
+
+    # Device resolution is deferred to the subprocess branch below — the
+    # server-first path passes None through and the singleton resolves it
+    # lazily, so successful server calls never import torch.
 
     # fix-all v1 H1: route through the persistent mineru-api server when
     # available so a single-file call (e.g. kb/store.py per-file fallback
@@ -785,7 +905,8 @@ def extract_pdf_mineru(
     mineru_cli = _resolve_mineru_cli()
     if mineru_cli is None:
         raise MinerUNotFoundError(
-            "mineru CLI not found. Install with: pip install 'mineru[pipeline]'"
+            "mineru CLI not found. Install with: "
+            "uv pip install -e '.[mineru]'  (or pip install -e '.[mineru]')"
         )
 
     cleanup = False
@@ -809,6 +930,8 @@ def extract_pdf_mineru(
         if end_page is not None:
             cmd += ["-e", str(end_page)]
 
+        if device is None:
+            device = mineru_auto_device()
         env = _build_mineru_env(device)
 
         logger.info(
@@ -904,7 +1027,7 @@ def extract_pdfs_mineru_batch(
     output_dir: str | Path | None = None,
     *,
     timeout_seconds: int = 3600,
-    device: str = "cpu",
+    device: str | None = None,
     on_file_done: Callable[[int, int], None] | None = None,
 ) -> dict[str, list[PageInfo]]:
     """Batch-extract many PDFs through MinerU.
@@ -922,6 +1045,10 @@ def extract_pdfs_mineru_batch(
     defaults to 1 hour because a batch of 20 PDFs × 50 pages can easily
     take 30 minutes on CPU.
     """
+    # Device resolution is deferred to the subprocess branch below — the
+    # server-first path passes None through and the singleton resolves it
+    # lazily, so successful server calls never import torch.
+
     # Server-first path. Run the async helper to completion via
     # _run_async (fix-all v1 H3) so callers in a sync thread (kb.ingest_course
     # is offloaded via to_thread from the upload pipeline) don't need to
@@ -950,7 +1077,8 @@ def extract_pdfs_mineru_batch(
     mineru_cli = _resolve_mineru_cli()
     if mineru_cli is None:
         raise MinerUNotFoundError(
-            "mineru CLI not found. Install with: pip install 'mineru[pipeline]'"
+            "mineru CLI not found. Install with: "
+            "uv pip install -e '.[mineru]'  (or pip install -e '.[mineru]')"
         )
 
     paths = [Path(p).resolve() for p in filepaths]
@@ -998,6 +1126,8 @@ def extract_pdfs_mineru_batch(
             "-b", "pipeline",
             "-l", lang,
         ]
+        if device is None:
+            device = mineru_auto_device()
         env = _build_mineru_env(device)
         logger.info(
             "mineru batch: %d PDFs lang=%s device=%s",

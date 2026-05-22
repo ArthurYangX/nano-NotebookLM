@@ -235,9 +235,24 @@ def test_extract_pdf_mineru_on_hmm_sample(tmp_path):
 def test_extract_pdf_mineru_raises_when_cli_missing(monkeypatch, tmp_path):
     fake_pdf = tmp_path / "x.pdf"
     fake_pdf.write_bytes(b"%PDF-1.4\n%fake\n")
+    # Patch BOTH resolvers + disable the singleton, otherwise the H1
+    # server-first path swallows the missing-CLI signal by trying to
+    # launch mineru-api (which would also be missing in CI but only by
+    # coincidence). Without this, the test passes for the wrong reason.
+    monkeypatch.setenv("MINERU_SERVER_DISABLED", "1")
     monkeypatch.setattr(
         "nano_notebooklm.ingest.extractors_mineru._resolve_mineru_cli",
         lambda: None,
+    )
+    monkeypatch.setattr(
+        "nano_notebooklm.ingest.extractors_mineru._resolve_mineru_api_cli",
+        lambda: None,
+    )
+    # Pin device so this test never reaches `import torch` — torch state
+    # in a cross-suite run is order-dependent and not what we're testing.
+    monkeypatch.setattr(
+        "nano_notebooklm.ingest.extractors_mineru.mineru_auto_device",
+        lambda: "cpu",
     )
     with pytest.raises(MinerUNotFoundError):
         extract_pdf_mineru(fake_pdf)
@@ -246,6 +261,87 @@ def test_extract_pdf_mineru_raises_when_cli_missing(monkeypatch, tmp_path):
 def test_extract_pdf_mineru_raises_when_pdf_missing(tmp_path):
     with pytest.raises(FileNotFoundError):
         extract_pdf_mineru(tmp_path / "does_not_exist.pdf")
+
+
+# ── mineru_auto_device() — env override + cuda / cpu fallback ────────
+#
+# These tests patch `import torch` to fail so they are independent of
+# whatever torch state earlier tests in the suite have left behind
+# (some envs segfault on a second torch import). The function under
+# test guarantees an `except Exception` around the torch path, so a
+# raised ImportError must lead to the `cpu` branch.
+
+
+def _disable_torch_import(monkeypatch):
+    """Force `mineru_auto_device()` down the no-torch fallback so the
+    test is independent of whatever torch state earlier tests left
+    behind (a second torch import can segfault). The session-wide
+    autouse fixture pins `MINERU_DEVICE_MODE=cpu`; tests in this
+    module delenv it to exercise the env-override + auto branches."""
+    import builtins
+
+    from nano_notebooklm.ingest import extractors_mineru as M
+
+    monkeypatch.delenv("MINERU_DEVICE_MODE", raising=False)
+    M._reset_auto_device_cache()  # force re-probe under the patched import
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "torch" or name.startswith("torch."):
+            raise ImportError("simulated: torch not installed")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+
+
+def test_mineru_auto_device_known_override(monkeypatch):
+    from nano_notebooklm.ingest.extractors_mineru import mineru_auto_device
+
+    # Env override path doesn't touch torch — no need to disable import.
+    for value in ("cpu", "cuda", "mps"):
+        monkeypatch.setenv("MINERU_DEVICE_MODE", value)
+        assert mineru_auto_device() == value
+
+
+def test_mineru_auto_device_unknown_override_falls_through(monkeypatch, caplog):
+    """A typo like `guda` must NOT pass through — it would cause a
+    180s health-check hang on the first upload before the singleton
+    sticky-disables itself."""
+    import logging
+
+    from nano_notebooklm.ingest.extractors_mineru import mineru_auto_device
+
+    _disable_torch_import(monkeypatch)
+    monkeypatch.setenv("MINERU_DEVICE_MODE", "guda")
+    with caplog.at_level(logging.WARNING, logger="nano_notebooklm.ingest.extractors_mineru"):
+        result = mineru_auto_device()
+    assert result == "cpu", f"with torch unimportable the fallback must be cpu, got {result!r}"
+    assert any("guda" in rec.getMessage() for rec in caplog.records), (
+        "expected a warning naming the rejected value, got: "
+        + repr([r.getMessage() for r in caplog.records])
+    )
+
+
+def test_mineru_auto_device_no_torch_falls_to_cpu(monkeypatch):
+    """If torch is unimportable (default install without [mineru]
+    extras), auto-detect must return cpu, not raise."""
+    from nano_notebooklm.ingest import extractors_mineru as M
+
+    monkeypatch.delenv("MINERU_DEVICE_MODE", raising=False)
+    _disable_torch_import(monkeypatch)
+    assert M.mineru_auto_device() == "cpu"
+
+
+def test_mineru_auto_device_never_auto_selects_mps(monkeypatch):
+    """Even on Apple Silicon where `torch.backends.mps.is_available()`
+    might be True, the auto path must NOT return `mps` — the pipeline
+    backend hangs at DocAnalysis init under MPS. The auto path only
+    consults `torch.cuda.is_available`, never MPS."""
+    from nano_notebooklm.ingest.extractors_mineru import mineru_auto_device
+
+    monkeypatch.delenv("MINERU_DEVICE_MODE", raising=False)
+    _disable_torch_import(monkeypatch)
+    assert mineru_auto_device() != "mps"
 
 
 

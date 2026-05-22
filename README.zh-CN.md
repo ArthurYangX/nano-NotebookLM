@@ -24,6 +24,8 @@
 
 ---
 
+## 概况
+
 上传课程 PDF / PPTX / DOCX / Markdown → 自动构建知识图谱 + 向量索引 →
 带**页级精确引用**的对话、结构化 LaTeX 笔记、练习题、带**错题自演化题库**
 的考试复习模式、以及可编辑的思维导图。
@@ -33,12 +35,56 @@ Groq · Together · Anthropic Claude · Gemini**，以及任何兼容 OpenAI
 `/v1/chat/completions` 协议的本地推理后端（**Ollama / vLLM /
 LM Studio / llama.cpp**）。
 
+---
+
+## 快速开始
+
 ```bash
+# 1. 克隆 + 安装（uv 比 pip 快约 10×，两个都行）
 git clone https://github.com/ArthurYangX/nano-NotebookLM && cd nano-NotebookLM
-python -m venv .venv && source .venv/bin/activate && pip install -e ".[test]"
-cp .env.example .env && $EDITOR .env   # 至少填一个 LLM key
+uv venv && source .venv/bin/activate && uv pip install -e ".[test]"
+# 或：python -m venv .venv && source .venv/bin/activate && pip install -e ".[test]"
+
+# 2. 配置 —— 复制模板，至少填一个 LLM key
+#    （OPENAI_API_KEY、或 ANTHROPIC_API_KEY、或 LOCAL_LLM_BASE_URL + LOCAL_LLM_MODEL）
+cp .env.example .env
+
+# 3. 启动（Ctrl-C 停服；或者用下面的 ./dev.sh 让它后台跑）
 python api/server.py                   # → http://localhost:8000
 ```
+
+想让服务在后台跑、有 pid / 日志管理？`./dev.sh` 封装了同样的命令：
+
+```bash
+./dev.sh install   # 建 .venv + 装依赖 + 复制 .env
+./dev.sh up        # 后台启动 + 等 /api/health
+./dev.sh status    # pid + /api/status 概览
+./dev.sh logs      # tail /tmp/nano-nlm.log
+./dev.sh down      # 停服
+```
+
+> 装 `uv`（一行命令、比 pip 快约 10×）：
+> `curl -LsSf https://astral.sh/uv/install.sh | sh` —— 完整文档见
+> <https://docs.astral.sh/uv/getting-started/installation/>。
+> 不装也行，原生 `pip` 跑起来完全一样。
+
+#### 可选 extras（按需安装）
+
+| 用途 | 安装命令 | 不装会怎样 |
+|---|---|---|
+| **MinerU** —— 扫描版 PDF / 公式版幻灯片的 OCR + 版式解析 | `uv pip install -e ".[mineru]"`（重，含模型约 3-5GB） | 上传选 `engine=mineru` 会报错；默认的 `engine=pymupdf` 仍可用 |
+| **tectonic** —— LaTeX → PDF（笔记导出） | `brew install tectonic` / `apt install tectonic` | 「导出 PDF」按钮自动隐藏，浏览器内 KaTeX 预览不受影响 |
+| **LibreOffice** (`soffice`) —— `.pptx` → PDF sidecar（MinerU 走 pptx 用） | `brew install --cask libreoffice` / `apt install libreoffice` | `.pptx` + `engine=mineru` 静默回落 python-pptx（无 OCR） |
+
+GPU：Linux 下 MinerU 会自动检测 CUDA（1–2 秒/页）；Apple Silicon 默认
+走 CPU（约 12 秒/页）—— 自动检测不会选 MPS，因为 pipeline 后端在 MPS
+上会 hang。可用 `MINERU_DEVICE_MODE=cuda|cpu|mps` 在 `.env` 里强制覆盖。
+**逃生口**：如果 CUDA 被检测出但运行时坏（驱动旧 / 显存满），显式设
+`MINERU_DEVICE_MODE=cpu` 让 MinerU 退回 CPU。
+
+> **联网要求。** 前端走 CDN 加载 React / KaTeX / d3-force / CodeMirror /
+> IBM Plex 字体（jsdelivr、unpkg、esm.sh、Google Fonts）—— 首次加载页面
+> 需要联网。完全离线部署需要把这些资产本地 vendor 一份。
 
 > 想了解架构和代码地图？看 [`CLAUDE.md`](CLAUDE.md)。
 > 想贡献代码？看 [`CONTRIBUTING.md`](CONTRIBUTING.md)。
@@ -104,49 +150,6 @@ python api/server.py                   # → http://localhost:8000
 
 ---
 
-## 架构
-
-<div align="center">
-
-<img src="docs/screenshots/architecture.png" alt="nano-NotebookLM 系统架构" width="900">
-
-*三层架构：应用层（笔记 / 知识图谱 / 阅读器 / 问答 / 考试复习）→
-检索层（BM25 + FAISS + GraphRAG + RRF）→ 模型层（OpenAI / DeepSeek /
-Claude 云端 API，或任意通过 Ollama / vLLM 提供服务的本地 7B–14B 模型）。*
-
-</div>
-
-单进程、单机、无鉴权、无数据库 —— 为单用户或小团队在自己的笔记本 /
-工作站上运行而设计。
-
----
-
-## 快速开始
-
-```bash
-# 1. 克隆 + 安装
-git clone https://github.com/ArthurYangX/nano-NotebookLM && cd nano-NotebookLM
-python -m venv .venv && source .venv/bin/activate
-pip install -e ".[test]"
-
-# 2. 配置至少一个 LLM backend
-cp .env.example .env
-$EDITOR .env                  # 填 OPENAI_API_KEY（或 ANTHROPIC_API_KEY、或 LOCAL_LLM_*）
-
-# 3. 启动
-python api/server.py          # → http://localhost:8000
-```
-
-打开浏览器，点击「上传第一个文档」，拖入一个 PDF，就开始用了。
-
-### 验证安装
-
-```bash
-pytest                         # 单元测试 + API 烟雾测试；无需任何 LLM key
-```
-
----
-
 ## Provider 列表
 
 | Provider              | 类型             | `OPENAI_BASE_URL`                                              | 建议模型                                      |
@@ -161,7 +164,7 @@ pytest                         # 单元测试 + API 烟雾测试；无需任何 
 | Together              | 云端，OpenAI 兼容 | `https://api.together.xyz/v1`                                  | `meta-llama/Llama-3.3-70B-Instruct-Turbo`    |
 | Gemini（OpenAI 兼容）  | 云端，OpenAI 兼容 | `https://generativelanguage.googleapis.com/v1beta/openai/`     | `gemini-2.0-flash`                           |
 | **Ollama**            | 本地             | `http://localhost:11434/v1`                                    | `qwen2.5:7b`                                 |
-| **vLLM**              | 本地             | `http://localhost:8000/v1`                                     | `Qwen/Qwen2.5-7B-Instruct`                   |
+| **vLLM**              | 本地             | `http://localhost:8001/v1` *（挑个空闲端口；**别用 8000**，那是 app server）* | `Qwen/Qwen2.5-7B-Instruct`                   |
 | **LM Studio**         | 本地             | `http://localhost:1234/v1`                                     | *（在 LM Studio 里加载的模型）*               |
 | **llama.cpp server**  | 本地             | `http://localhost:8080/v1`                                     | *（加载的 GGUF 模型）*                        |
 
@@ -261,8 +264,8 @@ docs/screenshots/        README 用图
 ## 开发
 
 ```bash
-pip install -e ".[test]"
-pytest                         # 单元测试 + API 烟雾测试
+uv pip install -e ".[test]"    # 或：pip install -e ".[test]"
+pytest                         # 单元测试 + API 烟雾测试；无需 LLM key
 pytest tests/test_api_smoke.py # 快速子集
 ```
 
@@ -291,7 +294,6 @@ pytest tests/test_api_smoke.py # 快速子集
 - Vite 构建选项（opt-in，CDN 仍是默认）
 - 掌握度驱动的考试复习难度曲线
 - 跨课程图谱连接
-- Docker Compose 一键启动
 
 ---
 

@@ -59,6 +59,13 @@ test = [
     "pytest-asyncio>=0.23",
     "httpx>=0.27",
 ]
+# MinerU is the OCR / layout-aware PDF extractor used when a course is
+# uploaded with engine=mineru (scanned PDFs, formula-heavy slides).
+# Heavy install (~3-5GB with torch + models on first run) — keep it
+# opt-in so the default `pip install -e .` stays slim.
+mineru = [
+    "mineru[pipeline]>=3.0",
+]
 
 [project.scripts]
 nano-nlm = "nano_notebooklm.__main__:main"

@@ -16,6 +16,18 @@ import pytest
 from nano_notebooklm.types import Chunk, FileType
 
 
+@pytest.fixture(autouse=True)
+def _pin_mineru_device(monkeypatch):
+    """Default every test to ``MINERU_DEVICE_MODE=cpu`` so the mineru
+    extractor's auto-device path never imports torch in the test
+    process. A second torch import can segfault when cross-test fixtures
+    have left libtorch in an unstable state, which has crashed pytest
+    in CI runs. Tests that explicitly cover `mineru_auto_device()` (see
+    test_extractors_mineru.py) delenv this and patch ``__import__``
+    themselves to control the resolution path."""
+    monkeypatch.setenv("MINERU_DEVICE_MODE", "cpu")
+
+
 def _hash_embed(texts: list[str], dim: int = 32) -> np.ndarray:
     """Deterministic hash-based embedding — for tests only."""
     out = np.zeros((len(texts), dim), dtype=np.float32)

@@ -42,6 +42,11 @@ Screenshot*.png
 # Course-presentation deck (15 MB, kept locally; not for the repo)
 ppt.pdf
 
+# Local PDFs used as ad-hoc test inputs (course slides, sample uploads).
+# Anything matching test-*.pdf or sample-*.pdf stays out of the repo.
+test-*.pdf
+sample-*.pdf
+
 # Local screenshot working folder — canonical copies live in docs/screenshots/
 pics/
 
