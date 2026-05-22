@@ -1,9 +1,41 @@
-/* global React, READER_DOC, API */
+/* global React, READER_DOC, API, getReaderDoc */
 const { useState: useStateR, useEffect: useEffectR, useRef: useRefR, useMemo: useMemoR } = React;
+
+// fix-all v3 (2026-05-22): split text on blank lines so multi-paragraph
+// strings from i18n (used heavily by the welcome guide) render as
+// separate <p> blocks instead of one comma-spliced wall. **bold**
+// markdown markers also get rendered via <strong> for emphasis on key
+// scenarios in the troubleshooting copy.
+function _renderBody(text) {
+  if (!text) return null;
+  const paras = text.split(/\n\n+/);
+  return paras.map((para, i) => (
+    <p key={i}>{_renderInline(para)}</p>
+  ));
+}
+
+function _renderInline(text) {
+  if (!text) return null;
+  // Tiny inline parser for **bold**; leaves everything else as-is.
+  const parts = text.split(/(\*\*[^*]+\*\*)/g);
+  return parts.map((part, j) => {
+    if (part.startsWith("**") && part.endsWith("**")) {
+      return <strong key={j}>{part.slice(2, -2)}</strong>;
+    }
+    return <React.Fragment key={j}>{part}</React.Fragment>;
+  });
+}
 
 function ReaderParagraph({ p, highlightedId, onHighlight, onCite }) {
   if (p.kind === "h2") {
     return <h2><span className="num mono">§ {p.num}</span>{p.text}</h2>;
+  }
+  // fix-all v3: when the doc carries newline-separated paragraphs (the
+  // localized welcome guide), split into multiple <p> blocks. Citation
+  // chips (`p.cites`) are kept only on the single-paragraph legacy path
+  // to avoid ambiguous chip placement across paragraphs.
+  if (p.kind === "p" && typeof p.text === "string" && p.text.includes("\n\n") && !p.cites) {
+    return <React.Fragment>{_renderBody(p.text)}</React.Fragment>;
   }
   if (p.kind === "figure") {
     return (
@@ -15,7 +47,7 @@ function ReaderParagraph({ p, highlightedId, onHighlight, onCite }) {
   }
   return (
     <p>
-      {p.text}
+      {_renderInline(p.text)}
       {p.cites && p.cites.map((c, i) => {
         if (typeof c === "string") return <span key={i}>{c}</span>;
         const isHot = highlightedId === c.id;
@@ -171,6 +203,17 @@ function DocumentPdfFrame({ courseId, docId, sourceFile, activePage, navEpoch, o
 
 function Reader({ sources, activeCourse, activeId, activePage, onHighlight, highlightedId, onCite, notice, navEpoch }) {
   const t = useT();
+  // fix-all v3 (2026-05-22): the "no source loaded" welcome screen
+  // (`showIntro`) now renders a localized operation guide built by
+  // data.jsx's `getReaderDoc(t)`. The legacy `READER_DOC` constant is
+  // kept only for the chapter/title/sub banner fallbacks below.
+  // Rebuilding the 25-paragraph guide on every Reader re-render (course
+  // switch / activeId / navEpoch / notice churn) is pure waste — the
+  // doc only changes when `t` does (i.e. on language switch).
+  const welcomeDoc = useMemoR(
+    () => (typeof getReaderDoc === "function" ? getReaderDoc(t) : READER_DOC),
+    [t],
+  );
   // Persisted global preference: collapse PDFium's bookmarks/thumbnails
   // side panel (default hidden — see StudyState.loadPdfOutlineHidden).
   const [pdfOutlineHidden, setPdfOutlineHiddenRaw] = useStateR(
@@ -283,14 +326,14 @@ function Reader({ sources, activeCourse, activeId, activePage, onHighlight, high
       ? `${docData.total_chunks} chunks · pages ${pages[0]}–${pages[1]}${docData.file_type ? " · " + docData.file_type : ""}`
       : `${docData.total_chunks} chunks${docData.file_type ? " · " + docData.file_type : ""}`;
   }
-  else banner = source ? `${pageLabel} · ${source.meta || ""}` : READER_DOC.sub;
+  else banner = source ? `${pageLabel} · ${source.meta || ""}` : welcomeDoc.sub;
 
   const heading = showRealChunk ? chunkData.source_file
                  : docData ? docData.source_file
-                 : source ? source.title : READER_DOC.title;
-  const chapter = showRealChunk ? (chunkData.course_id || READER_DOC.chapter)
-                 : docData ? (docData.course_id || activeCourse || READER_DOC.chapter)
-                 : READER_DOC.chapter;
+                 : source ? source.title : welcomeDoc.title;
+  const chapter = showRealChunk ? (chunkData.course_id || welcomeDoc.chapter)
+                 : docData ? (docData.course_id || activeCourse || welcomeDoc.chapter)
+                 : welcomeDoc.chapter;
 
   return (
     <div className="reader" data-screen-label="Reader">
@@ -354,7 +397,7 @@ function Reader({ sources, activeCourse, activeId, activePage, onHighlight, high
           />
         )}
 
-        {showIntro && READER_DOC.body.map((p, i) => (
+        {showIntro && welcomeDoc.body.map((p, i) => (
           <ReaderParagraph
             key={i}
             p={p}

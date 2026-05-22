@@ -32,13 +32,16 @@ function ExamPrep({ activeCourse, userLang }) {
   // can't tell whether the page is alive or the request has hung.
   function startBusy(label) {
     setLoading(true);
-    setLoadingLabel(label || "Working…");
+    setLoadingLabel(label || t("exam.busy.working"));
     setElapsedSec(0);
     if (elapsedTimerRef.current) clearInterval(elapsedTimerRef.current);
     const t0 = Date.now();
+    // Display granularity is whole seconds, so a 1s interval is enough.
+    // The earlier 500ms cadence doubled the render-attempt rate during
+    // the loading window for zero visible benefit.
     elapsedTimerRef.current = setInterval(() => {
       setElapsedSec(Math.round((Date.now() - t0) / 1000));
-    }, 500);
+    }, 1000);
   }
   function stopBusy() {
     setLoading(false);
@@ -67,14 +70,14 @@ function ExamPrep({ activeCourse, userLang }) {
   const refresh = useEPCallback(async () => {
     if (!activeCourse) return;
     const myActive = activeCourse;
-    startBusy("Loading exam bank…"); setError("");
+    startBusy(t("exam.busy.loading_bank")); setError("");
     try {
       const data = await API.examPrepView(myActive);
       if (myActive !== activeCourse) return;
       setBankView(data.view || null);
     } catch (e) {
       if (myActive !== activeCourse) return;
-      setError(e.message || "Failed to load exam bank");
+      setError(e.message || t("exam.error.failed_load_bank"));
     } finally {
       if (myActive === activeCourse) stopBusy();
     }
@@ -88,20 +91,21 @@ function ExamPrep({ activeCourse, userLang }) {
   async function handlePlan(force = false) {
     if (busy()) return;
     const myActive = activeCourse;
-    startBusy("Extracting exam topics from course materials…"); setError("");
+    startBusy(t("exam.busy.extracting")); setError("");
     try {
       const data = await API.examPrepPlan(myActive, { force, userLang });
       if (myActive !== activeCourse) return;
       setBankView(data.view || null);
       // H4: surface what was preserved / archived after a re-extract.
       if (force && (data.orphan_question_count || data.migrated_topic_count)) {
-        setError(
-          `Re-extract complete · ${data.migrated_topic_count || 0} topic(s) carried questions forward · ${data.orphan_question_count || 0} orphan questions archived (visible in a "[archive] ..." topic).`
-        );
+        setError(t("exam.info.re_extract_done", {
+          migrated: data.migrated_topic_count || 0,
+          orphans: data.orphan_question_count || 0,
+        }));
       }
     } catch (e) {
       if (myActive !== activeCourse) return;
-      setError(e.message || "Topic extraction failed");
+      setError(e.message || t("exam.error.failed_extract"));
     } finally {
       if (myActive === activeCourse) stopBusy();
     }
@@ -110,7 +114,7 @@ function ExamPrep({ activeCourse, userLang }) {
   async function startQuiz(topicId = null) {
     if (busy()) return;
     const myActive = activeCourse;
-    startBusy("Sampling questions from the bank…"); setError(""); setAnswers({}); setGraded(null);
+    startBusy(t("exam.busy.sampling")); setError(""); setAnswers({}); setGraded(null);
     try {
       const data = await API.examPrepNextQuiz(myActive, {
         size: 8,
@@ -123,11 +127,11 @@ function ExamPrep({ activeCourse, userLang }) {
         // (generation_failed), shrug it off (all_mastered), or check ingest.
         const reason = data.reason || "no_questions";
         if (reason === "generation_failed") {
-          setError("Question generation failed for this topic. Please retry — the LLM may have timed out or returned malformed JSON.");
+          setError(t("exam.error.gen_failed"));
         } else if (reason === "all_mastered") {
-          setError("All questions in scope are already mastered. Try re-extracting topics or pick a different topic.");
+          setError(t("exam.error.all_mastered"));
         } else {
-          setError("No questions available — try seeding this topic or check the course KB has content.");
+          setError(t("exam.error.no_questions"));
         }
         return;
       }
@@ -136,7 +140,7 @@ function ExamPrep({ activeCourse, userLang }) {
       setView("quiz");
     } catch (e) {
       if (myActive !== activeCourse) return;
-      setError(e.message || "Failed to start quiz");
+      setError(e.message || t("exam.error.failed_start"));
     } finally {
       if (myActive === activeCourse) stopBusy();
     }
@@ -145,11 +149,11 @@ function ExamPrep({ activeCourse, userLang }) {
   async function handleSubmit() {
     if (busy()) return;
     if (Object.keys(answers).length === 0) {
-      setError("Please answer at least one question before submitting.");
+      setError(t("exam.error.answer_at_least_one"));
       return;
     }
     const myActive = activeCourse;
-    startBusy("Grading + generating fresh variants for any wrong topics…"); setError("");
+    startBusy(t("exam.busy.grading")); setError("");
     try {
       const data = await API.examPrepSubmit(myActive, answers, { userLang });
       if (myActive !== activeCourse) return;
@@ -158,22 +162,22 @@ function ExamPrep({ activeCourse, userLang }) {
       setView("result");
     } catch (e) {
       if (myActive !== activeCourse) return;
-      setError(e.message || "Submit failed");
+      setError(e.message || t("exam.error.failed_submit"));
     } finally {
       if (myActive === activeCourse) stopBusy();
     }
   }
 
   async function handleReset() {
-    if (!window.confirm("Wipe the entire exam bank? You'll need to re-extract topics from scratch.")) return;
-    startBusy("Resetting bank…");
+    if (!window.confirm(t("exam.confirm.reset"))) return;
+    startBusy(t("exam.busy.resetting"));
     try {
       await API.examPrepReset(activeCourse);
       setBankView(null);
       setView("topics");
       setQuizQuestions([]); setAnswers({}); setGraded(null);
     } catch (e) {
-      setError(e.message || "Reset failed");
+      setError(e.message || t("exam.error.failed_reset"));
     }
     stopBusy();
   }
@@ -182,8 +186,8 @@ function ExamPrep({ activeCourse, userLang }) {
     return (
       <div className="reader-body exam-prep-wrap">
         <div className="exam-prep-empty">
-          <h2>Exam Prep</h2>
-          <p>Select a course from the sidebar to begin exam preparation.</p>
+          <h2>{t("exam.title")}</h2>
+          <p>{t("exam.empty_select_course")}</p>
         </div>
       </div>
     );
@@ -192,21 +196,21 @@ function ExamPrep({ activeCourse, userLang }) {
   const hasTopics = bankView && bankView.topic_count > 0;
 
   return (
-    <div className="reader-body exam-prep-wrap" data-screen-label="Exam Prep">
+    <div className="reader-body exam-prep-wrap" data-screen-label={t("exam.title")}>
       <header className="exam-prep-header">
         <div>
-          <h2>Exam Prep · {activeCourse}</h2>
+          <h2>{t("exam.title")} · {activeCourse}</h2>
           {bankView && (
             <div className="exam-prep-overall">
-              <span><b>{bankView.total_mastered}</b> / {bankView.total_questions} questions mastered</span>
+              <span>{t("exam.stats.questions_mastered", { done: bankView.total_mastered, total: bankView.total_questions })}</span>
               <span className="dot">·</span>
-              <span><b>{bankView.mastered_topics}</b> / {bankView.topic_count} topics fully mastered</span>
+              <span>{t("exam.stats.topics_mastered", { done: bankView.mastered_topics, total: bankView.topic_count })}</span>
               {bankView.total_attempts > 0 && (
                 <React.Fragment>
                   <span className="dot">·</span>
-                  <span><b>{bankView.total_attempts}</b> attempts</span>
+                  <span>{t("exam.stats.attempts", { n: bankView.total_attempts })}</span>
                   <span className="dot">·</span>
-                  <span className="mono">{Math.round((bankView.overall_correct_rate || 0) * 100)}% correct</span>
+                  <span className="mono">{t("exam.stats.correct_pct", { pct: Math.round((bankView.overall_correct_rate || 0) * 100) })}</span>
                 </React.Fragment>
               )}
             </div>
@@ -221,20 +225,18 @@ function ExamPrep({ activeCourse, userLang }) {
                 // would have dropped questions; we now preserve by normalized
                 // name and archive orphans, but the LLM cost + UX disruption
                 // still warrants a confirm.
-                const ok = window.confirm(
-                  "Re-extract exam topics? Existing questions are preserved for any topic whose name matches the new extraction (normalized). Topics whose names changed will have their questions moved to an archive bucket you can still see. Continue?"
-                );
+                const ok = window.confirm(t("exam.confirm.re_extract"));
                 if (ok) handlePlan(true);
               }}
               disabled={loading}
-              title="Run topic extraction again. Mastery history for renamed topics moves to an archive."
+              title={t("exam.tooltip.re_extract")}
             >
-              Re-extract topics
+              {t("exam.action.re_extract")}
             </button>
           )}
           {hasTopics && (
             <button className="btn ghost danger" onClick={handleReset} disabled={loading}>
-              Reset bank
+              {t("exam.action.reset")}
             </button>
           )}
         </div>
@@ -245,23 +247,26 @@ function ExamPrep({ activeCourse, userLang }) {
       {/* Empty state — no topics yet */}
       {!loading && !hasTopics && view === "topics" && (
         <div className="exam-prep-empty">
-          <p>No exam bank yet for this course. Extract topics from the course materials to begin.</p>
+          <p>{t("exam.empty_no_topics")}</p>
           <button className="btn primary" onClick={() => handlePlan(false)} disabled={loading}>
-            Extract Exam Topics
+            {t("exam.action.extract_topics")}
           </button>
         </div>
       )}
 
       {loading && (
         <div className="exam-prep-loading">
-          <div className="exam-prep-loading-label">{loadingLabel || "Working…"}</div>
-          <div className="exam-prep-loading-elapsed mono">{elapsedSec}s elapsed{elapsedSec >= 60 ? " — GPT-5.5 reasoning can take up to 120s before timing out" : ""}</div>
+          <div className="exam-prep-loading-label">{loadingLabel || t("exam.busy.working")}</div>
+          <div className="exam-prep-loading-elapsed mono">
+            {t("exam.busy.elapsed", { n: elapsedSec })}{elapsedSec >= 60 ? t("exam.busy.elapsed_long_hint") : ""}
+          </div>
         </div>
       )}
 
       {/* Topics list */}
       {!loading && hasTopics && view === "topics" && (
         <ExamPrepTopics
+          t={t}
           bankView={bankView}
           onStartMixed={() => startQuiz(null)}
           onStartTopic={(tid) => startQuiz(tid)}
@@ -271,6 +276,7 @@ function ExamPrep({ activeCourse, userLang }) {
       {/* Active quiz */}
       {view === "quiz" && (
         <ExamPrepQuiz
+          t={t}
           questions={quizQuestions}
           scope={quizScope}
           answers={answers}
@@ -284,6 +290,7 @@ function ExamPrep({ activeCourse, userLang }) {
       {/* Graded result */}
       {view === "result" && graded && (
         <ExamPrepResult
+          t={t}
           graded={graded}
           questions={quizQuestions}
           answers={answers}
@@ -303,36 +310,39 @@ function ExamPrep({ activeCourse, userLang }) {
   );
 }
 
-function ExamPrepTopics({ bankView, onStartMixed, onStartTopic }) {
-  const liveTopics = (bankView.topics || []).filter(t => !t.is_archived);
-  const archivedTopics = (bankView.topics || []).filter(t => t.is_archived);
+function ExamPrepTopics({ t, bankView, onStartMixed, onStartTopic }) {
+  // fix-all v3 (2026-05-22): `t` is the i18n helper passed from parent;
+  // topic objects inside the filter / map are aliased to `tp` to avoid
+  // shadowing it.
+  const liveTopics = (bankView.topics || []).filter(tp => !tp.is_archived);
+  const archivedTopics = (bankView.topics || []).filter(tp => tp.is_archived);
   return (
     <div className="exam-prep-topics">
       <div className="exam-prep-cta-row">
         <button className="btn primary" onClick={onStartMixed}>
-          Start Mixed Quiz · all non-mastered topics
+          {t("exam.action.start_mixed")}
         </button>
       </div>
       <div className="topic-grid">
-        {liveTopics.map(t => {
-          const pct = Math.round((t.mastery_ratio || 0) * 100);
+        {liveTopics.map(tp => {
+          const pct = Math.round((tp.mastery_ratio || 0) * 100);
           return (
-            <div key={t.id} className={"topic-card" + (t.is_mastered ? " mastered" : "")}>
+            <div key={tp.id} className={"topic-card" + (tp.is_mastered ? " mastered" : "")}>
               <div className="topic-card-head">
-                <h3>{t.name}</h3>
-                {t.is_mastered && <span className="topic-mastered-chip">✓ mastered</span>}
+                <h3>{tp.name}</h3>
+                {tp.is_mastered && <span className="topic-mastered-chip">{t("exam.topic.mastered_chip")}</span>}
               </div>
               <div className="topic-meta">
-                <span className="mono">weight · {Math.round((t.weight || 0) * 100)}%</span>
+                <span className="mono">{t("exam.topic.weight", { pct: Math.round((tp.weight || 0) * 100) })}</span>
                 <span className="dot">·</span>
-                <span>{t.mastered_count} / {t.question_count} mastered</span>
+                <span>{t("exam.topic.mastered_count", { done: tp.mastered_count, total: tp.question_count })}</span>
               </div>
-              {t.attempt_count > 0 && (
+              {tp.attempt_count > 0 && (
                 <div className="topic-meta topic-attempts">
-                  <span>{t.attempt_count} attempt{t.attempt_count === 1 ? "" : "s"}</span>
+                  <span>{t("exam.topic.attempts", { n: tp.attempt_count })}</span>
                   <span className="dot">·</span>
-                  <span className={"topic-correct-rate " + (t.correct_rate >= 0.7 ? "good" : t.correct_rate >= 0.4 ? "mid" : "bad")}>
-                    {Math.round((t.correct_rate || 0) * 100)}% correct
+                  <span className={"topic-correct-rate " + (tp.correct_rate >= 0.7 ? "good" : tp.correct_rate >= 0.4 ? "mid" : "bad")}>
+                    {t("exam.topic.correct_rate", { pct: Math.round((tp.correct_rate || 0) * 100) })}
                   </span>
                 </div>
               )}
@@ -341,10 +351,10 @@ function ExamPrepTopics({ bankView, onStartMixed, onStartTopic }) {
               </div>
               <button
                 className="btn ghost topic-quiz-btn"
-                onClick={() => onStartTopic(t.id)}
-                title={t.is_mastered ? "Re-quiz this topic (already mastered)" : `Start quiz on ${t.name}`}
+                onClick={() => onStartTopic(tp.id)}
+                title={tp.is_mastered ? t("exam.topic.re_quiz_tip") : t("exam.topic.start_quiz_tip", { name: tp.name })}
               >
-                {t.is_mastered ? "Review mastered →" : "Quiz on this topic →"}
+                {tp.is_mastered ? t("exam.topic.review_btn") : t("exam.topic.start_btn")}
               </button>
             </div>
           );
@@ -352,21 +362,21 @@ function ExamPrepTopics({ bankView, onStartMixed, onStartTopic }) {
       </div>
       {archivedTopics.length > 0 && (
         <div className="topic-archive-note">
-          <strong>Archive</strong> · {archivedTopics.length} bucket(s) of orphan questions from previous re-extracts (not sampled for new quizzes).
+          {t("exam.archive.label", { n: archivedTopics.length })}
         </div>
       )}
     </div>
   );
 }
 
-function ExamPrepQuiz({ questions, scope, answers, onAnswer, onSubmit, onCancel, loading }) {
+function ExamPrepQuiz({ t, questions, scope, answers, onAnswer, onSubmit, onCancel, loading }) {
   const answered = Object.keys(answers).filter(k => answers[k] != null && answers[k] !== "").length;
   return (
     <div className="exam-prep-quiz">
       <div className="exam-prep-quiz-head">
         <div>
-          <strong>Quiz · {questions.length} questions</strong>
-          {scope && <span className="mono"> · scoped to topic</span>}
+          <strong>{t("exam.quiz.title", { n: questions.length })}</strong>
+          {scope && <span className="mono">{t("exam.quiz.scoped_topic")}</span>}
         </div>
         <div className="exam-prep-quiz-progress">
           <span className="mono">{answered} / {questions.length}</span>
@@ -407,7 +417,7 @@ function ExamPrepQuiz({ questions, scope, answers, onAnswer, onSubmit, onCancel,
             <textarea
               className="exam-q-textarea"
               rows={3}
-              placeholder="Your answer…"
+              placeholder={t("exam.quiz.placeholder")}
               value={answers[q.id] || ""}
               onChange={e => onAnswer(q.id, e.target.value)}
             />
@@ -416,16 +426,22 @@ function ExamPrepQuiz({ questions, scope, answers, onAnswer, onSubmit, onCancel,
       ))}
 
       <div className="exam-prep-quiz-footer">
-        <button className="btn ghost" onClick={onCancel} disabled={loading}>Back</button>
+        <button className="btn ghost" onClick={onCancel} disabled={loading}>{t("exam.quiz.back")}</button>
         <button className="btn primary" onClick={onSubmit} disabled={loading || answered === 0}>
-          Submit · grade {answered} answer{answered === 1 ? "" : "s"}
+          {t("exam.quiz.submit", { n: answered })}
         </button>
       </div>
     </div>
   );
 }
 
-function ExamPrepResult({ graded, questions, answers, onContinue, onAgain }) {
+function ExamPrepResult({ t, graded, questions, answers, onContinue, onAgain }) {
+  // fix-all v3 (2026-05-22): `t` is now required — previously this
+  // component referenced `t(...)` from its parent's closure, which
+  // worked when the file was a single component but broke once these
+  // were factored into separate top-level functions. The exam.variant_*
+  // hint branch threw ReferenceError after Grade (the variants_pending
+  // path always fires on submit), crashing the result page render.
   const total = graded.graded.length;
   const right = graded.graded.filter(g => g.correct).length;
   const wrong = total - right;
@@ -446,20 +462,20 @@ function ExamPrepResult({ graded, questions, answers, onContinue, onAgain }) {
       <div className="exam-result-summary">
         <div className="exam-result-stat correct">
           <b>{right}</b>
-          <span>correct</span>
+          <span>{t("exam.result.correct")}</span>
         </div>
         <div className="exam-result-stat wrong">
           <b>{wrong}</b>
-          <span>wrong</span>
+          <span>{t("exam.result.wrong")}</span>
         </div>
         <div className="exam-result-stat">
           <b>{Math.round(total ? right * 100 / total : 0)}%</b>
-          <span>score</span>
+          <span>{t("exam.result.score")}</span>
         </div>
         {variantCount > 0 && (
-          <div className="exam-result-stat variants" title={`Self-evolution: ${graded.variant_budget_per_topic} variants per wrong topic`}>
+          <div className="exam-result-stat variants" title={t("exam.result.fresh_variants_tip", { n: graded.variant_budget_per_topic })}>
             <b>+{variantCount}</b>
-            <span>fresh variants generated</span>
+            <span>{t("exam.result.fresh_variants")}</span>
           </div>
         )}
         {variantCount === 0 && variantsPending && expectedVariants > 0 && (
@@ -485,12 +501,12 @@ function ExamPrepResult({ graded, questions, answers, onContinue, onAgain }) {
               </div>
               <p className="exam-q-prompt">{q.prompt}</p>
               <div className="exam-result-detail">
-                <div><strong>Your answer:</strong> {userAns || <em>(empty)</em>}</div>
+                <div><strong>{t("exam.result.your_answer")}</strong> {userAns || <em>{t("exam.result.empty_answer")}</em>}</div>
                 {!g.correct && (
-                  <div><strong>Expected:</strong> {g.expected}</div>
+                  <div><strong>{t("exam.result.expected")}</strong> {g.expected}</div>
                 )}
                 {g.explanation && (
-                  <div className="dim"><strong>Why:</strong> {g.explanation}</div>
+                  <div className="dim"><strong>{t("exam.result.why")}</strong> {g.explanation}</div>
                 )}
               </div>
             </div>
@@ -499,8 +515,8 @@ function ExamPrepResult({ graded, questions, answers, onContinue, onAgain }) {
       </div>
 
       <div className="exam-prep-quiz-footer">
-        <button className="btn ghost" onClick={onContinue}>Back to Topics</button>
-        <button className="btn primary" onClick={onAgain}>Another Round</button>
+        <button className="btn ghost" onClick={onContinue}>{t("exam.result.back_topics")}</button>
+        <button className="btn primary" onClick={onAgain}>{t("exam.result.another_round")}</button>
       </div>
     </div>
   );

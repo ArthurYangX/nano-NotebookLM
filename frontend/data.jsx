@@ -10,18 +10,73 @@ let SAMPLE_COLLECTIONS = [
   { id: "main", name: "All Courses", count: 0, color: "oklch(0.42 0.08 160)" },
 ];
 
+// Legacy English-only fallback. Kept so any stray `READER_DOC.chapter` /
+// `.title` / `.sub` reference (the header banner at the top of an
+// unloaded Reader screen) still renders before the i18n call resolves.
+// The expanded operation-guide body lives in `getReaderDoc(t)` below,
+// which reader.jsx prefers when in the "no source loaded" intro state.
 const READER_DOC = {
   chapter: "nano-NOTEBOOKLM",
   title: "Welcome to nano-NOTEBOOKLM",
   sub: "Upload course materials or select a course to begin exploring.",
+  // Minimal defense-in-depth fallback so a script-loading hiccup that
+  // strips `getReaderDoc` off `window` still renders one readable
+  // paragraph instead of a silent blank pane. See `getReaderDoc(t)` for
+  // the real localized operation guide.
   body: [
-    { kind: "p", text: "Use the Library panel on the left to manage your sources. Upload PDF, PPTX, DOCX, or Markdown files to build your knowledge base." },
-    { kind: "h2", num: "1.1", text: "Getting Started" },
-    { kind: "p", text: "1. Upload course materials via the Library panel. 2. Ask questions in the Assistant sidebar. 3. Generate notes, mind maps, and quizzes from the tabs above." },
-    { kind: "h2", num: "1.2", text: "Supported Features" },
-    { kind: "p", text: "Reader — browse extracted content with interactive highlights. Notes — generate structured study notes in Outline, Cornell, or Card format. Knowledge Graph — visualize knowledge relationships. Quiz — auto-generated practice tests with AI grading." },
-  ]
+    { kind: "p", text: "Upload course materials or select a course from the library to begin." },
+  ],
 };
+
+// Localized welcome / operation guide. Returns the doc shape that
+// reader.jsx maps over (`body[].kind` in {"h2", "p"}). The doc covers:
+//   1. Getting started (upload + provider setup)
+//   2. Core features (Assistant / Reader / Notes / KG / Quiz)
+//   3. Advanced (cross-course, embeddings, CLI)
+//   4. Troubleshooting
+// All strings come from i18n.js so the same shell renders in zh or en.
+function getReaderDoc(t) {
+  return {
+    chapter: t("reader.welcome.chapter"),
+    title: t("reader.welcome.title"),
+    sub: t("reader.welcome.sub"),
+    body: [
+      { kind: "p", text: t("reader.welcome.intro") },
+
+      { kind: "h2", num: "1", text: t("reader.welcome.h1") },
+      { kind: "h2", num: "1.1", text: t("reader.welcome.s11_h") },
+      { kind: "p",  text: t("reader.welcome.s11_p") },
+      { kind: "h2", num: "1.2", text: t("reader.welcome.s12_h") },
+      { kind: "p",  text: t("reader.welcome.s12_p") },
+
+      { kind: "h2", num: "2", text: t("reader.welcome.h2") },
+      { kind: "h2", num: "2.1", text: t("reader.welcome.s21_h") },
+      { kind: "p",  text: t("reader.welcome.s21_p") },
+      { kind: "h2", num: "2.2", text: t("reader.welcome.s22_h") },
+      { kind: "p",  text: t("reader.welcome.s22_p") },
+      { kind: "h2", num: "2.3", text: t("reader.welcome.s23_h") },
+      { kind: "p",  text: t("reader.welcome.s23_p") },
+      { kind: "h2", num: "2.4", text: t("reader.welcome.s24_h") },
+      { kind: "p",  text: t("reader.welcome.s24_p") },
+      { kind: "h2", num: "2.5", text: t("reader.welcome.s25_h") },
+      { kind: "p",  text: t("reader.welcome.s25_p") },
+
+      { kind: "h2", num: "3", text: t("reader.welcome.h3") },
+      { kind: "h2", num: "3.1", text: t("reader.welcome.s31_h") },
+      { kind: "p",  text: t("reader.welcome.s31_p") },
+      { kind: "h2", num: "3.2", text: t("reader.welcome.s32_h") },
+      { kind: "p",  text: t("reader.welcome.s32_p") },
+      { kind: "h2", num: "3.3", text: t("reader.welcome.s33_h") },
+      { kind: "p",  text: t("reader.welcome.s33_p") },
+
+      { kind: "h2", num: "4", text: t("reader.welcome.h4") },
+      { kind: "p",  text: t("reader.welcome.s41_p") },
+      { kind: "p",  text: t("reader.welcome.s42_p") },
+      { kind: "p",  text: t("reader.welcome.s43_p") },
+      { kind: "p",  text: t("reader.welcome.s44_p") },
+    ],
+  };
+}
 
 const NOTES_DATA = {
   title: "Study Notes",
@@ -62,4 +117,4 @@ const MINDMAP = {
   ]
 };
 
-Object.assign(window, { SAMPLE_SOURCES, SAMPLE_COLLECTIONS, READER_DOC, NOTES_DATA, QUIZ_DATA, MINDMAP });
+Object.assign(window, { SAMPLE_SOURCES, SAMPLE_COLLECTIONS, READER_DOC, NOTES_DATA, QUIZ_DATA, MINDMAP, getReaderDoc });

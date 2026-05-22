@@ -30,13 +30,18 @@
 // Backwards compat: when `stages` / `done` aren't provided, falls back
 // to the legacy `activeStep` integer that app.jsx still emits during
 // the brief 0-event window before the first stream tick.
-const STAGE_DEFS = [
-  { key: "extracting",   lbl: "Extracting",     sub: "MinerU / PyMuPDF · pages → text" },
-  { key: "chunking",     lbl: "Chunking",       sub: "Segmenting into 1.5KB chunks" },
-  { key: "embedding",    lbl: "Embedding",      sub: "FAISS vector + BM25 index" },
-  { key: "kg_stage_a",   lbl: "KG Stage A",     sub: "Macro topics + course overview" },
-  { key: "kg_stage_b",   lbl: "KG Stage B",     sub: "Per-chunk concepts + relations" },
-];
+// fix-all v3 (2026-05-22): stage labels go through i18n.js so the
+// upload overlay isn't English-only. STAGE_KEYS stays a plain array
+// (it pins ordering + drives per-key lookups); buildStageDefs(t)
+// resolves the localized {lbl, sub} pair via the i18n table.
+const STAGE_KEYS = ["extracting", "chunking", "embedding", "kg_stage_a", "kg_stage_b"];
+function buildStageDefs(t) {
+  return STAGE_KEYS.map((key) => ({
+    key,
+    lbl: t(`processing.stage.${key}.lbl`),
+    sub: t(`processing.stage.${key}.sub`),
+  }));
+}
 
 // Locale-aware clock formatter. Suffixes follow the user's UI language: CN uses
 // the all-CJK form (5秒 / 3分2秒 / 1小时), EN uses compact (5s / 3m2s / 1h).
@@ -90,6 +95,7 @@ function Processing({
   const t = useT();
   const lang = React.useContext(window.LangContext) || "en";
   const useStream = stages && typeof stages === "object";
+  const STAGE_DEFS = React.useMemo(() => buildStageDefs(t), [t]);
 
   // fix-all v2 LOW F6: per-second timer state lives in <ElapsedClock/>
   // so the parent tree (stage rows + bars) doesn't re-render every
@@ -131,25 +137,23 @@ function Processing({
   function stageSub(s) {
     if (s.key === "extracting" && totalPages > 0) {
       const pct = pctOf("extracting");
-      // H2 fix (2026-05-20): when a pptx file is present, the backend
-      // carves extracting 0-50% for the LibreOffice sidecar render
-      // (which does NOT extract any pages — it just converts pptx →
-      // pdf) and 50-99% for the real text extraction. Previously the
-      // displayed "done" pages ramped linearly 0→N across 0-100%, so
-      // mid-render the user saw e.g. "17 / 69 页" when in fact 0 pages
-      // had been extracted. Fix: clamp displayed `done` to 0 while
-      // pct < 50, then remap done across [50, 99] → [0, N]. For
-      // pptx-free uploads extracting jumps from 0 → high% within the
-      // first per-file callback tick, so the counter only sits at
-      // "0 / N" for a brief instant before catching up.
-      let done;
-      if (pct < 50) {
-        done = 0;
-        return `MinerU / PyMuPDF · ${t("processing.pages_progress", { done, total: totalPages })} · ${t("processing.with_pptx_render")}`;
-      } else {
-        const realPct = (pct - 50) / 49;  // 0..1 over [50, 99]
-        done = Math.min(totalPages, Math.round(totalPages * realPct));
+      // fix-all v3 (2026-05-22): backend no longer carves the bar for
+      // soffice pptx→pdf conversion. During that prep phase the bar
+      // stays at 0 and detail carries structured pptx_previews_total
+      // counters; we localize via i18n so zh users see Chinese copy.
+      // After prep, pct ticks 0-98 reflecting only the real extraction
+      // work (MinerU / PyMuPDF), and done ramps linearly across.
+      const stageObj = useStream ? stages["extracting"] : null;
+      const detail = (stageObj && typeof stageObj === "object" && stageObj.detail) || null;
+      const pptxTotal = detail && typeof detail.pptx_previews_total === "number"
+        ? detail.pptx_previews_total : 0;
+      if (pct === 0 && pptxTotal > 0) {
+        // Soffice prep window — show the localized prep message + a friendly 0/N.
+        const sub = t("processing.with_pptx_render", { n: pptxTotal });
+        return `${sub} · ${t("processing.pages_progress", { done: 0, total: totalPages })}`;
       }
+      const realPct = Math.min(1, pct / 98);
+      const done = Math.min(totalPages, Math.round(totalPages * realPct));
       return `MinerU / PyMuPDF · ${t("processing.pages_progress", { done, total: totalPages })}`;
     }
     return s.sub;

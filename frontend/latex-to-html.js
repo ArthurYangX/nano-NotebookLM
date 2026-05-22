@@ -123,6 +123,24 @@
   function latexToHtml(source) {
     if (!source) return "";
 
+    // Stage 0: strip PDF-only cross-reference commands.
+    //
+    // LLMs trained on academic LaTeX often emit `\label{eq:foo}` after a
+    // display equation and `\ref{eq:foo}` / `\eqref{eq:foo}` to cite it
+    // back. These are tectonic-time numbering commands — KaTeX does not
+    // implement any of them and raises "Undefined control sequence \label"
+    // / `\ref` / `\eqref` (red error tooltips on the rendered page).
+    //
+    // Strategy: drop them silently from browser preview. The PDF path
+    // (tectonic) sees the raw .tex with labels intact, so cross-refs
+    // still work in the exported PDF. The brace pattern `\{[^}]*\}` is
+    // intentionally simple — nested-brace labels like `\label{eq:f_{1}}`
+    // are vanishingly rare; revisit if a real example surfaces.
+    source = String(source)
+      .replace(/\\label\s*\{[^}]*\}/g, "")
+      .replace(/\\eqref\s*\{[^}]*\}/g, "")
+      .replace(/\\ref\s*\{[^}]*\}/g, "");
+
     // Stage 1: stash math placeholders.
     var mathStash = (typeof NanoMarkdown !== "undefined" && NanoMarkdown.stashMath)
       ? NanoMarkdown.stashMath(source)
@@ -254,7 +272,19 @@
         // execute in the app origin. HTML-escape first; KaTeX auto-render
         // reads textContent (post-HTML-parse) so `&lt;` round-trips back to
         // `<` for legitimate math like `$a<b$` — no rendering regression.
-        return "<div class=\"math-display\">$$" + escapeHtml(inner.trim()) + "$$</div>";
+        //
+        // align bug fix (2026-05-22): `align` / `align*` bodies use `&` as
+        // the alignment-column tab character, which is invalid inside a
+        // bare `$$...$$` display block — KaTeX raises "Misplaced alignment
+        // tab character &". Wrap the body in `\begin{aligned}...\end{aligned}`
+        // (the math-mode equivalent of `align`) so the alignment columns
+        // survive the trip through display math. `equation` has no `&`, so
+        // it stays as-is.
+        var body = escapeHtml(inner.trim());
+        if (env === "align" || env === "align*") {
+          body = "\\begin{aligned}" + body + "\\end{aligned}";
+        }
+        return "<div class=\"math-display\">$$" + body + "$$</div>";
       }
       var rendered = renderThmFamily(env, optionalName, renderInnerFragment(inner));
       if (rendered === null) {

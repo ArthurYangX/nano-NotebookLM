@@ -343,7 +343,7 @@ function CoursePickerModal({ courses, defaultId, defaultEngine, onPick, onCancel
           ref={fileInputRef}
           type="file"
           multiple
-          accept=".pdf,.pptx,.docx,.md,.txt"
+          accept=".pdf,.pptx,.ppt,.docx,.md,.txt"
           onChange={handleFileChange}
           style={{
             position: "absolute",
@@ -370,9 +370,17 @@ function App() {
   // so the Settings page can expose them. TWEAK_DEFAULTS still drives the
   // initial value, keeping the EDITMODE block as the single source of
   // defaults for both the design host and the runtime app.
+  // Dark mode is currently hidden from the UI while we iterate on the dark
+  // palette — force any persisted "dark"/"auto" back to "paper" so old visitors
+  // don't get stranded in a theme they can no longer switch out of.
   const [theme, setTheme] = useState(() => {
-    try { return window.localStorage.getItem("nano-nlm:v1:theme") || APPEARANCE_DEFAULTS.theme; }
-    catch (e) { return APPEARANCE_DEFAULTS.theme; }
+    try {
+      const stored = window.localStorage.getItem("nano-nlm:v1:theme");
+      if (stored && stored !== "paper") {
+        window.localStorage.setItem("nano-nlm:v1:theme", "paper");
+      }
+    } catch (e) {}
+    return "paper";
   });
   const [density, setDensity] = useState(() => {
     try { return window.localStorage.getItem("nano-nlm:v1:density") || APPEARANCE_DEFAULTS.density; }
@@ -540,6 +548,27 @@ function App() {
     try {
       if (next) window.localStorage.setItem("nano-nlm:v1:persona", next);
       else window.localStorage.removeItem("nano-nlm:v1:persona");
+    } catch (e) {}
+  }
+  // Persona icon (emoji or short glyph) — purely cosmetic, fronts the
+  // chat sidebar avatar. Cap at 4 chars so a single emoji (often 2–4
+  // UTF-16 units due to ZWJ sequences) fits but typos can't smuggle
+  // sentences in. Empty → Assistant falls back to first grapheme of
+  // displayPersona, matching the legacy behavior.
+  const PERSONA_ICON_MAX = 4;
+  const [personaIcon, setPersonaIcon] = useState(() => {
+    try {
+      const v = window.localStorage.getItem("nano-nlm:v1:persona-icon");
+      return (v || "").slice(0, PERSONA_ICON_MAX);
+    } catch (e) { return ""; }
+  });
+  function commitPersonaIcon(value) {
+    const next = (value || "").slice(0, PERSONA_ICON_MAX);
+    if (next === personaIcon) return;
+    setPersonaIcon(next);
+    try {
+      if (next) window.localStorage.setItem("nano-nlm:v1:persona-icon", next);
+      else window.localStorage.removeItem("nano-nlm:v1:persona-icon");
     } catch (e) {}
   }
   function commitUserLang(code) {
@@ -1330,7 +1359,7 @@ function App() {
             (s.failures || 0) + 1,
           ));
         }
-      }, { userLang, force });
+      }, { userLang, force, checkedFiles: getCheckedSourceFiles() });
       // Cancel any pending throttled file_delta render — the next
       // setRealNotes below installs the canonical final content.
       if (fileDeltaTimer) { clearTimeout(fileDeltaTimer); fileDeltaTimer = null; }
@@ -2166,6 +2195,8 @@ function App() {
               onPickLang={commitUserLang}
               persona={persona}
               onCommitPersona={commitPersona}
+              personaIcon={personaIcon}
+              onCommitPersonaIcon={commitPersonaIcon}
               hiddenCourseIds={hiddenCourseIds}
               onUnhideAll={unhideAllCourses}
               courses={courses}
@@ -2192,6 +2223,7 @@ function App() {
       <Assistant
         mode={effectiveMode}
         persona={persona}
+        personaIcon={personaIcon}
         activeSources={activeSources}
         streaming={streaming}
         streamProgress={streamProgress}
@@ -3378,7 +3410,20 @@ function RealNotesView({ content, streaming, activeCourse, sources, onContentCha
     const root = previewRef.current;
     if (!root) return;
     const target = root.querySelector(`#${CSS.escape(id)}`);
-    if (target) target.scrollIntoView({ behavior: "smooth", block: "start" });
+    if (!target) return;
+    // block:"start" forces the heading to viewport top. For a heading
+    // near the end of the document there isn't 1 full viewport of
+    // content below it, so the browser clamps scrollTop at max and
+    // leaves the bottom half of the viewport blank — symptom: "page
+    // moves up, whitespace at the bottom". Degrade to "nearest" when
+    // there's less than a viewport of room below, so the browser
+    // scrolls the minimum needed and no whitespace appears.
+    const scroller = target.closest(".notes-reader-body");
+    const remaining = scroller
+      ? scroller.scrollHeight - target.offsetTop - scroller.clientHeight
+      : Infinity;
+    const block = remaining < 0 ? "nearest" : "start";
+    target.scrollIntoView({ behavior: "smooth", block });
   }
 
   function jumpToHighlight(hid) {

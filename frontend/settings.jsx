@@ -545,6 +545,7 @@ function Settings({
   backend, onCommitBackend,
   userLang, onPickLang,
   persona, onCommitPersona,
+  personaIcon, onCommitPersonaIcon,
   hiddenCourseIds, onUnhideAll,
   courses,
   theme, onCommitTheme, autoResolved,
@@ -555,6 +556,7 @@ function Settings({
   const t = (k, vars) => window.I18N.t(k, userLang || "en", vars);
   const [storageScan, setStorageScan] = useS(() => _scanLocalStorage());
   const [personaDraft, setPersonaDraft] = useS(persona || "");
+  const [personaIconDraft, setPersonaIconDraft] = useS(personaIcon || "");
   // Embedding preset switch UX: while the POST is in flight we set
   // `embedSwitching` to the target preset_id so the radio shows a loading
   // hint and other radios disable. Once the server acks, we clear it; the
@@ -562,6 +564,7 @@ function Settings({
   const [embedSwitching, setEmbedSwitching] = useS(null);
   const [embedSwitchError, setEmbedSwitchError] = useS(null);
   useSEffect(() => { setPersonaDraft(persona || ""); }, [persona]);
+  useSEffect(() => { setPersonaIconDraft(personaIcon || ""); }, [personaIcon]);
 
   // While a background rebuild is running, tick /api/status faster so the
   // banner progresses smoothly. Cleans up on idle / unmount.
@@ -612,6 +615,7 @@ function Settings({
         const preserved = new Set([
           "nano-nlm:v1:backend",
           "nano-nlm:v1:persona",
+          "nano-nlm:v1:persona-icon",
           "nano-nlm:v1:user-lang",
           "nano-nlm:v1:kg-legend-hidden",
           "nano-nlm:v1:hidden-courses",
@@ -637,6 +641,7 @@ function Settings({
     [
       "nano-nlm:v1:backend",
       "nano-nlm:v1:persona",
+      "nano-nlm:v1:persona-icon",
       "nano-nlm:v1:user-lang",
       "nano-nlm:v1:kg-legend-hidden",
       "nano-nlm:v1:hidden-courses",
@@ -825,33 +830,11 @@ function Settings({
           <Row label={t("settings.row.pptx_pdf")} value={<LoadingBadge ready={statusReady} ok={!!s.pptx_pdf_available} labelOk={t("settings.badge.available")} labelBad={t("settings.badge.unavailable")} />} />
         </Section>
 
-        {/* ───────── 外观 ───────── */}
+        {/* ───────── 外观 ─────────
+            Theme picker (Paper / Dark / Auto) intentionally hidden while we
+            iterate on the dark palette — the dark CSS is still in styles.css,
+            re-surface this row when ready. */}
         <Section title={t("settings.section.appearance")} hint={t("settings.section.appearance_hint")}>
-          <div className="settings-pref-row">
-            <div className="settings-pref-label">{t("settings.theme_label")}</div>
-            <div className="settings-pref-ctrl">
-              {[
-                { v: "paper",  label: t("settings.theme.paper"),  hint: t("settings.theme.paper_hint") },
-                { v: "sepia",  label: t("settings.theme.sepia"),  hint: t("settings.theme.sepia_hint") },
-                { v: "slate",  label: t("settings.theme.slate"),  hint: t("settings.theme.slate_hint") },
-                { v: "dark",   label: t("settings.theme.dark"),   hint: t("settings.theme.dark_hint") },
-                { v: "auto",   label: t("settings.theme.auto"),   hint: t("settings.theme.auto_hint") },
-              ].map(o => (
-                <button
-                  key={o.v}
-                  className={"settings-chip" + (theme === o.v ? " active" : "")}
-                  title={o.hint}
-                  onClick={() => onCommitTheme && onCommitTheme(o.v)}
-                >{o.label}</button>
-              ))}
-              <span className="settings-pref-hint">
-                {theme === "auto"
-                  ? t("settings.theme_auto_current", { resolved: autoResolved === "dark" ? t("settings.theme.dark") : t("settings.theme.paper") })
-                  : t("settings.theme_current", { theme })}
-              </span>
-            </div>
-          </div>
-
           <div className="settings-pref-row">
             <div className="settings-pref-label">{t("settings.density_label")}</div>
             <div className="settings-pref-ctrl">
@@ -926,6 +909,35 @@ function Settings({
               <span className="settings-pref-hint" style={{ color: "var(--ink-3, #888)" }}>
                 {t("settings.persona_privacy_warn")}
               </span>
+            </div>
+          </div>
+
+          <div className="settings-pref-row">
+            <div className="settings-pref-label">{t("settings.persona_icon_label")}</div>
+            <div className="settings-pref-ctrl">
+              <input
+                type="text"
+                maxLength={4}
+                placeholder="📚"
+                className="settings-input"
+                style={{ width: 64, textAlign: "center", fontSize: 18 }}
+                value={personaIconDraft}
+                onChange={e => setPersonaIconDraft(e.target.value)}
+                onBlur={() => onCommitPersonaIcon && onCommitPersonaIcon(personaIconDraft)}
+                onKeyDown={e => {
+                  if (e.key === "Enter") { e.target.blur(); }
+                  else if (e.key === "Escape") { setPersonaIconDraft(personaIcon || ""); e.target.blur(); }
+                }}
+              />
+              <button
+                className="settings-chip"
+                style={{ marginLeft: 6 }}
+                onClick={() => {
+                  setPersonaIconDraft("");
+                  if (onCommitPersonaIcon) onCommitPersonaIcon("");
+                }}
+              >{t("settings.persona_icon_clear")}</button>
+              <span className="settings-pref-hint">{t("settings.persona_icon_hint")}</span>
             </div>
           </div>
 

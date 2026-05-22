@@ -62,57 +62,46 @@
   --density: 1;
 }
 
+/* Dark — F 档 暖石墨 (Warm Graphite, paper L=0.29 hue 55)
+   走 Gruvbox / Notion / Apple Reader Dark 的暖底冷光路线：paper 是 warm
+   olive-brown graphite（hue 55, chroma 0.014），ink 微暖（hue 70），accent
+   保留冷青蓝 hue 235 制造冷暖互补，让 accent 在暖底上真正"跳"出来。 */
 [data-theme="dark"] {
-  --paper: oklch(0.18 0.008 250);
-  --paper-2: oklch(0.22 0.008 250);
-  --paper-3: oklch(0.26 0.01 250);
-  --rule: oklch(0.32 0.012 250);
-  --rule-strong: oklch(0.42 0.015 250);
+  --paper: oklch(0.29 0.014 55);
+  --paper-2: oklch(0.33 0.016 55);
+  --paper-3: oklch(0.37 0.018 55);
+  --rule: oklch(0.4 0.018 55);
+  --rule-strong: oklch(0.46 0.02 55);
 
-  --ink: oklch(0.94 0.005 85);
-  --ink-2: oklch(0.82 0.005 85);
-  --ink-3: oklch(0.65 0.008 85);
-  --ink-4: oklch(0.5 0.008 85);
+  /* warm-cream ink — Notion-ish 微暖白 */
+  --ink: oklch(0.955 0.008 75);
+  --ink-2: oklch(0.84 0.012 72);
+  --ink-3: oklch(0.63 0.018 70);
+  --ink-4: oklch(0.5 0.022 68);
 
-  --accent: oklch(0.72 0.1 160);
-  --accent-soft: oklch(0.3 0.05 160);
-  --accent-ink: oklch(0.82 0.1 160);
+  /* accent 保持冷青蓝 #5CC8FF —— 暖底 + 冷蓝是高级 dark UI 的经典互补 */
+  --accent: oklch(0.79 0.13 235);
+  --accent-soft: oklch(0.42 0.08 235);
+  --accent-ink: oklch(0.85 0.12 235);
 
-  --crimson: oklch(0.68 0.14 25);
-  --crimson-soft: oklch(0.32 0.08 25);
+  --crimson: oklch(0.72 0.16 22);
+  --crimson-soft: oklch(0.4 0.08 22);
 
-  --amber: oklch(0.78 0.12 75);
-  --amber-soft: oklch(0.32 0.06 75);
+  --amber: oklch(0.85 0.12 90);
+  --amber-soft: oklch(0.4 0.07 90);
 
-  --hl-yellow: oklch(0.7 0.14 95 / 0.35);
-  --hl-green: oklch(0.7 0.12 160 / 0.3);
+  --plum: oklch(0.74 0.1 305);
+  --plum-soft: oklch(0.4 0.06 305);
 
-  --shadow-sm: 0 1px 0 oklch(0.08 0.01 250);
-  --shadow: 0 2px 10px oklch(0.05 0.01 250 / 0.5), 0 1px 0 oklch(0.08 0.01 250);
-}
+  --teal: oklch(0.74 0.1 215);
+  --teal-soft: oklch(0.4 0.06 215);
 
-[data-theme="sepia"] {
-  --paper: oklch(0.95 0.03 75);
-  --paper-2: oklch(0.92 0.035 75);
-  --paper-3: oklch(0.88 0.04 75);
-  --rule: oklch(0.78 0.04 75);
-  --rule-strong: oklch(0.68 0.05 75);
-  --ink: oklch(0.28 0.04 60);
-  --ink-2: oklch(0.4 0.04 60);
-  --ink-3: oklch(0.55 0.035 60);
-  --accent: oklch(0.4 0.09 60);
-  --accent-soft: oklch(0.88 0.05 60);
-  --accent-ink: oklch(0.3 0.09 60);
-}
+  --hl-yellow: oklch(0.85 0.12 90 / 0.28);
+  --hl-green: oklch(0.86 0.18 142 / 0.25);
 
-[data-theme="slate"] {
-  --paper: oklch(0.96 0.006 240);
-  --paper-2: oklch(0.93 0.008 240);
-  --paper-3: oklch(0.9 0.01 240);
-  --rule: oklch(0.82 0.012 240);
-  --accent: oklch(0.42 0.1 255);
-  --accent-soft: oklch(0.92 0.03 255);
-  --accent-ink: oklch(0.3 0.1 255);
+  /* shadow 也走暖调 */
+  --shadow-sm: 0 1px 0 oklch(0.18 0.012 55);
+  --shadow: 0 2px 10px oklch(0.12 0.012 55 / 0.5), 0 1px 0 oklch(0.18 0.012 55);
 }
 
 * { box-sizing: border-box; }
@@ -154,6 +143,45 @@ body::before {
   mix-blend-mode: multiply;
 }
 [data-theme="dark"] body::before { mix-blend-mode: screen; opacity: 0.12; }
+
+/* Dark F 档 — 暖石墨渐变。两道都走暖橄榄棕色域（hue 55~80），跟 paper hue
+   55 一致，只是极淡地把 bg 抬出一层"被暖光打过"的氛围，不再用冷蓝跟暖底打架。 */
+[data-theme="dark"] body {
+  background:
+    radial-gradient(ellipse 1200px 600px at 20% 0%, oklch(0.42 0.025 60 / 0.2), transparent 60%),
+    radial-gradient(ellipse 900px 500px at 100% 100%, oklch(0.4 0.022 80 / 0.16), transparent 60%),
+    var(--paper);
+}
+
+/* Dark — chip 颜色覆盖 (Graphite Noir 风)
+   paper 抬到 L=0.29 后，chip 黑底也要抬到 L=0.37 以上才能"浮出"成卡片，
+   否则比底色还暗反而下沉。统一用 var(--paper-3) 让 chip fill 自动跟随主题。 */
+[data-theme="dark"] .backend-chip.backend-openai {
+  border-color: oklch(0.5 0.06 235);
+  color: oklch(0.85 0.1 235);
+  background: var(--paper-3);
+}
+[data-theme="dark"] .backend-chip.backend-claude {
+  border-color: oklch(0.5 0.08 35);
+  color: oklch(0.85 0.1 35);
+  background: var(--paper-3);
+}
+[data-theme="dark"] .backend-chip.backend-local {
+  border-color: oklch(0.5 0.08 145);
+  color: oklch(0.85 0.1 145);
+  background: var(--paper-3);
+}
+
+[data-theme="dark"] .path-chip.path-graphrag {
+  border-color: oklch(0.5 0.08 160);
+  color: oklch(0.85 0.1 160);
+  background: var(--paper-3);
+}
+[data-theme="dark"] .path-chip.path-rewrite {
+  border-color: oklch(0.5 0.08 235);
+  color: oklch(0.85 0.1 235);
+  background: var(--paper-3);
+}
 
 /* Serif for headings and reader */
 .serif { font-family: var(--serif); }
@@ -2069,20 +2097,14 @@ mark.hl-flash, .hl-jump.hl-flash { animation: hl-flash 0.9s ease-out; }
   align-items: center;
   gap: 10px;
   font-family: var(--serif);
-  font-style: italic;
   font-size: 15px;
 }
 .asst-avatar {
   width: 24px; height: 24px;
-  background: var(--ink);
-  color: var(--paper);
-  font-family: var(--serif);
-  font-size: 13px;
-  font-style: italic;
-  font-weight: 600;
+  font-size: 18px;
+  line-height: 1;
   display: grid;
   place-items: center;
-  border-radius: 50%;
 }
 .asst-status {
   font-family: var(--mono);
@@ -3836,8 +3858,8 @@ mark.hl-flash, .hl-jump.hl-flash { animation: hl-flash 0.9s ease-out; }
 }
 .settings-radio:hover:not(.disabled) { background: var(--paper-2); }
 .settings-radio.active {
-  border-color: oklch(0.70 0.12 260);
-  background: oklch(0.98 0.02 260);
+  border-color: var(--accent);
+  background: var(--accent-soft);
 }
 .settings-radio.disabled { opacity: 0.55; cursor: not-allowed; }
 .settings-radio input[type="radio"] { margin-top: 3px; flex-shrink: 0; }

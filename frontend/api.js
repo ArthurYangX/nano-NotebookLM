@@ -133,11 +133,18 @@ const API = {
   // entry in per_file_cache.json short-circuit to a `file_cached` event
   // without an LLM call. Pass `force: true` to ignore the cache and
   // re-run every file.
-  async streamFullCourseNotes(courseId, onEvent = null, { userLang = null, concurrency = null, force = false } = {}) {
+  async streamFullCourseNotes(courseId, onEvent = null, { userLang = null, concurrency = null, force = false, checkedFiles = null } = {}) {
     const body = { course_id: courseId };
     if (userLang) body.user_lang = userLang;
     if (concurrency != null) body.concurrency = concurrency;
     if (force) body.force = true;
+    // Mirror /api/chat convention: omit `checked_files` (or send null) when
+    // the user has every file checked — generate for all. Send an explicit
+    // subset only when the user has narrowed the selection. An empty array
+    // is rejected with 422 server-side; caller is expected to gate on that.
+    if (Array.isArray(checkedFiles) && checkedFiles.length > 0) {
+      body.checked_files = checkedFiles;
+    }
     return _stream("/notes/full-course/stream", body, onEvent);
   },
 

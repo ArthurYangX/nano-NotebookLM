@@ -241,6 +241,76 @@
       zh: "新题目在后台生成（不阻塞当前页面）。下次开 quiz 时会出现。",
       en: "New questions are generated in the background. They'll appear next time you open a quiz.",
     },
+    // ── Exam Prep page ──
+    "exam.title":                       { zh: "题库练习", en: "Exam Prep" },
+    "exam.empty_select_course":         { zh: "在侧边栏选择一个课程开始题库练习。", en: "Select a course from the sidebar to begin exam preparation." },
+    "exam.empty_no_topics":             { zh: "本课程暂无题库。先从课件抽取主题以开始。", en: "No exam bank yet for this course. Extract topics from the course materials to begin." },
+    "exam.action.extract_topics":       { zh: "抽取题库主题", en: "Extract Exam Topics" },
+    "exam.action.re_extract":           { zh: "重新抽取主题", en: "Re-extract topics" },
+    "exam.action.reset":                { zh: "重置题库", en: "Reset bank" },
+    "exam.action.start_mixed":          { zh: "开始混合练习 · 所有未掌握主题", en: "Start Mixed Quiz · all non-mastered topics" },
+    "exam.tooltip.re_extract":          { zh: "重新跑主题抽取。重命名主题的掌握记录会移到归档。", en: "Run topic extraction again. Mastery history for renamed topics moves to an archive." },
+    "exam.confirm.re_extract":          {
+      zh: "重新抽取题库主题？已有题目按标准化后的主题名匹配保留；改名了的主题，旧题目会移到归档桶（仍可查看）。继续？",
+      en: "Re-extract exam topics? Existing questions are preserved for any topic whose name matches the new extraction (normalized). Topics whose names changed will have their questions moved to an archive bucket you can still see. Continue?",
+    },
+    "exam.confirm.reset":               { zh: "彻底清空题库？需要重新从头抽取主题。", en: "Wipe the entire exam bank? You'll need to re-extract topics from scratch." },
+    "exam.stats.questions_mastered":    { zh: "{done} / {total} 题已掌握", en: "{done} / {total} questions mastered" },
+    "exam.stats.topics_mastered":       { zh: "{done} / {total} 主题已全部掌握", en: "{done} / {total} topics fully mastered" },
+    "exam.stats.attempts":              { zh: "答过 {n} 次", en: "{n} attempts" },
+    "exam.stats.correct_pct":           { zh: "正确率 {pct}%", en: "{pct}% correct" },
+    // Busy labels (shown while loading)
+    "exam.busy.working":                { zh: "处理中…", en: "Working…" },
+    "exam.busy.loading_bank":           { zh: "加载题库…", en: "Loading exam bank…" },
+    "exam.busy.extracting":             { zh: "正在从课件抽取题库主题…", en: "Extracting exam topics from course materials…" },
+    "exam.busy.sampling":               { zh: "正在从题库抽样题目…", en: "Sampling questions from the bank…" },
+    "exam.busy.grading":                { zh: "评分中 · 同步为错题主题生成新变体…", en: "Grading + generating fresh variants for any wrong topics…" },
+    "exam.busy.resetting":              { zh: "正在重置题库…", en: "Resetting bank…" },
+    "exam.busy.elapsed":                { zh: "已用 {n} 秒", en: "{n}s elapsed" },
+    "exam.busy.elapsed_long_hint":      { zh: " — 推理模型可能需要 ~120s 才超时", en: " — reasoning models can take up to 120s before timing out" },
+    // Errors
+    "exam.error.gen_failed":            { zh: "本主题的题目生成失败。重试一下 —— LLM 可能超时或返回了不合法 JSON。", en: "Question generation failed for this topic. Please retry — the LLM may have timed out or returned malformed JSON." },
+    "exam.error.all_mastered":          { zh: "范围内题目全部已掌握。试试重新抽取主题或换一个主题。", en: "All questions in scope are already mastered. Try re-extracting topics or pick a different topic." },
+    "exam.error.no_questions":          { zh: "暂无可用题目 —— 试试给该主题播种题目或检查课程 KB 有没有内容。", en: "No questions available — try seeding this topic or check the course KB has content." },
+    "exam.error.answer_at_least_one":   { zh: "提交前至少回答一题。", en: "Please answer at least one question before submitting." },
+    "exam.error.failed_load_bank":      { zh: "加载题库失败", en: "Failed to load exam bank" },
+    "exam.error.failed_extract":        { zh: "主题抽取失败", en: "Topic extraction failed" },
+    "exam.error.failed_start":          { zh: "启动练习失败", en: "Failed to start quiz" },
+    "exam.error.failed_submit":         { zh: "提交失败", en: "Submit failed" },
+    "exam.error.failed_reset":          { zh: "重置失败", en: "Reset failed" },
+    "exam.info.re_extract_done":        {
+      zh: "重新抽取完成 · {migrated} 个主题带题保留 · {orphans} 道孤立题归档（在 \"[archive] ...\" 主题里可查看）",
+      en: "Re-extract complete · {migrated} topic(s) carried questions forward · {orphans} orphan questions archived (visible in a \"[archive] ...\" topic).",
+    },
+    // Topic card
+    "exam.topic.weight":                { zh: "权重 · {pct}%", en: "weight · {pct}%" },
+    "exam.topic.mastered_count":        { zh: "{done} / {total} 已掌握", en: "{done} / {total} mastered" },
+    "exam.topic.attempts":              { zh: "答过 {n} 次", en: "{n} attempt(s)" },
+    "exam.topic.correct_rate":          { zh: "正确率 {pct}%", en: "{pct}% correct" },
+    "exam.topic.mastered_chip":         { zh: "✓ 已掌握", en: "✓ mastered" },
+    "exam.topic.re_quiz_tip":           { zh: "再练一次本主题（已掌握）", en: "Re-quiz this topic (already mastered)" },
+    "exam.topic.start_quiz_tip":        { zh: "开始练习 {name}", en: "Start quiz on {name}" },
+    "exam.topic.review_btn":            { zh: "回顾已掌握 →", en: "Review mastered →" },
+    "exam.topic.start_btn":             { zh: "练习本主题 →", en: "Quiz on this topic →" },
+    "exam.archive.label":               { zh: "归档 · {n} 个旧主题桶（来自历次重抽取，不再被新练习抽中）。", en: "Archive · {n} bucket(s) of orphan questions from previous re-extracts (not sampled for new quizzes)." },
+    // Quiz view
+    "exam.quiz.title":                  { zh: "练习 · 共 {n} 题", en: "Quiz · {n} questions" },
+    "exam.quiz.scoped_topic":           { zh: " · 限定到单个主题", en: " · scoped to topic" },
+    "exam.quiz.placeholder":            { zh: "在这里写你的答案…", en: "Your answer…" },
+    "exam.quiz.back":                   { zh: "返回", en: "Back" },
+    "exam.quiz.submit":                 { zh: "提交 · 评分 {n} 题", en: "Submit · grade {n} answer(s)" },
+    // Result view
+    "exam.result.correct":              { zh: "答对", en: "correct" },
+    "exam.result.wrong":                { zh: "答错", en: "wrong" },
+    "exam.result.score":                { zh: "得分", en: "score" },
+    "exam.result.fresh_variants":       { zh: "新变体题已生成", en: "fresh variants generated" },
+    "exam.result.fresh_variants_tip":   { zh: "自演化：每个错题主题各生成 {n} 个新变体", en: "Self-evolution: {n} variants per wrong topic" },
+    "exam.result.your_answer":          { zh: "你的答案：", en: "Your answer:" },
+    "exam.result.empty_answer":         { zh: "（未作答）", en: "(empty)" },
+    "exam.result.expected":             { zh: "参考答案：", en: "Expected:" },
+    "exam.result.why":                  { zh: "解析：", en: "Why:" },
+    "exam.result.back_topics":          { zh: "返回主题列表", en: "Back to Topics" },
+    "exam.result.another_round":        { zh: "再来一轮", en: "Another Round" },
 
     // ── processing (upload progress) ──
     "processing.sec_suffix":       { zh: "秒",  en: "s" },
@@ -251,8 +321,19 @@
     "processing.pages_total":      { zh: "共 {n} 页",  en: "{n} pages total" },
     "processing.estimate_about":   { zh: "估算约",     en: "Estimated" },
     "processing.pages_progress":   { zh: "{done} / {total} 页", en: "{done} / {total} pages" },
-    "processing.with_pptx_render": { zh: "渲染 PPTX 预览", en: "rendering PPTX preview" },
+    "processing.with_pptx_render": { zh: "渲染 {n} 个 PPTX 预览", en: "rendering {n} pptx preview(s)" },
     "processing.failed_at":        { zh: "上传管道在 {stage} 阶段失败", en: "Upload pipeline failed at stage {stage}" },
+    // Stage rows shown in the upload overlay (5 stages, lbl + sub each).
+    "processing.stage.extracting.lbl":  { zh: "解析中",       en: "Extracting" },
+    "processing.stage.extracting.sub":  { zh: "MinerU / PyMuPDF · 页 → 文本", en: "MinerU / PyMuPDF · pages → text" },
+    "processing.stage.chunking.lbl":    { zh: "切片中",       en: "Chunking" },
+    "processing.stage.chunking.sub":    { zh: "切成 1.5KB 段", en: "Segmenting into 1.5KB chunks" },
+    "processing.stage.embedding.lbl":   { zh: "向量化",       en: "Embedding" },
+    "processing.stage.embedding.sub":   { zh: "FAISS 向量 + BM25 索引", en: "FAISS vector + BM25 index" },
+    "processing.stage.kg_stage_a.lbl":  { zh: "知识图 A 阶段",  en: "KG Stage A" },
+    "processing.stage.kg_stage_a.sub":  { zh: "宏观主题 + 课程概览", en: "Macro topics + course overview" },
+    "processing.stage.kg_stage_b.lbl":  { zh: "知识图 B 阶段",  en: "KG Stage B" },
+    "processing.stage.kg_stage_b.sub":  { zh: "逐 chunk 概念 + 关系", en: "Per-chunk concepts + relations" },
 
     // ── reader (PDF outline toggle) ──
     "reader.show_outline":         { zh: "📑 显示索引", en: "📑 Show outline" },
@@ -282,6 +363,93 @@
     "assistant.error_connect":        { zh: "连接后端失败",        en: "Failed to connect to backend" },
     "assistant.error_prefix":         { zh: "错误: {msg}",         en: "Error: {msg}" },
     "assistant.step_searching":       { zh: "正在搜索知识库",      en: "Searching knowledge base" },
+
+    // ── Reader "no source loaded" welcome / operation guide ──
+    "reader.welcome.chapter":         { zh: "nano-NOTEBOOKLM", en: "nano-NOTEBOOKLM" },
+    "reader.welcome.title":           { zh: "欢迎使用 nano-NOTEBOOKLM", en: "Welcome to nano-NOTEBOOKLM" },
+    "reader.welcome.sub":             { zh: "上传课件或选择一个课程开始 · 下面是操作指南", en: "Upload course materials or select a course to begin · operation guide below" },
+    "reader.welcome.intro":           {
+      zh: "nano-NOTEBOOKLM 是一个跑在你自己机器上的学习助手。上传课件之后，它会自动建好知识图谱和向量索引，让你用带引用的对话、结构化笔记、自动出题的方式来学。下面是从零开始到进阶用法的完整流程。",
+      en: "nano-NOTEBOOKLM is a self-hosted study assistant: upload course materials → automatic knowledge graph + vector index → ask questions with citations, generate structured notes, and practice with a self-evolving quiz bank. This guide walks through the whole flow, from first upload to advanced usage.",
+    },
+
+    // 1. Getting started
+    "reader.welcome.h1":              { zh: "上手起步", en: "Getting Started" },
+    "reader.welcome.s11_h":           { zh: "添加你的第一个课程", en: "Add your first course" },
+    "reader.welcome.s11_p":           {
+      zh: "在左侧\"课程库\"面板点 \"+\" 按钮，也可以直接把文件拖进去。弹出的窗口里要做三件事：起一个课程名、选解析引擎、选要上传的文件（PDF / PPTX / DOCX / Markdown 都支持）。\n\n解析引擎选哪个？PyMuPDF 是默认选项，几毫秒就能解析一页，适合纯文字课件。MinerU 慢得多——在 CPU 上每页要 10 秒左右——但它能完整保留 LaTeX 公式和表格。如果你的 PPT 里有数学公式或者复杂表格，选 MinerU。\n\n确认后后台会跑五个阶段：抽取文本 → 切片 → 嵌入向量 → 提取主题 → 提取概念。页面上的进度条会显示当前阶段和大致剩余时间。",
+      en: "Click \"+\" in the left Library panel (or drag files onto it) → Course Picker opens: name a course → pick the extractor engine (PyMuPDF is fast at ~0.05s/page; MinerU is slow at ~10s/page but recovers LaTeX equations and HTML tables — strongly recommended for slide decks with formulas) → pick the PDF / PPTX / DOCX / MD files to upload → confirm. The background pipeline runs five stages: extracting → chunking → embedding → KG Stage A (topics) → Stage B (leaf concepts). Progress bar and ETA shown live.",
+    },
+    "reader.welcome.s12_h":           { zh: "配置 LLM provider", en: "Configure an LLM provider" },
+    "reader.welcome.s12_p":           {
+      zh: "点右上角的齿轮图标进入设置页，找到 \"AI Backend & Models\" 一节，再点 \"+ 添加 provider\" 按钮。\n\n弹出来的表单里有一个供应商下拉，预置了常见的几家：OpenAI、DeepSeek、Moonshot（Kimi）、智谱（GLM）、MiniMax、Groq、Together、Gemini、Anthropic Claude，以及本地跑的 Ollama / vLLM / LM Studio。选好之后，base URL 和默认模型名会自动填好。\n\nAPI key 建议选\"从环境变量读取\"——你只填变量名（比如 OPENAI_API_KEY），真正的密钥放在项目根目录的 .env 文件里，永远不会出现在 UI 或者落到磁盘配置里。如果实在不方便用环境变量，再选\"直接粘贴 key\"，密钥会以 0600 权限存到本地配置文件，只有当前用户能读。\n\n保存之后可以继续加第二个、第三个供应商。顶栏右上角的模型按钮（带 🤖 / 🧠 / 💻 图标的那个胶囊）显示当前默认 provider，点一下会循环切换到下一个。每一行右边都有一个\"测试\"按钮——5 秒内会告诉你这个 provider 通不通、key 对不对、返回的模型名是不是预期的。",
+      en: "Top-right gear icon → Settings → AI Backend & Models. Click \"+ Add provider\" → pick a vendor from the preset dropdown (OpenAI / DeepSeek / Moonshot / Zhipu / MiniMax / Groq / Together / Gemini / Anthropic Claude / local Ollama / vLLM / LM Studio) → base URL and model auto-fill → API key: prefer \"From env var\" (the key stays in .env, never lands on disk) → save. You can configure multiple providers; the topbar chip cycles between them, and each row has a \"Test\" button for a 5-second connectivity probe.",
+    },
+
+    // 2. Core features
+    "reader.welcome.h2":              { zh: "核心功能", en: "Core Features" },
+    "reader.welcome.s21_h":           { zh: "Assistant — 带引用的提问", en: "Assistant — Q&A with citations" },
+    "reader.welcome.s21_p":           {
+      zh: "右侧的 Assistant 面板就是和课程内容对话的地方。提问可以针对当前选中的课程，也可以选\"全部课程\"做跨课程检索。\n\n回答里的方括号引用（比如 [s1]、[s2]）都是可点的链接，点一下会跳到 Reader 标签页里对应 PDF 的那一页并高亮相关段落。后台会根据你问的内容自动走不同的检索路径——可能是知识图谱、向量检索、跨课程汇总，或者直接走通用模型回答。你不用关心走的是哪条，回答下方会显示这次走的路径名。\n\n如果想换个模型回答这一次，比如普通问题用快的、复杂推理换成强的，直接点顶栏的模型按钮切换就行，不用回设置页。",
+      en: "Right-side Assistant panel — ask anything about the active course or all courses. Citation chips in the reply (e.g. [s1] [s2]) are clickable → auto-jump to the Reader tab at the source page. Five retrieval paths: intent router → graphrag (KG-augmented retrieval) → RAG (BM25 + vector hybrid) → translate → cross-course → general. The topbar chip switches which LLM provider answers this turn.",
+    },
+    "reader.welcome.s22_h":           { zh: "Reader — 浏览原文", en: "Reader — browse source content" },
+    "reader.welcome.s22_p":           {
+      zh: "Reader 标签页就是原始课件的浏览器。PDF 直接用浏览器自带的 PDFium 渲染，翻页、全文搜索、缩放都和系统的 PDF 阅读器一样。PPTX 上传时会被 LibreOffice 转成 PDF 副本——这个副本只用于 Reader 里的预览，不影响后台抽出来的 chunks。\n\n从 Assistant 里点引用跳过来时，对应的内容块会自动高亮。左侧那个大纲按钮可以折叠或展开 PDF 自带的书签和缩略图栏。",
+      en: "Switch to the Reader tab to browse the original course materials. PDFs use the browser's PDF.js / PDFium viewer (turn pages, full-text search). PPTX renders via a LibreOffice-generated PDF sidecar. Clicking a citation in the Assistant auto-highlights the corresponding chunk. The outline toggle on the left collapses/expands PDF bookmarks and thumbnails.",
+    },
+    "reader.welcome.s23_h":           { zh: "Notes — 结构化笔记生成", en: "Notes — structured note generation" },
+    "reader.welcome.s23_p":           {
+      zh: "Notes 标签页点\"生成笔记\"按钮，它会一个文件一个文件地流式生成结构化的 LaTeX 笔记，全部生成完后再过一遍 review，把不通顺、漏的、重复的地方修一遍。公式用浏览器里的 KaTeX 实时渲染，所见即所得。\n\n如果机器上装了 tectonic（一个轻量的 LaTeX 编译器），点导出按钮就能直接编译成 PDF。\n\n每一节都有独立缓存，下次再点生成只会处理新内容，不会重复跑已经生成过的。如果你想强制全部重新生成，点旁边的\"重新生成\"按钮可以绕过缓存。",
+      en: "Notes tab → click \"Generate Notes\" → per-file streaming LaTeX note generation + a review pass for polish. KaTeX renders math in-browser. If `tectonic` is installed, a one-click compile to PDF is available. Each section is independently cached — re-generating only touches new content. The force-regenerate button bypasses the cache.",
+    },
+    "reader.welcome.s24_h":           { zh: "Knowledge Graph — 可编辑知识图谱", en: "Knowledge Graph — editable concept map" },
+    "reader.welcome.s24_p":           {
+      zh: "Mindmap 标签页显示从课件自动抽取的知识图谱。抽取分两步进行：先识别课程的几个主题（Stage A），再在每个主题下抽叶子概念（Stage B），最终是一个带层级的图。布局用 d3 的力导图，节点可以拖来拖去，连线会自动重新排布。\n\n手动操作有这几个：双击节点能编辑名字和定义；按住 Shift 把一个节点拖到另一个上可以加一条边；选中某个节点按 N 添加子节点；按 Del 删除。\n\n所有手动改动会以 overlay 的形式叠在自动抽取结果之上——也就是说重新抽取这门课程时，你手编的部分不会被清掉，会自动合并回来。",
+      en: "Mindmap tab shows concepts + relations auto-extracted from the course materials (two-stage: topics → leaf concepts), laid out interactively with d3-force. Double-click to edit, shift-drag to add an edge, press N for a child node, Del to remove. Manual edits are stored as an overlay on top of automatic extraction — re-extraction never clobbers your handiwork.",
+    },
+    "reader.welcome.s25_h":           { zh: "Exam Prep — 自演化题库", en: "Exam Prep — self-evolving question bank" },
+    "reader.welcome.s25_p":           {
+      zh: "Exam Prep 标签页是带\"自演化\"机制的题库。第一次进入时它会先抽取课程主题，再给每个主题生成一组题（选择题和简答题混合）。答完点提交后 AI 评分，给出对错和解析。\n\n关键来了：**每答错一道题，系统会自动针对那个主题再生成几道新变体**塞回题库。所以你练得越多、错得越多，题库就越针对你的薄弱点，每次抽题都有新的。每个主题独立追踪掌握进度，掌握的主题会被打上勾，下次默认从未掌握的主题里抽。",
+      en: "Exam Prep tab: auto-extracts course topics, generates a set of questions per topic (multiple choice + short answer), grades with AI. **For every wrong answer, the system auto-generates fresh variants targeting that topic** and adds them to the bank — the more you practice, the more focused the bank gets on your weak spots. Per-topic mastery is tracked.",
+    },
+
+    // 3. Advanced
+    "reader.welcome.h3":              { zh: "进阶用法", en: "Advanced" },
+    "reader.welcome.s31_h":           { zh: "跨课程检索", en: "Cross-course retrieval" },
+    "reader.welcome.s31_p":           {
+      zh: "左侧课程列表顶部有一个\"全部课程\"选项。选中之后，Assistant 会同时跨所有上传过的课程做检索。\n\n这个功能适合期末复习——比如把整学期的资料当成一个统一的知识库来问：\"机器学习和数据库里都讲过的索引，是同一个东西吗？\"系统会从两门课里都抽相关内容，对照回答。需要限定在某一门课时，点对应的课程标签即可。",
+      en: "Click \"All Courses\" at the top of the sidebar (the default) to have the Assistant retrieve across every uploaded course at once. Useful for end-of-term review, treating the whole semester as one KB. Single-course scoping is one click away.",
+    },
+    "reader.welcome.s32_h":           { zh: "Embedding 模型切换", en: "Switch embedding model" },
+    "reader.welcome.s32_p":           {
+      zh: "设置页里有一节叫\"Embedding 模型\"，三档可选：\n\n• **本地 MiniLM**（默认）：多语言、零配置、384 维。在 CPU 上也跑得很快，但对学术中英跨语言检索一般。\n• **OpenAI text-embedding-3-large**：调 API，3072 维。中英跨语言最强，但每个文本块都要花一次 API 调用（按字数计费）。\n• **BGE-M3**：本地模型，1024 维。首次启动会下载约 2GB 的权重，之后纯本地跑，质量在 MiniLM 和 OpenAI 之间。\n\n切换是\"路由\"不是\"重建\"：每个预设在磁盘上有独立的索引目录，切回之前用过的预设是秒级的。切到一个新预设时，后台会重建索引（页面上有横幅提示进度），期间检索会临时退化到 BM25 关键词匹配，不影响使用。",
+      en: "Settings → Embedding: three presets — local MiniLM (multilingual, zero-config, 384-dim), OpenAI text-embedding-3-large (API, 3072-dim, strongest for ZH-EN cross-lingual), BGE-M3 (local, strong multilingual, 1024-dim, ~2GB first download). Switching is a path-route, not a rebuild: each preset keeps its own FAISS namespace — switching back to a previous preset is instant.",
+    },
+    "reader.welcome.s33_h":           { zh: "命令行批处理", en: "CLI batch processing" },
+    "reader.welcome.s33_p":           {
+      zh: "项目根目录的 scripts/ 文件夹下放了几个命令行工具：\n\n• ingest_course.py：把本地某个文件夹的全部文件批量摄入成一门课程\n• build_indices.py：手动改了 chunks.json 之后，用它重建 FAISS 和 BM25 索引\n• reembed_all.py：用当前 embedding 预设给所有课程重新跑一遍嵌入\n\n适合从已有的资料库一次性把几十门课迁过来，或者升级 embedding 模型后做一次全局 re-embed。",
+      en: "scripts/ directory: `ingest_course.py` batch-ingest a directory, `build_indices.py` rebuild FAISS/BM25 indices, `reembed_all.py` re-embed everything under the current preset. Useful for bulk-migrating an existing library.",
+    },
+
+    // 4. Troubleshooting
+    "reader.welcome.h4":              { zh: "故障排查", en: "Troubleshooting" },
+    "reader.welcome.s41_p":           {
+      zh: "**上传进度条不动了？** 打开终端跑 `tail -f /tmp/nano-server.log` 看后台日志。如果一直在刷 mineru-api 相关的行，说明 MinerU 在慢慢解析（CPU 上每页 10 秒左右，属于正常）；如果完全没新日志、或者反复重启某个阶段，那是真挂了，刷新页面就好——后台任务有 1 小时 TTL，浏览器关掉再开都能续上。",
+      en: "Upload stuck? Check server logs (`tail -f /tmp/nano-server.log`) to see whether mineru is actually grinding or genuinely hung. The frontend polls `/api/upload/status/<task_id>` every 1.5 s.",
+    },
+    "reader.welcome.s42_p":           {
+      zh: "**回答和你想要的差很远？** 先看顶栏有没有亮起的\"当前文件\"按钮——它会把检索限定到某个文件，可能你之前点过某个文件忘记关掉。再不行，确认这门课的 chunks 数是否合理（在课程主页能看到，应该是几十到几百），数字异常小说明抽取没跑完。",
+      en: "Wrong file in the answer's citation? The topbar's \"active source\" chip may be over-constraining; or re-extract the course (Settings → reindex). If that fails, check `/api/sources/<course_id>` — does the chunk count match what you expect?",
+    },
+    "reader.welcome.s43_p":           {
+      zh: "**Reader 或 Notes 里的公式和表格丢了？** 大概率是那个文件当初用 PyMuPDF 抽的（默认引擎，速度优先），公式被当成乱码丢弃。解决办法：把当前课程删掉重新上传，在弹窗里选 MinerU 引擎；或者保留课程、重新上传同名文件并切换引擎，系统会检测到引擎变化自动重新抽取。",
+      en: "Formulas or tables missing? That deck was extracted with PyMuPDF (the default), which drops math. Delete + re-upload the course and pick MinerU in the Course Picker; or change the engine which triggers a re-extract (the old chunks are dropped).",
+    },
+    "reader.welcome.s44_p":           {
+      zh: "**提问没反应或者一直转圈？** 多半是 LLM provider 那一侧的问题。回到设置页找到对应那一行 provider，点\"测试\"按钮：返回 401 说明 key 错了或过期了；返回 timeout 说明网络不通 / VPN 没开 / base URL 拼错了；返回 connection refused 说明本地的 Ollama / vLLM 服务没起来。如果一切看起来都对但还是不通，再去看 `/tmp/nano-server.log` 里有没有报错。",
+      en: "Provider API failing? In Settings, click the \"Test\" button on that provider's row (5-second timeout ping) to see whether it's 401 / timeout / network. Prefer `env:VAR` for `api_key_ref` so the key stays in .env; use `literal:` only when env vars aren't available.",
+    },
     "assistant.step_retrieving":      { zh: "正在检索相关段落",    en: "Retrieving relevant passages" },
     "assistant.step_generating":      { zh: "正在生成回答",        en: "Generating answer" },
     "assistant.step_formatting":      { zh: "正在格式化响应",      en: "Formatting response" },
@@ -447,13 +615,9 @@
     "settings.section.appearance_hint":{ zh: "保存在本机浏览器",    en: "Stored in your browser" },
     "settings.theme_label":           { zh: "主题",                en: "Theme" },
     "settings.theme.paper":           { zh: "Paper",               en: "Paper" },
-    "settings.theme.paper_hint":      { zh: "默认浅色",            en: "Default light" },
-    "settings.theme.sepia":           { zh: "Sepia",               en: "Sepia" },
-    "settings.theme.sepia_hint":      { zh: "暖纸色",              en: "Warm paper" },
-    "settings.theme.slate":           { zh: "Slate",               en: "Slate" },
-    "settings.theme.slate_hint":      { zh: "石板灰",              en: "Slate gray" },
+    "settings.theme.paper_hint":      { zh: "日间默认 · 暖白学术",  en: "Daytime default · warm academic white" },
     "settings.theme.dark":            { zh: "Dark",                en: "Dark" },
-    "settings.theme.dark_hint":       { zh: "深色",                en: "Dark" },
+    "settings.theme.dark_hint":       { zh: "暖石墨 · 冷青蓝点缀",    en: "Warm graphite · cool cyan accent" },
     "settings.theme.auto":            { zh: "Auto",                en: "Auto" },
     "settings.theme.auto_hint":       { zh: "跟随系统",            en: "Follow system" },
     "settings.theme_current":         { zh: "当前：{theme}",        en: "Current: {theme}" },
@@ -476,6 +640,12 @@
       zh: "⚠ 这个名字会随每次提问发送到 LLM 后端 · 不要填真名 / 邮箱 / 手机号等隐私信息",
       en: "⚠ This name is sent to the LLM with every request · don't enter real name / email / phone or other private info",
     },
+    "settings.persona_icon_label":    { zh: "助手图标",            en: "Assistant icon" },
+    "settings.persona_icon_hint":     {
+      zh: "粘贴一个 emoji（macOS：🌐/Fn + E，或 ⌃⌘空格）· 留空则用助手名首字",
+      en: "Paste an emoji (macOS: 🌐/Fn + E, or ⌃⌘Space) · leave empty to use the first letter of the name",
+    },
+    "settings.persona_icon_clear":    { zh: "清空",                en: "Clear" },
     "settings.hidden_courses_label":  { zh: "隐藏的课程",          en: "Hidden courses" },
     "settings.hidden_courses_count":  { zh: "{n} 门课程已隐藏（仅前端隐藏；后端数据保留）", en: "{n} courses hidden (frontend-only; backend data is preserved)" },
     "settings.hidden_courses_unhide": { zh: "全部恢复显示",        en: "Show all" },
@@ -567,11 +737,21 @@
 
   window.I18N = { STRINGS, t };
   window.LangContext = _LangContext;
+  // Stable per-language closure. Without React.useMemo, callers that do
+  // `React.useMemo(..., [t])` would see a fresh fn ref every render and
+  // re-run the memo body unconditionally — the optimization at e.g.
+  // reader.jsx's 25-paragraph welcome doc would silently regress.
   window.useT = function () {
     const ctxLang = (_LangContext && typeof React !== "undefined")
       ? React.useContext(_LangContext)
       : "en";
     const lang = ctxLang || "en";
+    if (typeof React !== "undefined" && React.useMemo) {
+      return React.useMemo(
+        () => function (key, vars) { return t(key, lang, vars); },
+        [lang],
+      );
+    }
     return function (key, vars) { return t(key, lang, vars); };
   };
 })();
