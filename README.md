@@ -148,8 +148,8 @@ is detected but breaks at runtime (stale driver / OOM), set
   <br><b>Exam Prep</b> — topics weighted by mastery; wrong answers auto-spawn variant questions so the bank grows where you need it.
 </td>
 <td width="50%" valign="top">
-  <img src="docs/screenshots/upload.png" alt="Upload pipeline">
-  <br><b>Upload pipeline</b> — pick the PDF engine per-course (PyMuPDF for speed, MinerU for scanned). Runs in the background, resumable.
+  <img src="docs/screenshots/chat-citations.png" alt="Chat with cited sources">
+  <br><b>Chat with cited sources</b> — every answer ends with chips like <code>ch3.pdf, Page 32/51</code> pointing at the exact source file and page; click to jump there. Bilingual sectioned format (课件覆盖 / 补充背景) makes it explicit which part came from your slides vs general background.
 </td>
 </tr>
 </table>
@@ -322,7 +322,9 @@ and no persistent task queue. If you expose it on the public internet:
 
 ## License
 
-[MIT](LICENSE) — do what you want, just keep the copyright notice.
+Released under the [MIT License](LICENSE). Free to use, modify, and
+redistribute — including in commercial products — provided the original
+copyright notice and license text are retained.
 
 ## Acknowledgements
 
