@@ -389,6 +389,135 @@ def test_generate_file_stream_empty_response():
     assert result.error == "empty_llm_response"
 
 
+# ── C2 continuation: resume after upstream truncation ──────────────────
+
+
+class _SequencedTruncatingRouter:
+    """Returns responses from a queue, one per `complete_stream` call.
+    Each queue entry is ``(content, truncate)``: yields the content as
+    two deltas and, if ``truncate`` is True, a trailing TruncationSignal.
+    Raises ``RuntimeError`` if the test exhausts the queue — that means
+    generate_file_stream called the router more times than the test
+    expected, which is itself a test failure worth surfacing.
+    """
+
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls: list[dict] = []
+
+    async def complete_stream(self, prompt, task_type="", system="",
+                              temperature=0.7, max_tokens=4096):
+        self.calls.append({"prompt": prompt, "task_type": task_type})
+        if not self.responses:
+            raise RuntimeError(
+                "test ran out of fake responses — generate_file_stream "
+                "called the router more times than expected"
+            )
+        content, truncate = self.responses.pop(0)
+        # Split the content into 2 chunks so the delta path is exercised
+        # the same way _FakeRouter.complete_stream does it.
+        midpoint = max(1, len(content) // 2)
+        yield content[:midpoint]
+        yield content[midpoint:]
+        if truncate:
+            from nano_notebooklm.ai.base import TruncationSignal
+            yield TruncationSignal(reason="length")
+
+
+def test_generate_file_stream_continues_after_truncation():
+    """Truncated initial call → continuation prompt → second call completes.
+
+    Pins the contract that:
+    - partial body from the truncated initial call is preserved
+    - the continuation prompt receives a tail-anchor showing where to resume
+    - the final FileResult content concatenates both calls
+    - FileResult.truncated is False because continuation recovered it
+    """
+    router = _SequencedTruncatingRouter([
+        (r"\section{a}\subsection{intro} initial body... ", True),
+        (r"continuation body \textbf{ok}", False),
+    ])
+    deltas, result = asyncio.run(_collect_file_stream(router, _make_plan()))
+    assert result is not None
+    assert result.error is None
+    assert result.truncated is False, (
+        "continuation succeeded — truncated flag should be cleared"
+    )
+    assert "initial body" in result.content
+    assert "continuation body" in result.content
+    # Two LLM calls: initial + one continuation round
+    assert len(router.calls) == 2
+    cont_prompt = router.calls[1]["prompt"]
+    # The continuation prompt carries the resume signal and the tail
+    # of the partial output so the LLM can match brackets.
+    assert "CONTINUATION" in cont_prompt
+    assert "initial body" in cont_prompt
+
+
+def test_generate_file_stream_continuation_max_rounds_exhausted():
+    """Every round truncates → we give up after CONTINUATION_MAX_ROUNDS
+    and surface truncated=True. All assembled content is still preserved
+    so the frontend can render the partial body under the warning chip.
+    """
+    n = notes_full_course.CONTINUATION_MAX_ROUNDS + 1  # initial + N continuations
+    router = _SequencedTruncatingRouter([
+        (f"\\section{{a}}part{i} ", True) for i in range(n)
+    ])
+    deltas, result = asyncio.run(_collect_file_stream(router, _make_plan()))
+    assert result is not None
+    assert result.error is None  # we still produced (partial) content
+    assert result.truncated is True
+    for i in range(n):
+        assert f"part{i}" in result.content
+    assert len(router.calls) == n
+
+
+def test_generate_file_stream_continuation_call_crash_keeps_partial():
+    """When a continuation LLM call raises, we keep the partial body from
+    the initial call and report truncated=True rather than failing the
+    whole file.
+    """
+    class _CrashOnContinuation:
+        def __init__(self):
+            self.call_idx = 0
+            self.calls: list[dict] = []
+
+        async def complete_stream(self, prompt, task_type="", system="",
+                                  temperature=0.7, max_tokens=4096):
+            self.calls.append({"prompt": prompt})
+            self.call_idx += 1
+            if self.call_idx == 1:
+                yield r"\section{a}initial "
+                yield "body"
+                from nano_notebooklm.ai.base import TruncationSignal
+                yield TruncationSignal(reason="length")
+                return
+            raise RuntimeError("continuation backend down")
+
+    router = _CrashOnContinuation()
+    deltas, result = asyncio.run(_collect_file_stream(router, _make_plan()))
+    assert result is not None
+    assert result.error is None
+    assert result.truncated is True
+    assert "initial body" in result.content
+
+
+def test_build_continuation_prompt_includes_tail_and_rules():
+    """Pin the continuation prompt structure so a future refactor that
+    drops the resume rules or the tail snippet doesn't silently regress
+    the LLM's ability to pick up mid-LaTeX.
+    """
+    plan = _make_plan(source_file="ch3.pdf")
+    tail = r"\begin{theorem} The Viterbi algorithm computes "
+    p = notes_full_course._build_continuation_prompt(plan, tail, 1, 2)
+    assert "CONTINUATION" in p
+    assert "ch3.pdf" in p
+    assert tail in p
+    # Hard rules the LLM must respect
+    assert "Do NOT repeat" in p
+    assert "Do NOT start a new" in p
+
+
 # ── Endpoint tests (TestClient + monkeypatched router) ─────────────────
 
 
@@ -562,6 +691,113 @@ def test_endpoint_emits_latex_unsafe_when_review_stream_returns_forbidden(fc_cli
     assert final["error"] == "latex_unsafe"
     # Sanitiser reason should mention the offending command
     assert "\\input" in final.get("detail", "")
+
+
+def test_endpoint_review_continues_after_truncation(fc_client, monkeypatch):
+    """Review pass truncates on the first call, continuation prompt is
+    issued, second call completes. Final `done` event:
+    - review_truncated=False (continuation recovered)
+    - content concatenates both review halves
+    - review_chunk events span both calls (initial + continuation deltas)
+    """
+    from nano_notebooklm.ai.base import TruncationSignal
+
+    review_call_count = {"n": 0}
+    cont_prompt_seen = {"saw": False, "tail_match": False}
+
+    async def fake_complete_stream(prompt, task_type="", system="",
+                                   temperature=0.7, max_tokens=4096):
+        # Detect the review-continuation prompt by its marker. Must check
+        # this BEFORE the "Polish" branch because the continuation prompt
+        # does not start with "Polish".
+        if "[CONTINUATION" in prompt:
+            cont_prompt_seen["saw"] = True
+            # The tail snippet from the first review call must appear in
+            # the continuation prompt — that's what anchors the LLM.
+            cont_prompt_seen["tail_match"] = "review part A" in prompt
+            yield r" review part B \textbf{done}"
+            return
+        if _is_review_prompt(prompt):
+            review_call_count["n"] += 1
+            # First review call truncates partway through.
+            yield r"\section{ml.pdf}\textbf{review part A"
+            yield TruncationSignal(reason="length")
+            return
+        # Per-file phase — short deterministic bodies so we reach review.
+        yield r"\textbf{file body}"
+
+    client, server_mod = fc_client
+    monkeypatch.setattr(server_mod.router, "complete_stream", fake_complete_stream)
+
+    response = client.post("/api/notes/full-course/stream",
+                           json={"course_id": "testcourse", "concurrency": 2})
+    assert response.status_code == 200
+    events = _read_events(response)
+
+    # Continuation prompt was issued and carried the truncated tail
+    assert cont_prompt_seen["saw"], (
+        "review continuation never fired — initial truncation likely "
+        "didn't reach the continuation loop in api/server.py"
+    )
+    assert cont_prompt_seen["tail_match"], (
+        "review continuation prompt did not contain the partial output "
+        "as tail anchor"
+    )
+
+    # Final done: recovered, content includes both halves
+    final = events[-1]
+    assert final["type"] == "done"
+    assert final["review_truncated"] is False, (
+        "review_truncated should clear after successful continuation"
+    )
+    assert "review part A" in final["content"]
+    assert "review part B" in final["content"]
+
+    # review_chunk events span both calls
+    review_chunks = [e for e in events if e["type"] == "review_chunk"]
+    accumulated = "".join(e["delta"] for e in review_chunks)
+    assert "review part A" in accumulated
+    assert "review part B" in accumulated
+
+
+def test_endpoint_review_continuation_exhausted_flags_truncated(fc_client, monkeypatch):
+    """Every review continuation round also truncates → done event surfaces
+    review_truncated=True. Partial content from all rounds is preserved.
+    """
+    from nano_notebooklm.ai.base import TruncationSignal
+
+    client, server_mod = fc_client
+    # 1 initial + N continuations all truncate
+    max_rounds = notes_full_course.CONTINUATION_MAX_ROUNDS
+
+    async def fake_complete_stream(prompt, task_type="", system="",
+                                   temperature=0.7, max_tokens=4096):
+        if "[CONTINUATION" in prompt:
+            # Each continuation also truncates
+            yield r" cont chunk"
+            yield TruncationSignal(reason="length")
+            return
+        if _is_review_prompt(prompt):
+            yield r"\section{x}initial review"
+            yield TruncationSignal(reason="length")
+            return
+        # Per-file phase
+        yield r"\textbf{file body}"
+
+    monkeypatch.setattr(server_mod.router, "complete_stream", fake_complete_stream)
+
+    response = client.post("/api/notes/full-course/stream",
+                           json={"course_id": "testcourse", "concurrency": 2})
+    events = _read_events(response)
+    final = events[-1]
+    assert final["type"] == "done"
+    assert final["review_truncated"] is True, (
+        f"after {max_rounds} truncating continuations, review_truncated "
+        f"should still be True"
+    )
+    # Partial body from all rounds is preserved in the final content
+    assert "initial review" in final["content"]
+    assert "cont chunk" in final["content"]
 
 
 def test_endpoint_rejects_empty_course(fc_client, monkeypatch):

@@ -106,12 +106,17 @@ def _get_course_cache_lock(course_id: str) -> asyncio.Lock:
     return lock
 
 # Cap chunks fed into a single per-file prompt. Big PDF lectures can exceed
-# 100 chunks; at ~300 tokens each that's 30K+ input tokens before the
-# instructions, which crowds out the model's context window. 60
-# captures the bulk of a typical 90-minute lecture without truncating
-# anything important — chunks are slide-order, so we keep the start of the
-# lecture (where the definitions live) and drop only the trailing exercises.
-MAX_CHUNKS_PER_FILE = 60
+# 100 chunks; the planner slices them into ceil(n/cap) parts (see
+# plan_for_course) and runs each part as an independent LLM call with
+# batch-aware prompts. Lowering this cap shrinks each part's output, which
+# is what keeps the per-call output under the 8K cap that DeepSeek-family
+# models enforce — beyond ~25 dense slide chunks a single LaTeX note
+# easily exceeds 8K output tokens and the upstream silently clamps with
+# finish_reason=length. 20 is the conservative setting that keeps every
+# batch's output safely under 8K on DeepSeek while leaving Claude /
+# gpt-4o families with plenty of headroom. The C2 continuation loop below
+# is the safety net for batches that *still* overshoot.
+MAX_CHUNKS_PER_FILE = 20
 
 # 2026-05-13: raised 2 → 8 per user judgement that 2 was too slow on
 # multi-file courses. The per-file retry in `generate_file_stream`
@@ -133,6 +138,22 @@ PER_FILE_MAX_TOKENS = int(os.getenv("NOTES_PER_FILE_MAX_TOKENS", "12288"))
 REVIEW_MAX_TOKENS = int(os.getenv("NOTES_REVIEW_MAX_TOKENS", "24576"))
 PER_FILE_TEMPERATURE = 0.3
 REVIEW_TEMPERATURE = 0.2
+
+# C2 continuation: when a per-file LLM call hits the upstream
+# max_output_tokens cap mid-LaTeX, re-prompt the model with the tail of
+# its own output and ask it to resume exactly where it stopped. Each
+# continuation can itself truncate, so we loop up to this many rounds.
+# 2 = up to two extra LLM calls to finish a file's notes; if the file
+# still isn't done after that, surface truncated=True and ship the
+# partial body. Set to 0 to disable continuation entirely.
+CONTINUATION_MAX_ROUNDS = int(os.getenv("NOTES_CONTINUATION_MAX_ROUNDS", "2"))
+
+# How many trailing chars of the previous output to feed back as the
+# resume-anchor. 2000 chars ≈ 500-700 tokens of LaTeX — enough for the
+# model to see any unclosed \begin{...} environment and the local
+# subsection context, but short enough that the continuation prompt itself
+# doesn't crowd out the output budget on small-context backends.
+CONTINUATION_TAIL_CHARS = 2000
 
 
 @dataclass(frozen=True)
@@ -430,6 +451,7 @@ def plan_for_course(
     user_lang: str | None = None,
     *,
     force_refresh: bool = False,
+    checked_files: list[str] | None = None,
 ) -> list[FilePlan]:
     """Build one FilePlan per source_file in the course. Returns [] when
     the course has no chunks — caller surfaces this as an error event.
@@ -440,6 +462,13 @@ def plan_for_course(
     then short-circuits the LLM call. ``force_refresh=True`` ignores the
     cache entirely — used by the explicit "regenerate from scratch" UI.
 
+    ``checked_files``: when not None, only files whose ``source_file``
+    appears in this list contribute plans. None (default) means "all
+    files" — same convention as the chat path. The endpoint guarantees
+    a non-empty list when this argument is non-None, so an empty result
+    here means the user's selection doesn't intersect any indexed
+    source_file (typo / stale UI state) — caller surfaces as no_chunks.
+
     The hash is computed over the CAPPED chunk list (post-MAX_CHUNKS_PER_FILE
     truncation) so changing the cap invalidates every cache entry — which
     is the safe behavior, since the prompt that produced the cached body
@@ -448,6 +477,14 @@ def plan_for_course(
     chunks = kb.get_chunks(course_id)
     if not chunks:
         return []
+    if checked_files is not None:
+        # Filter at the chunk level so the downstream batch / cache_key
+        # logic stays unchanged. `set` lookup keeps this O(N) for any
+        # reasonable course size.
+        keep = set(checked_files)
+        chunks = [c for c in chunks if c.source_file in keep]
+        if not chunks:
+            return []
     groups = _group_chunks_by_file(chunks)
     cache = {} if force_refresh else load_cache(course_id)
 
@@ -552,6 +589,7 @@ def plan_for_course(
                 source_text=source_text,
                 format_instructions=prompts.NOTE_FORMAT_LATEX,
             )
+            prompt += prompts.USER_LANG_REMINDER(user_lang)
             system = prompts.NOTE_GENERATION_SYSTEM
             binding = prompts.USER_LANG_BINDING(user_lang)
             if binding:
@@ -571,6 +609,62 @@ def plan_for_course(
                 batch_total=batch_total,
             ))
     return plans
+
+
+def build_review_continuation_prompt(
+    tail: str, round_idx: int, max_rounds: int,
+) -> str:
+    """Follow-up prompt asking the LLM to resume the merged-notes review
+    pass from exactly where the previous call stopped.
+
+    Mirrors ``_build_continuation_prompt`` but adjusts the framing: the
+    review pass is polishing an already-merged draft (not writing fresh
+    per-file notes), so the rules emphasize "do not restart the polish,
+    do not re-emit \\section{} headers, just continue from the cutover".
+    """
+    return (
+        f"[CONTINUATION round {round_idx} of {max_rounds}] Your previous "
+        f"merged-notes review output ran out of budget mid-write. The "
+        f"polished body so far ends with this snippet:\n\n"
+        f"```latex\n{tail}\n```\n\n"
+        f"Continue from EXACTLY where it stopped. Hard rules:\n"
+        f"- Do NOT repeat any of the snippet above.\n"
+        f"- Do NOT write a preamble like 'Sure, continuing...' or "
+        f"'Here is the rest...'.\n"
+        f"- Do NOT restart the polish or re-emit \\section{{}} headers — "
+        f"the merged file structure already exists in the snippet.\n"
+        f"- If the snippet ends inside an open \\begin{{...}}..."
+        f"\\end{{...}} block, continue inside it and close it properly.\n"
+        f"- Output ONLY the LaTeX continuation, nothing else."
+    )
+
+
+def _build_continuation_prompt(
+    plan: FilePlan, tail: str, round_idx: int, max_rounds: int,
+) -> str:
+    """Follow-up prompt asking the LLM to resume LaTeX generation from
+    exactly where the previous call stopped.
+
+    The tail snippet is shown verbatim because LaTeX environments
+    (\\begin{...}...\\end{...}) and citation chips can span hundreds of
+    chars — the model needs to literally see the unclosed bracket /
+    open environment to know how to continue, not a paraphrase.
+    """
+    return (
+        f"[CONTINUATION round {round_idx} of {max_rounds}] The previous "
+        f"LaTeX note for {plan.source_file} ran out of output budget "
+        f"mid-write. Your output so far ends with this snippet:\n\n"
+        f"```latex\n{tail}\n```\n\n"
+        f"Continue from EXACTLY where it stopped. Hard rules:\n"
+        f"- Do NOT repeat any of the snippet above.\n"
+        f"- Do NOT write a preamble like 'Sure, continuing...' or "
+        f"'Here is the rest...'.\n"
+        f"- Do NOT start a new \\section{{}} — you are still inside the "
+        f"same file's notes.\n"
+        f"- If the snippet ends inside an open \\begin{{...}}..."
+        f"\\end{{...}} block, continue inside it and close it properly.\n"
+        f"- Output ONLY the LaTeX continuation, nothing else."
+    )
 
 
 async def generate_file_stream(
@@ -654,6 +748,53 @@ async def generate_file_stream(
                 batch_index=plan.batch_index, batch_total=plan.batch_total,
             ))
             return
+
+    # C2 continuation loop: if the initial call truncated, re-prompt with
+    # the tail of the partial output asking the LLM to resume from exactly
+    # where it stopped. Each continuation round can itself truncate, so we
+    # loop up to CONTINUATION_MAX_ROUNDS times. Successful continuation
+    # clears the truncated flag so the FileResult lands as a clean
+    # finish; exhausted rounds (or a continuation that crashes) leave
+    # truncated=True and ship whatever partial body was assembled — the
+    # frontend's "⚠️ N truncated" chip already handles that case.
+    cont_round = 0
+    while truncated and cont_round < CONTINUATION_MAX_ROUNDS:
+        cont_round += 1
+        truncated = False  # provisional; flips back True if this round also truncates
+        tail = partial[-CONTINUATION_TAIL_CHARS:]
+        cont_prompt = _build_continuation_prompt(
+            plan, tail, cont_round, CONTINUATION_MAX_ROUNDS,
+        )
+        try:
+            async for item in router.complete_stream(
+                cont_prompt,
+                task_type=plan.task_type,
+                system=plan.system,
+                temperature=plan.temperature,
+                max_tokens=plan.max_tokens,
+            ):
+                if isinstance(item, TruncationSignal):
+                    truncated = True
+                    logger.warning(
+                        "continuation round %d also truncated for %s "
+                        "(reason=%s)",
+                        cont_round, plan.source_file, item.reason,
+                    )
+                    continue
+                if item:
+                    partial += item
+                    yield ("delta", item)
+        except Exception as e:  # noqa: BLE001
+            # Continuation backend crashed — keep whatever partial output
+            # we've assembled so far rather than discarding the whole file.
+            # Mark truncated so the user knows the body is incomplete.
+            logger.warning(
+                "continuation round %d failed for %s: %s — keeping partial output",
+                cont_round, plan.source_file, type(e).__name__,
+            )
+            truncated = True
+            break
+
     content = partial.strip()
     if not content:
         yield ("result", FileResult(
@@ -839,6 +980,7 @@ def prepare_review_inputs(
         draft=draft,
         format_instructions=prompts.NOTE_FORMAT_LATEX,
     )
+    prompt += prompts.USER_LANG_REMINDER(user_lang)
     system = prompts.NOTE_MERGE_REVIEW_SYSTEM
     binding = prompts.USER_LANG_BINDING(user_lang)
     if binding:
