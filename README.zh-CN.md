@@ -50,8 +50,17 @@ uv venv && source .venv/bin/activate && uv pip install -e ".[test]"
 cp .env.example .env
 
 # 3. 启动（Ctrl-C 停服；或者用下面的 ./dev.sh 让它后台跑）
-python api/server.py                   # → http://localhost:8000
+python api/server.py
 ```
+
+### → 在浏览器打开 [`http://localhost:8000`](http://localhost:8000)
+
+然后点顶栏右上角的 **⚙ 设置** 齿轮图标，进入 Settings 管理 LLM
+provider —— 新增 / 切换 provider、改默认、或者按 **Test** 做 5 秒连通性
+ping，全都不用重启服务。`.env` 里填的 key 是首次启动时的种子；Settings
+建好之后，UI 就是唯一可信源（改动写入 `artifacts/providers.json`）。
+
+---
 
 想让服务在后台跑、有 pid / 日志管理？`./dev.sh` 封装了同样的命令：
 

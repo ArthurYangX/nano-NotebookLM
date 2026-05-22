@@ -51,8 +51,19 @@ uv venv && source .venv/bin/activate && uv pip install -e ".[test]"
 cp .env.example .env
 
 # 3. run (Ctrl-C to stop; or use ./dev.sh below to manage as a background process)
-python api/server.py                   # → http://localhost:8000
+python api/server.py
 ```
+
+### → Open [`http://localhost:8000`](http://localhost:8000) in your browser
+
+Then click the **⚙ Settings** gear (top-right of the topbar) to manage
+LLM providers — add or swap a provider, switch the active default, or
+hit **Test** for a 5-second connectivity ping. All without restarting
+the server. The `.env` values you just filled in seed the first row;
+once Settings exists, the UI is the source of truth (writes go to
+`artifacts/providers.json`).
+
+---
 
 Prefer a managed lifecycle? `./dev.sh` wraps the same commands:
 
