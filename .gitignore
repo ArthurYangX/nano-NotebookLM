@@ -18,6 +18,9 @@ build/
 # Generated app data — uploaded files, indices, KGs, notes, sessions
 artifacts/
 
+# MinerU runtime output (per-document parse cache, kept beside artifacts/)
+output/
+
 # Tectonic / LaTeX build artefacts
 *.aux
 *.log
@@ -29,9 +32,18 @@ artifacts/
 Thumbs.db
 .idea/
 .vscode/
+# macOS screenshot dumps that land in the repo root
+截屏*.png
+Screenshot*.png
 
 # Per-machine Claude Code project config
 .claude/
+
+# Course-presentation deck (15 MB, kept locally; not for the repo)
+ppt.pdf
+
+# Local screenshot working folder — canonical copies live in docs/screenshots/
+pics/
 
 # Playwright / browser-automation residue
 .playwright-mcp/
