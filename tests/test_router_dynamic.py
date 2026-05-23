@@ -193,7 +193,11 @@ def test_bootstrap_idempotent(monkeypatch, tmp_path):
     from nano_notebooklm import config
 
     monkeypatch.setattr(config, "PROVIDERS_FILE", tmp_path / "providers.json")
-    monkeypatch.setenv("OPENAI_API_KEY", "k1")
+    # `_default_providers_from_env` reads the module-level
+    # `OPENAI_API_KEY` constant captured at import (line 24 of config.py),
+    # NOT `os.getenv` at call time. `monkeypatch.setenv` would not
+    # propagate — see the project memory note about config defaults.
+    monkeypatch.setattr(config, "OPENAI_API_KEY", "k1")
 
     config.bootstrap_providers_from_env()
     first = json.loads(config.PROVIDERS_FILE.read_text())
@@ -214,12 +218,14 @@ def test_bootstrap_idempotent_when_env_removed(monkeypatch, tmp_path):
     from nano_notebooklm import config
 
     monkeypatch.setattr(config, "PROVIDERS_FILE", tmp_path / "providers.json")
-    monkeypatch.setenv("OPENAI_API_KEY", "k1")
+    # See test_bootstrap_idempotent above for why setattr (not setenv).
+    monkeypatch.setattr(config, "OPENAI_API_KEY", "k1")
     config.bootstrap_providers_from_env()
     first_bytes = config.PROVIDERS_FILE.read_bytes()
     assert b"openai-main" in first_bytes
 
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    # Simulate "operator removed the key from env between boots".
+    monkeypatch.setattr(config, "OPENAI_API_KEY", "")
     config.bootstrap_providers_from_env()
     second_bytes = config.PROVIDERS_FILE.read_bytes()
     assert first_bytes == second_bytes, (
