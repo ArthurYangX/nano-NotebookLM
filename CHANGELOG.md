@@ -3,6 +3,17 @@
 All notable changes to nano-NOTEBOOKLM are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+
+- **License changed from MIT to Apache License 2.0.** Existing copies
+  obtained under MIT remain MIT-licensed; all future versions (this
+  commit onward) are distributed under Apache 2.0. Motivation: explicit
+  patent grant, NOTICE-file attribution requirement, and alignment with
+  peer projects (vLLM, PyTorch, Transformers). Sole-author project — no
+  external contributor consent needed.
+
 ## [0.2.0] — 2026-05-21
 
 ### Added

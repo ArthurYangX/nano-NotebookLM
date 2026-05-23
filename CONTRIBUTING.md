@@ -92,5 +92,8 @@ can talk about scope before you write code.
 
 ## License
 
-By contributing, you agree your contributions are licensed under
-[MIT](LICENSE), same as the rest of the project.
+By contributing, you agree your contributions are licensed under the
+[Apache License 2.0](LICENSE), same as the rest of the project. Per
+Section 5 of the license, submitting a contribution implicitly grants
+the project the same patent and copyright license that covers the
+existing codebase — no separate CLA is required.

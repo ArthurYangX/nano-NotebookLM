@@ -4,7 +4,7 @@
 
 **A self-hosted, open-source study assistant — chat with citations, structured LaTeX notes, exam-prep with a self-evolving question bank, and an editable knowledge graph.**
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![Tests](https://github.com/ArthurYangX/nano-NotebookLM/actions/workflows/test.yml/badge.svg)](https://github.com/ArthurYangX/nano-NotebookLM/actions/workflows/test.yml)
 [![Code style](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
@@ -27,10 +27,11 @@ Upload course PDFs / PPTX / DOCX / Markdown → automatic knowledge graph
 LaTeX notes, practice quizzes, exam prep with a **self-evolving question
 bank**, and an editable mind map.
 
-Bring your own model: **OpenAI · DeepSeek · Moonshot · Zhipu · MiniMax
-· Groq · Together · Anthropic Claude · Gemini**, or any local runner
-that speaks OpenAI's `/v1/chat/completions` (**Ollama / vLLM / LM Studio
-/ llama.cpp**).
+Bring your own model: **DeepSeek · OpenAI · Anthropic Claude · Gemini
+· and 11+ more** named cloud providers, or any local runner that speaks
+OpenAI's `/v1/chat/completions` (**Ollama / vLLM / LM Studio /
+llama.cpp**). See the [Provider matrix](#provider-matrix) for the full
+list.
 
 ---
 
@@ -103,17 +104,21 @@ is detected but breaks at runtime (stale driver / OOM), set
 
 ## Why nano-NotebookLM
 
-| Capability                                | nano-NotebookLM   | Google NotebookLM | ChatGPT (upload PDF) |
-|-------------------------------------------|:-----------------:|:-----------------:|:--------------------:|
-| Fully self-hosted, your data never leaves | ✅                | ❌                | ❌                   |
-| Bring your own LLM (cloud or local)       | ✅ 9+ providers   | ❌ Gemini only    | ❌ OpenAI only       |
-| **Page-accurate citations**, click to jump | ✅               | ✅                | ⚠️ inline quote only |
-| Editable knowledge graph                  | ✅                | ❌                | ❌                   |
-| LaTeX notes (KaTeX + tectonic PDF)        | ✅                | ❌                | ❌                   |
-| Exam prep with self-evolving question bank | ✅               | ❌                | ❌                   |
-| Background upload pipeline, resumable     | ✅                | ✅                | ⚠️ session-bound     |
-| Cross-course retrieval                    | ✅                | ❌                | ❌                   |
-| Cost at scale                             | Local GPU / API   | Free tier capped  | Subscription         |
+| Capability                                | nano-NotebookLM   | [open-notebook](https://github.com/lfnovo/open-notebook) | Google NotebookLM | ChatGPT (upload PDF) |
+|-------------------------------------------|:-----------------:|:-----------------:|:-----------------:|:--------------------:|
+| Fully self-hosted, your data never leaves | ✅                | ✅                | ❌                | ❌                   |
+| Bring your own LLM (cloud or local)       | ✅ 20+ providers (any OpenAI-compatible endpoint) | ✅ 18+ providers  | ❌ Gemini only    | ❌ OpenAI only       |
+| **Page-accurate citations**, click to jump | ✅               | ⚠️ basic refs     | ✅                | ⚠️ inline quote only |
+| Editable knowledge graph                  | ✅                | ❌                | ❌                | ❌                   |
+| LaTeX notes (KaTeX + tectonic PDF)        | ✅                | ❌                | ❌                | ❌                   |
+| Exam prep with self-evolving question bank | ✅               | ❌                | ❌                | ❌                   |
+| Background upload pipeline, resumable     | ✅                | ⚠️ async, no stages | ✅              | ⚠️ session-bound     |
+| Cross-course retrieval                    | ✅                | ⚠️ within-notebook only | ❌          | ❌                   |
+| Podcast / multi-speaker audio generation  | ❌                | ✅                | ✅ (2-speaker)    | ❌                   |
+| Audio / video / web-page ingestion        | 🔜 future (today: PDF/PPTX/DOCX/MD) | ✅            | ✅                | ⚠️ varies            |
+| Cost at scale                             | Local GPU / API   | Local GPU / API   | Free tier capped  | Subscription         |
+
+> **Choosing between nano-NotebookLM and open-notebook:** **open-notebook** is strong at multi-modal ingestion (audio / video / web) and podcast generation. **nano-NotebookLM** is strong at the deep-reading loop — page-accurate citations into a built-in PDF reader, an editable knowledge graph, LaTeX notes (KaTeX + tectonic PDF), and an exam-prep mode that grows a question bank around the topics you got wrong. Provider coverage is comparable — both are OpenAI-compatible, so any `/v1/chat/completions` endpoint plugs into either.
 
 ---
 
@@ -167,19 +172,27 @@ is detected but breaks at runtime (stale driver / OOM), set
 
 | Provider              | Type             | `OPENAI_BASE_URL`                                              | Suggested model                              |
 |-----------------------|------------------|----------------------------------------------------------------|----------------------------------------------|
-| OpenAI                | Cloud, native    | `https://api.openai.com/v1`                                    | `gpt-4o-mini`                                |
-| Anthropic Claude      | Cloud, native    | *(uses Anthropic SDK)*                                         | `claude-sonnet-4-5`                          |
-| DeepSeek              | Cloud, compat    | `https://api.deepseek.com/v1`                                  | `deepseek-chat`                              |
-| Moonshot              | Cloud, compat    | `https://api.moonshot.cn/v1`                                   | `moonshot-v1-8k`                             |
-| Zhipu GLM             | Cloud, compat    | `https://open.bigmodel.cn/api/paas/v4`                         | `glm-4-flash`                                |
-| MiniMax               | Cloud, compat    | `https://api.minimax.chat/v1`                                  | `abab6.5-chat`                               |
-| Groq                  | Cloud, compat    | `https://api.groq.com/openai/v1`                               | `llama-3.3-70b-versatile`                    |
-| Together              | Cloud, compat    | `https://api.together.xyz/v1`                                  | `meta-llama/Llama-3.3-70B-Instruct-Turbo`    |
-| Gemini (OpenAI mode)  | Cloud, compat    | `https://generativelanguage.googleapis.com/v1beta/openai/`     | `gemini-2.0-flash`                           |
-| **Ollama**            | Local            | `http://localhost:11434/v1`                                    | `qwen2.5:7b`                                 |
-| **vLLM**              | Local            | `http://localhost:8001/v1` *(pick any free port; **not** 8000 — that's the app server)* | `Qwen/Qwen2.5-7B-Instruct`                   |
-| **LM Studio**         | Local            | `http://localhost:1234/v1`                                     | *(model loaded in LM Studio)*                |
-| **llama.cpp server**  | Local            | `http://localhost:8080/v1`                                     | *(GGUF model loaded)*                        |
+| **[DeepSeek](https://api-docs.deepseek.com/) ★ (used during development)** | Cloud, compat | `https://api.deepseek.com/v1`                                  | `deepseek-v4-pro`                            |
+| [OpenAI](https://platform.openai.com/docs/api-reference)               | Cloud, native    | `https://api.openai.com/v1`                                    | `gpt-4o-mini`                                |
+| [Anthropic Claude](https://docs.anthropic.com/en/api/getting-started)  | Cloud, native    | *(uses Anthropic SDK)*                                         | `claude-sonnet-4-5`                          |
+| [Moonshot (Kimi)](https://platform.moonshot.cn/docs)                   | Cloud, compat    | `https://api.moonshot.cn/v1`                                   | `moonshot-v1-8k`                             |
+| [Zhipu GLM](https://docs.bigmodel.cn/)                                 | Cloud, compat    | `https://open.bigmodel.cn/api/paas/v4`                         | `glm-4-flash`                                |
+| [MiniMax](https://www.minimax.io/platform_overview)                    | Cloud, compat    | `https://api.minimax.chat/v1`                                  | `abab6.5-chat`                               |
+| [Groq](https://console.groq.com/docs/quickstart)                       | Cloud, compat    | `https://api.groq.com/openai/v1`                               | `llama-3.3-70b-versatile`                    |
+| [Together](https://docs.together.ai/docs/openai-api-compatibility)     | Cloud, compat    | `https://api.together.xyz/v1`                                  | `meta-llama/Llama-3.3-70B-Instruct-Turbo`    |
+| [Gemini (OpenAI mode)](https://ai.google.dev/gemini-api/docs/openai)   | Cloud, compat    | `https://generativelanguage.googleapis.com/v1beta/openai/`     | `gemini-2.0-flash`                           |
+| [xAI (Grok)](https://docs.x.ai/docs/overview)                          | Cloud, compat    | `https://api.x.ai/v1`                                          | `grok-4`                                     |
+| [OpenRouter](https://openrouter.ai/docs/quickstart)                    | Cloud, compat    | `https://openrouter.ai/api/v1`                                 | `openai/gpt-4o-mini` *(any `vendor/model` id)* |
+| [Perplexity](https://docs.perplexity.ai/getting-started/quickstart)    | Cloud, compat    | `https://api.perplexity.ai` *(no `/v1`)*                       | `sonar-pro`                                  |
+| [Mistral](https://docs.mistral.ai/api/)                                | Cloud, compat    | `https://api.mistral.ai/v1`                                    | `mistral-large-latest`                       |
+| [DashScope (Qwen)](https://www.alibabacloud.com/help/en/model-studio/compatibility-of-openai-with-dashscope) | Cloud, compat | `https://dashscope-intl.aliyuncs.com/compatible-mode/v1` | `qwen-plus`                                  |
+| [Fireworks](https://docs.fireworks.ai/getting-started/quickstart)      | Cloud, compat    | `https://api.fireworks.ai/inference/v1`                        | `accounts/fireworks/models/deepseek-v3p1`    |
+| [SiliconFlow](https://docs.siliconflow.cn/en/userguide/quickstart)     | Cloud, compat    | `https://api.siliconflow.cn/v1`                                | `Qwen/Qwen2.5-72B-Instruct`                  |
+| [Cerebras](https://inference-docs.cerebras.ai/introduction)            | Cloud, compat    | `https://api.cerebras.ai/v1`                                   | `llama-3.3-70b`                              |
+| **[Ollama](https://ollama.com/library) ★**                             | Local            | `http://localhost:11434/v1`                                    | `qwen3:14b` *(suggested as open source model)*     |
+| **[vLLM](https://docs.vllm.ai/en/latest/)**                            | Local            | `http://localhost:8001/v1` *(pick any free port; **not** 8000 — that's the app server)* | `Qwen/Qwen2.5-7B-Instruct`                   |
+| **[LM Studio](https://lmstudio.ai/docs/app/api)**                      | Local            | `http://localhost:1234/v1`                                     | *(model loaded in LM Studio)*                |
+| **[llama.cpp server](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md)** | Local | `http://localhost:8080/v1`                                     | *(GGUF model loaded)*                        |
 
 You can mix freely — add a cloud OpenAI key for high-quality KG
 extraction, point chat at a local 7B for privacy, and the Settings UI
@@ -308,6 +321,7 @@ Recently shipped:
 
 Planned (issues welcome):
 
+- Web URL as a source type (fetch + readable-content extraction, then through the existing chunk / embed / KG pipeline)
 - Vite build option (opt-in, CDN stays default)
 - Mastery-driven exam-prep difficulty curve
 - Cross-course graph linking
@@ -329,9 +343,11 @@ and no persistent task queue. If you expose it on the public internet:
 
 ## License
 
-Released under the [MIT License](LICENSE). Free to use, modify, and
-redistribute — including in commercial products — provided the original
-copyright notice and license text are retained.
+Released under the [Apache License 2.0](LICENSE). Free to use, modify,
+and redistribute — including in commercial products — provided the
+original copyright notice, license text, and `NOTICE` file are retained,
+and any modified files are marked as changed. See [`NOTICE`](NOTICE) for
+attribution requirements.
 
 ## Acknowledgements
 

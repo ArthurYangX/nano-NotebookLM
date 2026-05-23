@@ -3,7 +3,7 @@ name = "nano-notebooklm"
 version = "0.2.0"
 description = "Self-hosted, provider-agnostic study assistant: chat with citations, structured LaTeX notes, exam-prep with a self-evolving question bank, and an editable knowledge graph"
 readme = "README.md"
-license = "MIT"
+license = "Apache-2.0"
 requires-python = ">=3.10"
 keywords = ["notebooklm", "rag", "knowledge-graph", "study-assistant", "llm", "self-hosted", "fastapi"]
 authors = [
