@@ -103,3 +103,22 @@ def disable_network():
 # exercising any production behavior. Disable globally for tests; the
 # hook is verified by tests/test_r4_4_fix_all_v1.py source-pin grep.
 os.environ.setdefault("NANO_NLM_DISABLE_EMBED_WARMUP", "1")
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """Bypass Python's interpreter shutdown when the session is fully green.
+
+    faiss-cpu, numpy, sentence-transformers and pytest-asyncio interact
+    badly during CPython teardown on Linux GitHub runners — after a
+    100%-green run, the interpreter exits with `FATAL: exception not
+    rethrown` + SIGABRT (exit 134), masking the success. The race is in
+    C-extension destructor ordering, not in any test code we own.
+
+    ``os._exit(0)`` short-circuits the cleanup race by going straight to
+    the kernel exit. Only triggered on ``exitstatus == 0`` so real test
+    failures still surface their full traceback through the normal exit
+    path. Any subprocess we spawned uses ``start_new_session=True`` so
+    it lives independently; CI VMs are ephemeral anyway.
+    """
+    if exitstatus == 0:
+        os._exit(0)
