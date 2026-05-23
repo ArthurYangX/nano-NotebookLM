@@ -107,18 +107,26 @@ function LoadingBadge({ ready, ok, labelOk, labelBad }) {
 const PROVIDER_PRESETS = [
   // OpenAI-compatible cloud
   { value: "openai",    label: "OpenAI",            kind: "openai_compat",       base_url: "https://api.openai.com/v1",                                model: "gpt-4o-mini",                              api_key_ref: "env:OPENAI_API_KEY"   },
-  { value: "deepseek",  label: "DeepSeek",          kind: "openai_compat",       base_url: "https://api.deepseek.com/v1",                              model: "deepseek-chat",                            api_key_ref: "env:DEEPSEEK_API_KEY" },
+  { value: "deepseek",  label: "DeepSeek",          kind: "openai_compat",       base_url: "https://api.deepseek.com/v1",                              model: "deepseek-v4-pro",                          api_key_ref: "env:DEEPSEEK_API_KEY" },
   { value: "moonshot",  label: "Moonshot (Kimi)",   kind: "openai_compat",       base_url: "https://api.moonshot.cn/v1",                               model: "moonshot-v1-8k",                           api_key_ref: "env:MOONSHOT_API_KEY" },
   { value: "zhipu",     label: "Zhipu (GLM)",       kind: "openai_compat",       base_url: "https://open.bigmodel.cn/api/paas/v4",                     model: "glm-4-flash",                              api_key_ref: "env:ZHIPU_API_KEY"    },
   { value: "minimax",   label: "MiniMax",           kind: "openai_compat",       base_url: "https://api.minimax.chat/v1",                              model: "abab6.5-chat",                             api_key_ref: "env:MINIMAX_API_KEY"  },
   { value: "groq",      label: "Groq",              kind: "openai_compat",       base_url: "https://api.groq.com/openai/v1",                           model: "llama-3.3-70b-versatile",                  api_key_ref: "env:GROQ_API_KEY"     },
   { value: "together",  label: "Together",          kind: "openai_compat",       base_url: "https://api.together.xyz/v1",                              model: "meta-llama/Llama-3.3-70B-Instruct-Turbo",  api_key_ref: "env:TOGETHER_API_KEY" },
   { value: "gemini",    label: "Gemini",            kind: "openai_compat",       base_url: "https://generativelanguage.googleapis.com/v1beta/openai/", model: "gemini-2.0-flash",                         api_key_ref: "env:GEMINI_API_KEY"   },
+  { value: "xai",         label: "xAI (Grok)",      kind: "openai_compat",       base_url: "https://api.x.ai/v1",                                      model: "grok-4",                                   api_key_ref: "env:XAI_API_KEY"         },
+  { value: "openrouter",  label: "OpenRouter",      kind: "openai_compat",       base_url: "https://openrouter.ai/api/v1",                             model: "openai/gpt-4o-mini",                       api_key_ref: "env:OPENROUTER_API_KEY"  },
+  { value: "perplexity",  label: "Perplexity",      kind: "openai_compat",       base_url: "https://api.perplexity.ai",                                model: "sonar-pro",                                api_key_ref: "env:PERPLEXITY_API_KEY"  },
+  { value: "mistral",     label: "Mistral",         kind: "openai_compat",       base_url: "https://api.mistral.ai/v1",                                model: "mistral-large-latest",                     api_key_ref: "env:MISTRAL_API_KEY"     },
+  { value: "dashscope",   label: "DashScope (Qwen)",kind: "openai_compat",       base_url: "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",   model: "qwen-plus",                                api_key_ref: "env:DASHSCOPE_API_KEY"   },
+  { value: "fireworks",   label: "Fireworks",       kind: "openai_compat",       base_url: "https://api.fireworks.ai/inference/v1",                    model: "accounts/fireworks/models/deepseek-v3p1",  api_key_ref: "env:FIREWORKS_API_KEY"   },
+  { value: "siliconflow", label: "SiliconFlow",     kind: "openai_compat",       base_url: "https://api.siliconflow.cn/v1",                            model: "Qwen/Qwen2.5-72B-Instruct",                api_key_ref: "env:SILICONFLOW_API_KEY" },
+  { value: "cerebras",    label: "Cerebras",        kind: "openai_compat",       base_url: "https://api.cerebras.ai/v1",                               model: "llama-3.3-70b",                            api_key_ref: "env:CEREBRAS_API_KEY"    },
   // Anthropic native
   { value: "anthropic", label: "Anthropic Claude",  kind: "anthropic",           base_url: null,                                                       model: "claude-sonnet-4-5",                        api_key_ref: "env:ANTHROPIC_API_KEY"},
   // Local OpenAI-compatible runners (loopback URL pre-filled — operator
   // edits the port / model to match their setup)
-  { value: "ollama",    label: "Ollama (local)",    kind: "openai_compat_local", base_url: "http://localhost:11434/v1",                                model: "qwen2.5:7b",                               api_key_ref: "env:LOCAL_LLM_API_KEY"},
+  { value: "ollama",    label: "Ollama (local)",    kind: "openai_compat_local", base_url: "http://localhost:11434/v1",                                model: "qwen3:14b",                                api_key_ref: "env:LOCAL_LLM_API_KEY"},
   { value: "vllm",      label: "vLLM (local)",      kind: "openai_compat_local", base_url: "http://localhost:8000/v1",                                 model: "Qwen/Qwen2.5-7B-Instruct",                 api_key_ref: "env:LOCAL_LLM_API_KEY"},
   { value: "lmstudio",  label: "LM Studio (local)", kind: "openai_compat_local", base_url: "http://localhost:1234/v1",                                 model: "",                                         api_key_ref: "env:LOCAL_LLM_API_KEY"},
   // Escape hatch — user fills everything manually.
