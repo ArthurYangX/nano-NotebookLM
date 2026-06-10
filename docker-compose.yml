@@ -1,0 +1,19 @@
+# Quickstart:
+#   cp .env.example .env       # fill at least one LLM key
+#   docker compose up          # http://localhost:8000
+#
+# Course data, KGs, notes, sessions persist in ./artifacts on the host.
+
+services:
+  nano-nlm:
+    build: .
+    image: nano-notebooklm:latest
+    container_name: nano-nlm
+    ports:
+      - "${NANO_NLM_PORT:-8000}:8000"
+    volumes:
+      - ./artifacts:/app/artifacts
+      - ./output:/app/output
+    env_file:
+      - .env
+    restart: unless-stopped

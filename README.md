@@ -77,6 +77,31 @@ Prefer a managed lifecycle? `./dev.sh` wraps the same commands:
 > <https://docs.astral.sh/uv/getting-started/installation/>.
 > Plain `pip` works identically if you'd rather skip it.
 
+---
+
+### Docker (no Python install needed)
+
+```bash
+git clone https://github.com/ArthurYangX/nano-NotebookLM && cd nano-NotebookLM
+cp .env.example .env   # fill at least one LLM key
+docker compose up      # → http://localhost:8000
+```
+
+Course data, KGs, notes, and sessions persist in `./artifacts/` on the
+host. The default image is **~2 GB** — most of which is torch (CPU
+build) + `sentence-transformers` for the local embedding option;
+PDF extraction uses `pymupdf`. To bake MinerU OCR into the image
+(heavy: ~5-7 GB total), build with `--build-arg WITH_MINERU=1`:
+
+```bash
+docker compose build --build-arg WITH_MINERU=1
+docker compose up
+```
+
+**Want to host a public demo?** See
+[`huggingface_space/DEPLOY.md`](huggingface_space/DEPLOY.md) for a
+one-command push to HuggingFace Spaces (free CPU tier works).
+
 #### Optional extras (only install what you need)
 
 | What | Install | Without it |

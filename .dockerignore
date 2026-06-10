@@ -1,0 +1,46 @@
+# Build context exclusions — keep the image small + reproducible.
+
+# Local state
+.env
+.venv/
+venv/
+artifacts/
+output/
+
+# VCS + caches
+.git/
+.gitignore
+.pytest_cache/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Build / dist
+dist/
+build/
+
+# Editor / OS / tooling
+.DS_Store
+.idea/
+.vscode/
+.claude/
+.playwright-mcp/
+.github/
+
+# Tests aren't needed at runtime
+tests/
+
+# Local scratch
+pics/
+docs/
+截屏*.png
+Screenshot*.png
+test-*.pdf
+sample-*.pdf
+ppt.pdf
+
+# Docs other than the ones the package metadata reads
+CHANGELOG.md
+CLAUDE.md
+CONTRIBUTING.md
+README.zh-CN.md
