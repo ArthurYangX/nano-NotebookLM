@@ -1,3 +1,5 @@
+
+
 <div align="center">
 
 # nano-NotebookLM
@@ -197,7 +199,7 @@ is detected but breaks at runtime (stale driver / OOM), set
 
 | Provider              | Type             | `OPENAI_BASE_URL`                                              | Suggested model                              |
 |-----------------------|------------------|----------------------------------------------------------------|----------------------------------------------|
-| **[DeepSeek](https://api-docs.deepseek.com/) ★ (used during development)** | Cloud, compat | `https://api.deepseek.com/v1`                                  | `deepseek-v4-pro`                            |
+| **[DeepSeek](https://api-docs.deepseek.com/) ★ (used during development)** | Cloud, compat | `https://api.deepseek.com/v1`                                  | `deepseek-chat`                              |
 | [OpenAI](https://platform.openai.com/docs/api-reference)               | Cloud, native    | `https://api.openai.com/v1`                                    | `gpt-4o-mini`                                |
 | [Anthropic Claude](https://docs.anthropic.com/en/api/getting-started)  | Cloud, native    | *(uses Anthropic SDK)*                                         | `claude-sonnet-4-5`                          |
 | [Moonshot (Kimi)](https://platform.moonshot.cn/docs)                   | Cloud, compat    | `https://api.moonshot.cn/v1`                                   | `moonshot-v1-8k`                             |
