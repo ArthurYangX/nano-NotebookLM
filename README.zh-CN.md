@@ -9,6 +9,7 @@
 [![Tests](https://github.com/ArthurYangX/nano-NotebookLM/actions/workflows/test.yml/badge.svg)](https://github.com/ArthurYangX/nano-NotebookLM/actions/workflows/test.yml)
 [![Code style](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
 [![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
+[![GitHub Clones](https://img.shields.io/badge/dynamic/json?color=success&label=Clone&query=count&url=https://gist.githubusercontent.com/ArthurYangX/600190d999e27f9eb7d8f4bb87f47d44/raw/clone.json&logo=github)](https://github.com/ArthurYangX/nano-NotebookLM)
 
 [English](README.md) | 简体中文
 
