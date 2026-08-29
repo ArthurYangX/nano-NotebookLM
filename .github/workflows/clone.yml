@@ -12,11 +12,13 @@ jobs:
   build:
     runs-on: ubuntu-latest
 
+    # Feed the PAT to gh via GH_TOKEN rather than `gh auth login --with-token`,
+    # which additionally demands a read:org scope this job has no use for.
+    env:
+      GH_TOKEN: ${{ secrets.SECRET_TOKEN }}
+
     steps:
       - uses: actions/checkout@v4
-
-      - name: gh login
-        run: echo "${{ secrets.SECRET_TOKEN }}" | gh auth login --with-token
 
       - name: parse latest clone count
         run: |
