@@ -54,3 +54,8 @@ pics/
 .playwright-mcp/
 playwright-report/
 test-results/
+
+# GitHub clone-count workflow scratch files
+clone.json
+clone_before.json
+post_clone.json
