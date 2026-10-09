@@ -678,6 +678,7 @@
     "tab.mindmap":                    { zh: "知识图谱",      en: "Knowledge Graph" },
     "tab.exam_prep":                  { zh: "考试备考",      en: "Exam Prep" },
     "tab.history":                    { zh: "历史",          en: "History" },
+    "topbar.backend_select":         { zh: "选择模型",        en: "Select model" },
     "topbar.all_courses":             { zh: "🌐 全部课程（{n} chunks）", en: "🌐 All Courses ({n} chunks)" },
     "topbar.course_option":           { zh: "{flag} {name}（{n} chunks）", en: "{flag} {name} ({n} chunks)" },
     "topbar.sources_btn":             { zh: "{n}/{total} 来源",    en: "{n}/{total} sources" },

@@ -411,6 +411,7 @@ function App() {
     try { window.localStorage.setItem("nano-nlm:v1:base-size", String(v)); } catch (e) {}
   }, []);
 
+  const [modelMenuOpen, setModelMenuOpen] = useState(false);
   const [mode, setMode] = useState("reader");
   const [sources, setSources] = useState([]);
   const [activeId, setActiveId] = useState(null);
@@ -1876,11 +1877,6 @@ function App() {
               ? enabledRows.map(p => p.id)
               : fallbackIds;
             const rowFor = (id) => enabledRows.find(p => p.id === id);
-            const next = () => {
-              if (!cycle.length) return backend;
-              const i = backend ? cycle.indexOf(backend) : -1;
-              return cycle[(i + 1) % cycle.length];
-            };
             const iconFor = (row) => {
               if (!row) return "🤖";
               if (row.kind === "anthropic") return "🧠";
@@ -1899,14 +1895,35 @@ function App() {
               if (row.kind === "openai_compat_local") return "local";
               return "openai";
             };
-            const tip = cycle.length > 1 ? t("topbar.backend_cycle") : t("topbar.backend_only");
+            // 2026-10: 32 个 provider 时点击轮换不可用——改为下拉列表
             return (
-              <button
-                className={"backend-chip mono backend-" + variantFor(backend)}
-                title={tip}
-                onClick={() => commitBackend(next())}
-                disabled={streaming || cycle.length <= 1}
-              >{labelFor(backend)}</button>
+              <div className="model-select">
+                <button
+                  className={"backend-chip mono backend-" + variantFor(backend)}
+                  title={t("topbar.backend_select")}
+                  onClick={() => setModelMenuOpen(v => !v)}
+                  disabled={streaming || cycle.length === 0}
+                ><span className="backend-chip-label">{labelFor(backend)}</span><span className="caret">▾</span></button>
+                {modelMenuOpen && (
+                  <>
+                    <div className="model-menu-backdrop" onClick={() => setModelMenuOpen(false)} />
+                    <div className="model-menu" role="listbox" aria-label={t("topbar.backend_select")}>
+                      {cycle.map(id => (
+                        <button
+                          key={id}
+                          className={"model-menu-item" + (backend === id ? " on" : "")}
+                          title={labelFor(id)}
+                          onClick={() => { commitBackend(id); setModelMenuOpen(false); }}
+                          disabled={streaming}
+                        >
+                          <span className="mm-check">{backend === id ? "✓" : ""}</span>
+                          <span className="mm-label">{labelFor(id)}</span>
+                        </button>
+                      ))}
+                    </div>
+                  </>
+                )}
+              </div>
             );
           })()}
           <button className="icon-btn" title="Generate Notes (uses cache when available)" onClick={() => handleGenerateNotes()} disabled={streaming}>📝</button>

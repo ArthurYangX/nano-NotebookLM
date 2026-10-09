@@ -4064,3 +4064,37 @@ mark.hl-flash, .hl-jump.hl-flash { animation: hl-flash 0.9s ease-out; }
   display: flex; gap: 10px; flex-wrap: wrap;
   padding-top: 6px;
 }
+
+
+/* ── model dropdown (topbar) ──────────────────────────────────────────── */
+.model-select { position: relative; }
+.backend-chip .caret { font-size: 9px; margin-left: 3px; opacity: .7; flex: none; }
+.backend-chip .backend-chip-label { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.model-menu-backdrop {
+  position: fixed; inset: 0; z-index: 45;
+  background: transparent; border: 0; padding: 0; cursor: default;
+}
+.model-menu {
+  position: absolute; right: 0; top: calc(100% + 8px); z-index: 46;
+  min-width: 320px; max-width: min(430px, 92vw);
+  max-height: 440px; overflow-y: auto;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  box-shadow: var(--shadow-2);
+  padding: 6px;
+}
+.model-menu-item {
+  appearance: none; border: 0; cursor: pointer;
+  display: flex; align-items: center; gap: 8px; width: 100%;
+  padding: 8px 10px; border-radius: 8px;
+  background: transparent; color: var(--ink);
+  font-size: 12.5px; font-family: var(--mono); text-align: left;
+}
+.model-menu-item:hover { background: var(--surface-2); }
+.model-menu-item.on { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+.model-menu-item .mm-check { width: 14px; flex: none; color: var(--accent); }
+.model-menu-item .mm-label {
+  overflow-wrap: anywhere; word-break: break-word; line-height: 1.45;
+  white-space: normal;
+}
